@@ -1,0 +1,193 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>DistingNT-CustomAlgos</title>
+<style>
+  :root {
+    color-scheme: light dark;
+    --bg: #ffffff;
+    --fg: #1f2328;
+    --muted: #57606a;
+    --border: #d0d7de;
+    --code-bg: #f6f8fa;
+    --link: #0969da;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #0d1117;
+      --fg: #e6edf3;
+      --muted: #9198a1;
+      --border: #30363d;
+      --code-bg: #161b22;
+      --link: #4493f8;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--fg);
+    font: 16px/1.6 -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+  }
+  main {
+    max-width: 780px;
+    margin: 0 auto;
+    padding: 3rem 1.5rem 5rem;
+  }
+  h1, h2, h3 {
+    line-height: 1.25;
+    border-bottom: 1px solid var(--border);
+    padding-bottom: 0.3em;
+  }
+  h1 { font-size: 2em; margin-bottom: 0.4em; }
+  h2 { font-size: 1.4em; margin-top: 2em; }
+  h3 { font-size: 1.1em; border-bottom: none; margin-top: 1.5em; }
+  p, ul, ol { color: var(--fg); }
+  a { color: var(--link); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  code {
+    font-family: ui-monospace, SFMono-Regular, Consolas, "Liberation Mono", monospace;
+    background: var(--code-bg);
+    padding: 0.15em 0.4em;
+    border-radius: 4px;
+    font-size: 0.9em;
+  }
+  pre {
+    background: var(--code-bg);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 1em;
+    overflow-x: auto;
+  }
+  pre code { background: none; padding: 0; }
+  table {
+    border-collapse: collapse;
+    width: 100%;
+    margin: 1em 0;
+    display: block;
+    overflow-x: auto;
+  }
+  th, td {
+    border: 1px solid var(--border);
+    padding: 0.5em 0.8em;
+    text-align: left;
+    vertical-align: top;
+  }
+  th { background: var(--code-bg); }
+  li { margin: 0.3em 0; }
+  .lede {
+    color: var(--muted);
+    font-size: 1.05em;
+  }
+  .top-nav {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.5em 1.2em;
+    margin: 1.2em 0 2em;
+    padding: 0.9em 1.1em;
+    background: var(--code-bg);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    font-size: 0.95em;
+  }
+</style>
+</head>
+<body>
+<main>
+
+<h1>DistingNT-CustomAlgos</h1>
+<p class="lede">Custom C++ algorithm plugins for the <a href="https://www.expert-sleepers.co.uk/distingNT.html">Expert Sleepers disting NT</a>, built against the <a href="https://github.com/expertsleepersltd/distingNT_API">distingNT_API</a> submodule.</p>
+
+<nav class="top-nav">
+  <a href="#quick-start">Quick start</a>
+  <a href="#what-install-bat-sets-up">What install.bat sets up</a>
+  <a href="#repo-layout">Repo layout</a>
+  <a href="#writing-a-new-algorithm-by-hand">Writing an algorithm</a>
+  <a href="#building">Building</a>
+  <a href="#pushing-to-hardware">Pushing to hardware</a>
+  <a href="#cleaning">Cleaning</a>
+  <a href="#troubleshooting">Troubleshooting</a>
+</nav>
+
+<h2 id="quick-start">Quick start (new computer)</h2>
+<ol>
+  <li>Clone this repo.</li>
+  <li>Double-click <code>install.bat</code> (or run it from a terminal). It installs everything needed and is safe to re-run.</li>
+  <li><strong>Open a new terminal window</strong> (so the PATH changes it made are picked up), then:
+    <pre><code>make build</code></pre>
+  </li>
+</ol>
+<p>That's it — see below for writing your own algorithm and pushing it to hardware.</p>
+
+<h2 id="what-install-bat-sets-up">What <code>install.bat</code> sets up</h2>
+<p>Runs <code>tools/install.ps1</code>, which:</p>
+<ul>
+  <li>Initializes the <code>distingNT_API</code> git submodule (non-recursive — its own nested <code>airwindows</code> submodule is unrelated to building custom algorithms and its long file paths fail to clone on Windows)</li>
+  <li>Downloads and installs the ARM GNU Toolchain (10.3-2021.10) to <code>%LOCALAPPDATA%\Programs\gcc-arm-none-eabi\</code> (no admin rights needed)</li>
+  <li>Downloads and installs GNU Make 4.4.1 to <code>%LOCALAPPDATA%\Programs\make\</code></li>
+  <li>Adds Git for Windows' <code>usr\bin</code> to PATH — GNU Make on Windows needs a real <code>sh.exe</code> there to run the Makefile's recipes (<code>mkdir -p</code>, <code>rm -f</code>, etc.); without it, Make silently falls back to <code>cmd.exe</code> and those recipes fail to parse</li>
+  <li>Adds all of the above to your <strong>user</strong> PATH permanently (not just this session)</li>
+  <li>Installs the Python packages (<code>mido</code>, <code>python-rtmidi</code>) that <code>tools/nt_push.py</code> needs to talk to the module over MIDI</li>
+</ul>
+<p>Everything it installs is detected and skipped on a re-run, so it's safe to run again any time (e.g. after a fresh clone on another machine).</p>
+<p>Prerequisites <code>install.bat</code> does <strong>not</strong> install for you: <a href="https://git-scm.com/download/win">Git for Windows</a> and <a href="https://www.python.org/downloads/">Python 3</a> must already be present.</p>
+
+<h2 id="repo-layout">Repo layout</h2>
+<table>
+<thead><tr><th>Path</th><th>What it is</th></tr></thead>
+<tbody>
+<tr><td><code>distingNT_API/</code></td><td>The API submodule — <code>include/distingnt/api.h</code> is what you build against; <code>examples/</code> has more reference algorithms than <code>template.cpp</code> covers</td></tr>
+<tr><td><code>template.cpp</code></td><td>Minimal starter algorithm (audio passthrough) — copy this to start a new one</td></tr>
+<tr><td><code>Makefile</code></td><td><code>build</code> / <code>hardware</code> / <code>push</code> / <code>clean</code> targets</td></tr>
+<tr><td><code>tools/nt_push.py</code></td><td>Sends a built <code>.o</code> to a connected disting NT over MIDI SysEx (no SD card removal needed)</td></tr>
+<tr><td><code>tools/install.ps1</code>, <code>tools/build.ps1</code>, <code>tools/push.ps1</code></td><td>Logic behind the <code>.bat</code> files</td></tr>
+<tr><td><code>install.bat</code>, <code>build.bat</code>, <code>push.bat</code>, <code>clean.bat</code></td><td>Double-clickable / drag-and-drop entry points</td></tr>
+<tr><td><code>plugins/</code></td><td>Build output (<code>.o</code> files) — gitignored</td></tr>
+</tbody>
+</table>
+
+<h2 id="writing-a-new-algorithm-by-hand">Writing a new algorithm by hand</h2>
+<ol>
+  <li>Copy <code>template.cpp</code> to a new name, e.g. <code>mydelay.cpp</code>.</li>
+  <li>Open it and work through the <code>TODO</code>s:
+    <ul>
+      <li>Rename <code>_templateAlgorithm</code> to something specific to your algorithm.</li>
+      <li>Pick a <strong>GUID unique among your own plugins</strong> — the 4-char code in <code>NT_MULTICHAR( 'T', 'p', 'l', '1' )</code>. It doesn't need to be globally unique across every plugin ever written, just distinct from your other installed ones.</li>
+      <li>Set <code>.name</code> and <code>.description</code> in the <code>factory</code> struct.</li>
+      <li>Add your own entries to the <code>parameters[]</code> table and the <code>kParam...</code> enum (see <code>distingNT_API/examples/gain.cpp</code> for a parameter table with linear/dB/custom-scaled values, and pages).</li>
+      <li>Replace the passthrough loop in <code>step()</code> with your actual DSP.</li>
+    </ul>
+  </li>
+  <li>For anything beyond passthrough — a custom UI (<code>draw</code>), reacting to parameter changes (<code>parameterChanged</code>), MIDI input (<code>midiMessage</code>), or multiple algorithms in one plugin file — look at the other files in <code>distingNT_API/examples/</code> (<code>gainCustomUI.cpp</code>, <code>midiLFO.cpp</code>, <code>multiple.cpp</code>, etc.) and the declarations in <code>distingNT_API/include/distingnt/api.h</code>.</li>
+  <li>Build it (see below). Fix any compiler errors/warnings — the build uses <code>-Wall</code>.</li>
+</ol>
+<p>You don't need to touch the <code>Makefile</code> — it picks up every <code>.cpp</code> in the repo root automatically.</p>
+
+<h2 id="building">Building</h2>
+<pre><code>make build</code></pre>
+<p>Compiles every <code>.cpp</code> in the repo root to <code>plugins/&lt;name&gt;.o</code> using the same ARM Cortex-M7 cross-compile flags the API's own examples use. <code>make hardware</code> is an alias (there's no separate "hardware" build — every build already targets the module's ARM core).</p>
+<p><strong>Or</strong> drag one or more <code>.cpp</code> files onto <code>build.bat</code> to build just those. Double-click <code>build.bat</code> with nothing dropped to build everything.</p>
+
+<h2 id="pushing-to-hardware">Pushing to hardware</h2>
+<p>Connect the disting NT over USB, then:</p>
+<pre><code>make push</code></pre>
+<p>This builds first, then transfers every built <code>.o</code> to the module over MIDI SysEx (wake → ensure <code>/programs/plug-ins</code> exists → upload in 512-byte chunks → rescan plugins) — the same mechanism <a href="https://github.com/thorinside/nt_helper">nt_helper</a> uses, so no SD card removal is needed. The module's MIDI port is auto-detected (matched by name containing "disting"); override with <code>make push MIDI_PORT="some other name"</code> if you have more than one candidate, or <code>make push SYSEX_ID=n</code> if your module isn't using SysEx ID 0.</p>
+<p><strong>Or</strong> drag a <code>.cpp</code> or <code>.o</code> file onto <code>push.bat</code> — it builds first if you dropped a <code>.cpp</code>, then pushes. Double-click with nothing dropped to be prompted for a filename. The MIDI port is auto-detected the same way.</p>
+<p>After pushing, the new/updated algorithm shows up at the <strong>very end</strong> of the "Add algorithm" list on the module — it's easy to miss if you're only looking near the top.</p>
+
+<h2 id="cleaning">Cleaning</h2>
+<pre><code>make clean</code></pre>
+<p>or double-click <code>clean.bat</code>. Removes everything under <code>plugins/</code>.</p>
+
+<h2 id="troubleshooting">Troubleshooting</h2>
+<ul>
+  <li><strong><code>make</code> or <code>arm-none-eabi-c++</code> not found right after running <code>install.bat</code></strong>: open a <em>new</em> terminal window (or re-launch from Explorer) — Windows doesn't refresh PATH in already-open shells.</li>
+  <li><strong>Plugin doesn't seem to have installed</strong>: it's likely just at the bottom of the algorithm list, not missing — scroll all the way down. You can also drop a directory-listing check on <code>/programs/plug-ins</code> via <code>tools/nt_push.py</code> internals if you need to confirm a file landed.</li>
+  <li><strong><code>push</code> can't find a MIDI port</strong>: make sure the module is connected over USB and shows up as a MIDI device (Windows should list something like "disting NT MIDI OUT"/"disting NT MIDI IN"); pass <code>MIDI_PORT=</code> explicitly if you have multiple similarly-named MIDI devices.</li>
+</ul>
+
+</main>
+</body>
+</html>
