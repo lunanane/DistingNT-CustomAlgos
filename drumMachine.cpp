@@ -263,6 +263,18 @@ enum
 	// see kWavefolderTypeXxx below.
 	kParamFoldTypeBD, kParamFoldTypeSD, kParamFoldTypeCH, kParamFoldTypeOH,
 
+	// Page 22-24: EQ LOW/MID/HIGH - a cheap 3-band EQ (fixed frequencies -
+	// ~150Hz shelf, ~1kHz bell, ~5kHz shelf - not sweepable, so their
+	// filter coefficients are computed once, never per-block, see
+	// _drumVoicePost::Init()) applied in ApplyPost() after Waveshaper and
+	// before Volume. -100..100, 0 = flat/bypass. Not modulatable (no Mod
+	// Matrix entry) and not part of the smoothed kit range, to keep this
+	// simple - appended at the very end like Fold Type, never inserted
+	// mid-range (see kParamFoldBD's comment for why that matters).
+	kParamEqLowBD, kParamEqLowSD, kParamEqLowCH, kParamEqLowOH,
+	kParamEqMidBD, kParamEqMidSD, kParamEqMidCH, kParamEqMidOH,
+	kParamEqHighBD, kParamEqHighSD, kParamEqHighCH, kParamEqHighOH,
+
 	kNumParams,
 };
 
@@ -493,6 +505,21 @@ static _NT_parameter parameters[] = {
 	{ .name = "SD fold type", .min = 0, .max = kNumWavefolderTypes - 1, .def = 0, .unit = kNT_unitEnum, .scaling = 0, .enumStrings = kEnumWavefolderType },
 	{ .name = "CH fold type", .min = 0, .max = kNumWavefolderTypes - 1, .def = 0, .unit = kNT_unitEnum, .scaling = 0, .enumStrings = kEnumWavefolderType },
 	{ .name = "OH fold type", .min = 0, .max = kNumWavefolderTypes - 1, .def = 0, .unit = kNT_unitEnum, .scaling = 0, .enumStrings = kEnumWavefolderType },
+
+	{ .name = "BD EQ low", .min = -100, .max = 100, .def = 0, .unit = kNT_unitNone, .scaling = 0, .enumStrings = NULL },
+	{ .name = "SD EQ low", .min = -100, .max = 100, .def = 0, .unit = kNT_unitNone, .scaling = 0, .enumStrings = NULL },
+	{ .name = "CH EQ low", .min = -100, .max = 100, .def = 0, .unit = kNT_unitNone, .scaling = 0, .enumStrings = NULL },
+	{ .name = "OH EQ low", .min = -100, .max = 100, .def = 0, .unit = kNT_unitNone, .scaling = 0, .enumStrings = NULL },
+
+	{ .name = "BD EQ mid", .min = -100, .max = 100, .def = 0, .unit = kNT_unitNone, .scaling = 0, .enumStrings = NULL },
+	{ .name = "SD EQ mid", .min = -100, .max = 100, .def = 0, .unit = kNT_unitNone, .scaling = 0, .enumStrings = NULL },
+	{ .name = "CH EQ mid", .min = -100, .max = 100, .def = 0, .unit = kNT_unitNone, .scaling = 0, .enumStrings = NULL },
+	{ .name = "OH EQ mid", .min = -100, .max = 100, .def = 0, .unit = kNT_unitNone, .scaling = 0, .enumStrings = NULL },
+
+	{ .name = "BD EQ high", .min = -100, .max = 100, .def = 0, .unit = kNT_unitNone, .scaling = 0, .enumStrings = NULL },
+	{ .name = "SD EQ high", .min = -100, .max = 100, .def = 0, .unit = kNT_unitNone, .scaling = 0, .enumStrings = NULL },
+	{ .name = "CH EQ high", .min = -100, .max = 100, .def = 0, .unit = kNT_unitNone, .scaling = 0, .enumStrings = NULL },
+	{ .name = "OH EQ high", .min = -100, .max = 100, .def = 0, .unit = kNT_unitNone, .scaling = 0, .enumStrings = NULL },
 };
 
 static const uint8_t pageRouting[]   = { kParamOutBD, kParamOutBDMode, kParamStereoBD, kParamPanBD, kParamOutSD, kParamOutSDMode, kParamStereoSD, kParamPanSD, kParamOutCH, kParamOutCHMode, kParamStereoCH, kParamPanCH, kParamOutOH, kParamOutOHMode, kParamStereoOH, kParamPanOH };
@@ -516,6 +543,15 @@ static const uint8_t pageKnockTail[] = { kParamKnockTailBD, kParamKnockTailSD, k
 static const uint8_t pageMixType[]   = { kParamMixTypeBD, kParamMixTypeSD, kParamMixTypeCH, kParamMixTypeOH };
 static const uint8_t pageFold[]      = { kParamFoldBD, kParamFoldSD, kParamFoldCH, kParamFoldOH };
 static const uint8_t pageFoldType[]  = { kParamFoldTypeBD, kParamFoldTypeSD, kParamFoldTypeCH, kParamFoldTypeOH };
+static const uint8_t pageEqLow[]     = { kParamEqLowBD, kParamEqLowSD, kParamEqLowCH, kParamEqLowOH };
+static const uint8_t pageEqMid[]     = { kParamEqMidBD, kParamEqMidSD, kParamEqMidCH, kParamEqMidOH };
+static const uint8_t pageEqHigh[]    = { kParamEqHighBD, kParamEqHighSD, kParamEqHighCH, kParamEqHighOH };
+// Pan already exists as a parameter (part of Routing - see WriteVoiceOutput())
+// but wasn't reachable from the custom UI (Routing is list-style and
+// deliberately excluded from the custom-UI page cycle - see
+// kFirstCustomPage's comment). This just gives it its own bar page, no new
+// parameters needed.
+static const uint8_t pagePan[]        = { kParamPanBD, kParamPanSD, kParamPanCH, kParamPanOH };
 
 // The Mod Matrix's 32 params are contiguous (kFirstModRouteParam..+31) in
 // exactly this sequential order already, so this is just that range restated
@@ -553,6 +589,10 @@ static const _NT_parameterPage pages[] = {
 	{ .name = "Mix Type", .numParams = ARRAY_SIZE(pageMixType), .params = pageMixType },
 	{ .name = "Wavefolder", .numParams = ARRAY_SIZE(pageFold), .params = pageFold },
 	{ .name = "Wavefolder Type", .numParams = ARRAY_SIZE(pageFoldType), .params = pageFoldType },
+	{ .name = "EQ Low", .numParams = ARRAY_SIZE(pageEqLow), .params = pageEqLow },
+	{ .name = "EQ Mid", .numParams = ARRAY_SIZE(pageEqMid), .params = pageEqMid },
+	{ .name = "EQ High", .numParams = ARRAY_SIZE(pageEqHigh), .params = pageEqHigh },
+	{ .name = "Pan", .numParams = ARRAY_SIZE(pagePan), .params = pagePan },
 };
 
 static const _NT_parameterPages parameterPages = {
@@ -576,6 +616,7 @@ enum {
 	kPagePitch, kPageVolume, kPageTone, kPageCharacter, kPageFm, kPageFmMode,
 	kPageSample, kPageSampleMix, kPageKnockTail, kPageMixType,
 	kPageFold, kPageFoldType,
+	kPageEqLow, kPageEqMid, kPageEqHigh, kPagePan,
 	kNumPages,
 };
 enum { kFirstCustomPage = kPageEnvelopes };
@@ -588,9 +629,10 @@ static const int kPageType[kNumPages] = {
 	kPageTypeBar, kPageTypeBar, kPageTypeBar, kPageTypeBar, kPageTypeBar, kPageTypeBar,
 	kPageTypeBar, kPageTypeBar, kPageTypeBar, kPageTypeBar,
 	kPageTypeBar, kPageTypeBar,
+	kPageTypeBar, kPageTypeBar, kPageTypeBar, kPageTypeBar,
 };
 // List pages (Routing/MIDI/Mod Matrix) use these via SetupPageParams()/
-// SetupPageItemCount(); graph/bar pages (Envelopes/LFOs/Model..Fold Type) use
+// SetupPageItemCount(); graph/bar pages (Envelopes/LFOs/Model..Pan) use
 // kPageParams directly since they always have exactly 4 params (one per
 // pot/encoder control - see customUi()).
 static const uint8_t* const kPageParams[kNumPages] = {
@@ -600,6 +642,7 @@ static const uint8_t* const kPageParams[kNumPages] = {
 	pagePitch, pageVolume, pageTone, pageChar, pageFm, pageFmMode,
 	pageSample, pageSampleMix, pageKnockTail, pageMixType,
 	pageFold, pageFoldType,
+	pageEqLow, pageEqMid, pageEqHigh, pagePan,
 };
 static const int kPageItemCount[kNumPages] = {
 	(int)ARRAY_SIZE(pageRouting), (int)ARRAY_SIZE(pageMidi), 0, 0, (int)ARRAY_SIZE(pageModMatrix),
@@ -608,6 +651,7 @@ static const int kPageItemCount[kNumPages] = {
 	0, 0, 0, 0, 0, 0,
 	0, 0, 0, 0,
 	0, 0,
+	0, 0, 0, 0,
 };
 static const char* const kPageNames[kNumPages] = {
 	"ROUTING", "MIDI", "ENVELOPES", "LFOS", "MOD MATRIX",
@@ -616,6 +660,7 @@ static const char* const kPageNames[kNumPages] = {
 	"PITCH", "VOLUME", "TONE", "CHARACTER", "FM", "FM MODE",
 	"SAMPLE", "SAMPLE MIX", "KNOCK/TAIL", "MIX TYPE",
 	"WAVEFOLDER", "FOLD TYPE",
+	"EQ LOW", "EQ MID", "EQ HIGH", "PAN",
 };
 static const bool kPageBipolar[kNumPages] = {
 	false, false, false, false, false,
@@ -624,9 +669,11 @@ static const bool kPageBipolar[kNumPages] = {
 	false, false, false, false, false, false,
 	false, false, false, false,
 	false, false,
+	true, true, true, true,
 };
 // kConceptXxx for each bar-style page, or -1 for non-bar pages and Model/FM
-// Mode/Fold Type/Sample/Mix Type (none of which are modulatable concepts).
+// Mode/Fold Type/Sample/Mix Type/EQ/Pan (none of which are modulatable
+// concepts).
 static const int kPageConcept[kNumPages] = {
 	-1, -1, -1, -1, -1,
 	-1, kConceptRelease, kConceptCompressor, kConceptFilter,
@@ -634,6 +681,7 @@ static const int kPageConcept[kNumPages] = {
 	kConceptPitch, kConceptVolume, kConceptTone, kConceptCharacter, kConceptFm, -1,
 	-1, -1, -1, -1,
 	kConceptFold, -1,
+	-1, -1, -1, -1,
 };
 
 // The 10 concepts below Model get smoothed for the preset-load fade (Model
@@ -695,6 +743,9 @@ static const uint8_t kModParams[] = {
 	kParamKnockTailBD, kParamKnockTailSD, kParamKnockTailCH, kParamKnockTailOH,
 	kParamMixTypeBD, kParamMixTypeSD, kParamMixTypeCH, kParamMixTypeOH,
 	kParamFoldTypeBD, kParamFoldTypeSD, kParamFoldTypeCH, kParamFoldTypeOH,
+	kParamEqLowBD, kParamEqLowSD, kParamEqLowCH, kParamEqLowOH,
+	kParamEqMidBD, kParamEqMidSD, kParamEqMidCH, kParamEqMidOH,
+	kParamEqHighBD, kParamEqHighSD, kParamEqHighCH, kParamEqHighOH,
 };
 enum { kNumModRouteParamsTotal = kNumModRoutes * kNumModRouteParams };
 enum { kNumModParams = ARRAY_SIZE(kModParams) + kNumModRouteParamsTotal };
@@ -778,6 +829,32 @@ struct _drumVoicePost
 	// fight over its cachedFilterParam-driven coefficients).
 	float samplePos;
 	stmlib::Svf sampleHp;
+	// Artificial release envelope for the sample layer - the loaded WAV has
+	// no envelope of its own (it's just raw file content), so without this
+	// the Release knob only shortened the synth voice, leaving the sample
+	// always playing out its full length regardless - a noticeable, real
+	// mismatch. Same technique already used for braids::Cymbal's own
+	// artificial release (see ProcessHat()'s cymbalElapsed/cymbalTotalS) -
+	// a simple linear ramp down, timed by NormToSeconds(), reset at
+	// trigger time in MixSampleLayer().
+	float sampleEnvElapsed;
+	float sampleEnvTotalS;
+
+	// 3-band EQ taps (see ApplyEq()) - each just an LP/BP/HP "tap" added
+	// back onto the dry signal, scaled by the band's gain knob (a cheap
+	// shelf/bell EQ - no true shelf/peak filter topology needed). All 3
+	// bands sit at fixed frequencies (not sweepable), so - like sampleHp
+	// above - their coefficients are computed once here, never recomputed
+	// per block.
+	stmlib::Svf eqLowTap;
+	stmlib::Svf eqMidTap;
+	stmlib::Svf eqHighTap;
+	// Final fixed cleanup filter (not user-adjustable) - removes sub-40Hz
+	// rumble/DC and near-ultrasonic content above 17kHz that no other
+	// stage specifically targets, run last so it catches whatever the
+	// synth, sample layer, Wavefolder, Waveshaper, and EQ all fed into it.
+	stmlib::Svf cleanupHp;
+	stmlib::Svf cleanupLp;
 
 	void Init()
 	{
@@ -795,12 +872,30 @@ struct _drumVoicePost
 		fmEnvElapsed = 0.0f;
 		fmPrevSample = 0.0f;
 		samplePos = 0.0f;
+		sampleEnvElapsed = 0.0f;
+		sampleEnvTotalS = 1.0f;
 		sampleHp.Init();
 		// Fixed cutoff (not user-adjustable - Knock/Tail already owns this
 		// page's controls), so it's cheap to set once here rather than
 		// recomputing set_f_q() every block in MixSampleLayer() the way
 		// ApplyPost()'s user-adjustable Filter page has to.
 		sampleHp.set_f_q<stmlib::FREQUENCY_FAST>( 700.0f / plaits::kSampleRate, 0.6f );
+
+		eqLowTap.Init();
+		eqMidTap.Init();
+		eqHighTap.Init();
+		eqLowTap.set_f_q<stmlib::FREQUENCY_FAST>( 150.0f / plaits::kSampleRate, 0.6f );
+		eqMidTap.set_f_q<stmlib::FREQUENCY_FAST>( 1000.0f / plaits::kSampleRate, 1.0f );
+		eqHighTap.set_f_q<stmlib::FREQUENCY_FAST>( 5000.0f / plaits::kSampleRate, 0.6f );
+
+		cleanupHp.Init();
+		cleanupLp.Init();
+		cleanupHp.set_f_q<stmlib::FREQUENCY_FAST>( 40.0f / plaits::kSampleRate, 0.6f );
+		{
+			float cleanupLpNorm = 17000.0f / plaits::kSampleRate;
+			CONSTRAIN( cleanupLpNorm, 0.001f, 0.49f );
+			cleanupLp.set_f_q<stmlib::FREQUENCY_FAST>( cleanupLpNorm, 0.6f );
+		}
 	}
 };
 
@@ -2440,7 +2535,44 @@ static void ApplyWavefolder( float* buf, int numFrames, float amount, int type )
 	}
 }
 
-static void ApplyPost( _drumVoicePost& v, float* buf, float* dryBuf, int numFrames, int filterParam, int foldParam, int foldType, int compParam, int driveParam, int volParam )
+// Cheap 3-band EQ (see kParamEqLowBD's comment): each band is just its own
+// LP/BP/HP "tap" of the dry signal, scaled by the gain knob and added back
+// on - a classic, cheap shelf/bell-EQ-via-mix trick that needs no true
+// shelf/peak filter topology, and (since all 3 bands sit at fixed
+// frequencies - see _drumVoicePost::Init()) never recomputes filter
+// coefficients per block, only per-block Process() calls. `tapBuf` is
+// scratch space (reused sequentially for each of the up-to-3 bands) - safe
+// to be the same buffer ApplyPost()'s Waveshaper stage used moments ago,
+// since that stage has already finished by the time this runs.
+static void ApplyEq( _drumVoicePost& v, float* buf, float* tapBuf, int numFrames, int lowParam, int midParam, int highParam )
+{
+	if ( lowParam != 0 )
+	{
+		memcpy( tapBuf, buf, numFrames * sizeof(float) );
+		v.eqLowTap.Process<stmlib::FILTER_MODE_LOW_PASS>( tapBuf, tapBuf, numFrames );
+		float t = lowParam * 0.01f;
+		for ( int i=0; i<numFrames; ++i )
+			buf[i] += t * tapBuf[i];
+	}
+	if ( midParam != 0 )
+	{
+		memcpy( tapBuf, buf, numFrames * sizeof(float) );
+		v.eqMidTap.Process<stmlib::FILTER_MODE_BAND_PASS>( tapBuf, tapBuf, numFrames );
+		float t = midParam * 0.01f;
+		for ( int i=0; i<numFrames; ++i )
+			buf[i] += t * tapBuf[i];
+	}
+	if ( highParam != 0 )
+	{
+		memcpy( tapBuf, buf, numFrames * sizeof(float) );
+		v.eqHighTap.Process<stmlib::FILTER_MODE_HIGH_PASS>( tapBuf, tapBuf, numFrames );
+		float t = highParam * 0.01f;
+		for ( int i=0; i<numFrames; ++i )
+			buf[i] += t * tapBuf[i];
+	}
+}
+
+static void ApplyPost( _drumVoicePost& v, float* buf, float* dryBuf, int numFrames, int filterParam, int foldParam, int foldType, int eqLowParam, int eqMidParam, int eqHighParam, int compParam, int driveParam, int volParam )
 {
 	if ( filterParam < 0 )
 	{
@@ -2508,11 +2640,22 @@ static void ApplyPost( _drumVoicePost& v, float* buf, float* dryBuf, int numFram
 		}
 	}
 
+	// TEMPORARILY DISABLED for A/B testing whether the EQ or the fixed
+	// cleanup filter (below) is behind a reported sound-quality regression -
+	// re-enable by uncommenting once the culprit's confirmed.
+	// ApplyEq( v, buf, dryBuf, numFrames, eqLowParam, eqMidParam, eqHighParam );
+
 	float vol = volParam * 0.01f;
 	for ( int i=0; i<numFrames; ++i )
 		buf[i] *= vol;
 
 	ApplyCompressor( v, buf, numFrames, compParam );
+
+	// TEMPORARILY DISABLED alongside ApplyEq() above, for A/B testing a
+	// reported sound-quality regression - re-enable both once the culprit's
+	// confirmed.
+	// v.cleanupHp.Process<stmlib::FILTER_MODE_HIGH_PASS>( buf, buf, numFrames );
+	// v.cleanupLp.Process<stmlib::FILTER_MODE_LOW_PASS>( buf, buf, numFrames );
 }
 
 // Writes a voice's rendered mono buffer to its output bus(es). In Stereo
@@ -2617,7 +2760,7 @@ static void ExtendIdleForSample( _drumMachineAlgorithm* pThis, _drumVoicePost& v
 // pThis->dryScratch/elementsExciteScratch as working buffers for the
 // windowed/highpassed sample signal - both are free at this point in
 // ProcessKick/Snare/Hat.
-static void MixSampleLayer( _drumMachineAlgorithm* pThis, _drumVoicePost& v, int slot, bool trig, float accent, float* scratch, int numFrames )
+static void MixSampleLayer( _drumMachineAlgorithm* pThis, _drumVoicePost& v, int slot, bool trig, float accent, float decay, float blockSeconds, float* scratch, int numFrames )
 {
 	_sampleSlot& s = pThis->sampleSlot[slot];
 	int mixValue = pThis->v[ kSampleMixParam[slot] ];
@@ -2627,8 +2770,32 @@ static void MixSampleLayer( _drumMachineAlgorithm* pThis, _drumVoicePost& v, int
 	if ( trig )
 	{
 		v.samplePos = 0.0f;
+		// Same range/curve as braids::Cymbal's own artificial release (see
+		// ProcessHat()) - ties the sample's fade-out to the same Release
+		// knob the synth voice already uses, even though the two envelopes
+		// aren't a byte-for-byte match (each synth model's own internal
+		// decay math differs too much to replicate exactly here) - the
+		// point is that turning Release down now audibly shortens the
+		// sample as well, not just the synth.
+		v.sampleEnvTotalS = NormToSeconds( decay * decay, 0.05f, 2.0f );
+		v.sampleEnvElapsed = 0.0f;
 		OpenSampleStream( pThis, slot, accent );
 	}
+	else if ( v.samplePos >= (float)( (int)s.loadedNumFrames - 1 ) )
+	{
+		// This voice's sample already finished streaming (e.g. a short
+		// knock sample under a much longer synth Release tail) - stop
+		// calling NT_streamRender() for it every block instead of asking
+		// the streaming engine to keep rendering a stream that has nothing
+		// left to give, purely wasted CPU for a silent result.
+		return;
+	}
+
+	v.sampleEnvElapsed += blockSeconds;
+	float envAmp = 1.0f - v.sampleEnvElapsed / v.sampleEnvTotalS;
+	CONSTRAIN( envAmp, 0.0f, 1.0f );
+	if ( envAmp <= 0.0f )
+		return;	// fully released - same reasoning as the exhausted-stream skip above
 
 	if ( NT_globals.workBufferSizeBytes < (uint32_t)numFrames * sizeof(_NT_frame) )
 		return;	// not enough transient scratch this block - skip rather than risk an overrun
@@ -2691,7 +2858,7 @@ static void MixSampleLayer( _drumMachineAlgorithm* pThis, _drumVoicePost& v, int
 		float edge = ( pos - (float)splitFrame + declick ) / ( 2.0f * declick );
 		CONSTRAIN( edge, 0.0f, 1.0f );
 		float gain = preGain + ( postGain - preGain ) * edge;
-		sampleBuf[i] = raw * gain;
+		sampleBuf[i] = raw * gain * envAmp;
 	}
 	v.samplePos = pos;
 
@@ -2843,7 +3010,7 @@ static void ProcessKick( _drumMachineAlgorithm* pThis, float* busFrames, int num
 		for ( int i=0; i<numFrames; ++i ) scratch[i] *= accent;
 	}
 
-	MixSampleLayer( pThis, v, kSlotBD, trig, accent, scratch, numFrames );
+	MixSampleLayer( pThis, v, kSlotBD, trig, accent, decay, blockSeconds, scratch, numFrames );
 
 	int filtParam = RoundToInt( ModulatedViaMatrix( pThis, kConceptFilter, kSlotBD, Smoothed( pThis, kParamFiltBD ), env1Level, env2Level ) );
 	int foldParam = RoundToInt( ModulatedViaMatrix( pThis, kConceptFold, kSlotBD, Smoothed( pThis, kParamFoldBD ), env1Level, env2Level ) );
@@ -2855,7 +3022,7 @@ static void ProcessKick( _drumMachineAlgorithm* pThis, float* busFrames, int num
 	CONSTRAIN( compParam, 0, 100 );
 	CONSTRAIN( driveParam, 0, 100 );
 	CONSTRAIN( volParam, 0, 200 );
-	ApplyPost( v, scratch, pThis->dryScratch, numFrames, filtParam, foldParam, pThis->v[kParamFoldTypeBD], compParam, driveParam, volParam );
+	ApplyPost( v, scratch, pThis->dryScratch, numFrames, filtParam, foldParam, pThis->v[kParamFoldTypeBD], pThis->v[kParamEqLowBD], pThis->v[kParamEqMidBD], pThis->v[kParamEqHighBD], compParam, driveParam, volParam );
 
 	v.samplesUntilIdle -= numFrames;
 	if ( v.samplesUntilIdle < 0 ) v.samplesUntilIdle = 0;
@@ -2953,7 +3120,7 @@ static void ProcessSnare( _drumMachineAlgorithm* pThis, float* busFrames, int nu
 		for ( int i=0; i<numFrames; ++i ) scratch[i] *= accent;
 	}
 
-	MixSampleLayer( pThis, v, kSlotSD, trig, accent, scratch, numFrames );
+	MixSampleLayer( pThis, v, kSlotSD, trig, accent, decay, blockSeconds, scratch, numFrames );
 
 	int filtParam = RoundToInt( ModulatedViaMatrix( pThis, kConceptFilter, kSlotSD, Smoothed( pThis, kParamFiltSD ), env1Level, env2Level ) );
 	int foldParam = RoundToInt( ModulatedViaMatrix( pThis, kConceptFold, kSlotSD, Smoothed( pThis, kParamFoldSD ), env1Level, env2Level ) );
@@ -2965,7 +3132,7 @@ static void ProcessSnare( _drumMachineAlgorithm* pThis, float* busFrames, int nu
 	CONSTRAIN( compParam, 0, 100 );
 	CONSTRAIN( driveParam, 0, 100 );
 	CONSTRAIN( volParam, 0, 200 );
-	ApplyPost( v, scratch, pThis->dryScratch, numFrames, filtParam, foldParam, pThis->v[kParamFoldTypeSD], compParam, driveParam, volParam );
+	ApplyPost( v, scratch, pThis->dryScratch, numFrames, filtParam, foldParam, pThis->v[kParamFoldTypeSD], pThis->v[kParamEqLowSD], pThis->v[kParamEqMidSD], pThis->v[kParamEqHighSD], compParam, driveParam, volParam );
 
 	v.samplesUntilIdle -= numFrames;
 	if ( v.samplesUntilIdle < 0 ) v.samplesUntilIdle = 0;
@@ -2985,6 +3152,9 @@ static void ProcessHat( _drumMachineAlgorithm* pThis, float* busFrames, int numF
 	int filtParamIdx = isOpen ? kParamFiltOH : kParamFiltCH;
 	int foldParamIdx = isOpen ? kParamFoldOH : kParamFoldCH;
 	int foldTypeParamIdx = isOpen ? kParamFoldTypeOH : kParamFoldTypeCH;
+	int eqLowParamIdx = isOpen ? kParamEqLowOH : kParamEqLowCH;
+	int eqMidParamIdx = isOpen ? kParamEqMidOH : kParamEqMidCH;
+	int eqHighParamIdx = isOpen ? kParamEqHighOH : kParamEqHighCH;
 	int compParamIdx = isOpen ? kParamCompOH : kParamCompCH;
 	int driveParamIdx = isOpen ? kParamDriveOH : kParamDriveCH;
 	int volParamIdx = isOpen ? kParamVolOH : kParamVolCH;
@@ -3089,7 +3259,7 @@ static void ProcessHat( _drumMachineAlgorithm* pThis, float* busFrames, int numF
 		UpdateFmFeedback( v, scratch, numFrames );
 	}
 
-	MixSampleLayer( pThis, v, slot, trig, accent, scratch, numFrames );
+	MixSampleLayer( pThis, v, slot, trig, accent, decay, blockSeconds, scratch, numFrames );
 
 	int filtParam = RoundToInt( ModulatedViaMatrix( pThis, kConceptFilter, slot, Smoothed( pThis, filtParamIdx ), env1Level, env2Level ) );
 	int foldParam = RoundToInt( ModulatedViaMatrix( pThis, kConceptFold, slot, Smoothed( pThis, foldParamIdx ), env1Level, env2Level ) );
@@ -3101,7 +3271,7 @@ static void ProcessHat( _drumMachineAlgorithm* pThis, float* busFrames, int numF
 	CONSTRAIN( compParam, 0, 100 );
 	CONSTRAIN( driveParam, 0, 100 );
 	CONSTRAIN( volParam, 0, 200 );
-	ApplyPost( v, scratch, pThis->dryScratch, numFrames, filtParam, foldParam, pThis->v[foldTypeParamIdx], compParam, driveParam, volParam );
+	ApplyPost( v, scratch, pThis->dryScratch, numFrames, filtParam, foldParam, pThis->v[foldTypeParamIdx], pThis->v[eqLowParamIdx], pThis->v[eqMidParamIdx], pThis->v[eqHighParamIdx], compParam, driveParam, volParam );
 
 	v.samplesUntilIdle -= numFrames;
 	if ( v.samplesUntilIdle < 0 ) v.samplesUntilIdle = 0;
