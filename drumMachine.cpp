@@ -15,6 +15,7 @@
 #include <new>
 #include <distingnt/api.h>
 #include <distingnt/serialisation.h>
+#include <distingnt/wav.h>
 
 #include "third_party/mi_drums/stmlib/stmlib.h"
 #include "third_party/mi_drums/stmlib/dsp/dsp.h"
@@ -35,6 +36,15 @@
 #include "elements/dsp/exciter.h"
 #include "elements/dsp/resonator.h"
 
+#include "peaks/drums/excitation.h"
+#include "peaks/drums/svf.h"
+#include "peaks/drums/bass_drum.h"
+#include "peaks/drums/snare_drum.h"
+#include "peaks/drums/fm_drum.h"
+
+#include "braids/svf.h"
+#include "braids/cymbal.h"
+
 // Out-of-line definitions for the vendored code's extern/static members.
 // Single-translation-unit build (each plugin .cpp compiles standalone), so
 // including units.cc's LUT data directly here is safe - no ODR risk.
@@ -44,6 +54,12 @@ uint32_t stmlib::Random::rng_state_ = 1;
 #include "third_party/mi_drums/stmlib/dsp/units.cc"
 #include "elements/dsp/exciter.cc"
 #include "elements/dsp/resonator.cc"
+#include "peaks/resources.cc"
+#include "peaks/drums/bass_drum.cc"
+#include "peaks/drums/snare_drum.cc"
+#include "peaks/drums/fm_drum.cc"
+#include "braids/resources.cc"
+#include "braids/cymbal.cc"
 
 // ---------------------------------------------------------------------
 // MIDI note (0-127) -> frequency (Hz) lookup table, equal temperament,
@@ -90,21 +106,29 @@ enum
 };
 static const char* const kSlotNames[kNumSlots] = { "BD", "SD", "CH", "OH" };
 
-// Modulation target concepts - all 9 smoothed parameters are modulatable via
+// Modulation target concepts - all 10 smoothed parameters are modulatable via
 // the Mod Matrix below; no curation needed since the matrix is a sparse
 // "N assignable routes" system, not a dense per-concept grid (an earlier
 // dense per-concept-per-slot-per-source parameter block hit an undocumented
 // platform limit around 214 total parameters and silently failed to load -
-// see kNumModRoutes's comment).
+// see kNumModRoutes's comment). kConceptFold is appended at the end (not
+// inserted next to kConceptFilter, despite Wavefolder sitting right after
+// Filter in the actual signal chain - see ApplyPost()) because Mod Matrix
+// routes store a route's target concept as a raw saved integer - inserting
+// a new value in the middle would silently repoint any already-saved
+// route at the wrong concept, the same bug this caused for the kit
+// parameter range (see kParamFoldBD's comment).
 enum {
 	kConceptRelease, kConceptCompressor, kConceptFilter, kConceptDrive,
 	kConceptPitch, kConceptVolume, kConceptTone, kConceptCharacter, kConceptFm,
+	kConceptFold,
 	kNumConcepts,
 };
-static_assert( kNumConcepts == 9, "one per smoothed concept" );
+static_assert( kNumConcepts == 10, "one per smoothed concept" );
 static char const * const kEnumModConcept[] = {
 	"Release", "Compressor", "Filter", "Waveshape",
 	"Pitch", "Volume", "Tone", "Character", "FM",
+	"Wavefolder",
 };
 static_assert( ARRAY_SIZE(kEnumModConcept) == kNumConcepts, "" );
 
@@ -176,14 +200,68 @@ enum
 	kParamToneBD, kParamToneSD, kParamToneCH, kParamToneOH,
 	// Page 13: Character
 	kParamCharBD, kParamCharSD, kParamCharCH, kParamCharOH,
-	// Page 14: FM - self-contained internal modulation depth (Synthetic
-	// model's own fm_envelope_amount/fm_amount), NOT an external audio
-	// input - only meaningful when the slot's Model is Synthetic (Analog
-	// models have no equivalent free parameter; see ProcessKick/Snare()).
-	// Reachable only via the Mod Matrix (see kConceptFm) or this base knob,
-	// same as any other concept - matches how Plaits/Braids-style FM works
-	// standalone, no patched signal required.
+	// Page 14: FM - self-contained internal modulation depth (drives the
+	// attack pitch-knock on Analog/Synthetic/808, and the core FM amount on
+	// the FM model itself - see ProcessKick()/ProcessSnare()), NOT an
+	// external audio input. A no-op on Elements and on CH/OH's models (none
+	// of which have an equivalent free parameter). Reachable only via the
+	// Mod Matrix (see kConceptFm) or this base knob, same as any other
+	// concept - matches how Plaits/Braids-style FM works standalone, no
+	// patched signal required.
 	kParamFmBD, kParamFmSD, kParamFmCH, kParamFmOH,
+
+	// Page 15: WAVEFOLDER AMOUNT - post-fx; applied in ApplyPost() right
+	// after Filter and before Waveshaper (see ApplyWavefolder()), even
+	// though this parameter block sits here, at the *end* of the smoothed/
+	// kit-preset range, not next to Filter/Waveshaper in this enum. It was
+	// originally inserted between them for readability, but that shifted
+	// every later parameter's saved-preset position by 4 and broke loading
+	// old presets (their Volume data landed in the new Pitch slot,
+	// clamping to 127 - Volume's range exceeds Pitch's). New persisted
+	// params must always be *appended* after everything that already
+	// existed when presets were saved, never inserted in the middle -
+	// signal-chain order (kept correct - see ApplyPost()) and
+	// parameter-table order are independent concerns. Wavefolder Type
+	// (page 21, non-modulatable, like Model/FM Mode) picks which fold
+	// curve this amount drives.
+	kParamFoldBD, kParamFoldSD, kParamFoldCH, kParamFoldOH,
+
+	// Page 16: FM MODE - selects how the FM knob's "knock" energy is
+	// generated (see kFmModeXxx below) - a creative/exploratory control, not
+	// a modulatable concept (no Mod Matrix entry, like Model).
+	kParamFmModeBD, kParamFmModeSD, kParamFmModeCH, kParamFmModeOH,
+
+	// Page 16: SAMPLE - which WAV (if any) from this slot's SD card sample
+	// folder (found by name match against kSlotNames - "BD"/"SD"/"CH"/"OH",
+	// see ScanSampleFolders()) is layered in. 0 = None (default - the whole
+	// sample-mix DSP is skipped entirely when no sample is selected, not
+	// just silenced - see MixSampleLayer()). Dynamic .max (0 until the
+	// folder's file count is known) - see parameterChanged()/GetSampleDisplayName().
+	kParamSampleBD, kParamSampleSD, kParamSampleCH, kParamSampleOH,
+	// Page 17: SAMPLE MIX - 0-50% fades the sample in under the synth voice
+	// (synth stays full); 50-100% crossfades the synth out until only the
+	// sample is heard. See MixSampleLayer().
+	kParamSampleMixBD, kParamSampleMixSD, kParamSampleMixCH, kParamSampleMixOH,
+	// Page 18: KNOCK/TAIL - a 5-zone performative curve across the loaded
+	// sample: 0 = full sample; 0.25 = knock portion only; 0.25-0.5 = a
+	// highpass fades in over the knock; 0.5-0.75 = crossfades to the tail
+	// portion with the highpass held; 0.75-1.0 = the highpass fades back out
+	// leaving the tail portion alone. See MixSampleLayer().
+	kParamKnockTailBD, kParamKnockTailSD, kParamKnockTailCH, kParamKnockTailOH,
+	// Page 19: MIX TYPE - how the Knock/Tail split point within the sample
+	// is found: Fixed (a constant early time window, same for every sample)
+	// or Env Follower (adapts per-sample - the point where its amplitude
+	// envelope first decays below a threshold after the peak). Both are
+	// precomputed once at load time - see AnalyzeSampleSplits().
+	kParamMixTypeBD, kParamMixTypeSD, kParamMixTypeCH, kParamMixTypeOH,
+
+	// Page 21: WAVEFOLDER TYPE - which fold curve the Wavefolder Amount
+	// knob (kParamFoldBD et al, near the very end of this enum - see its
+	// own comment for why) drives - Sine (smooth, LUT-based), Triangle
+	// (harder-edged reflect fold), or Buchla (rounder rational soft-fold).
+	// Not modulatable (no Mod Matrix entry, like Model/FM Mode/Mix Type) -
+	// see kWavefolderTypeXxx below.
+	kParamFoldTypeBD, kParamFoldTypeSD, kParamFoldTypeCH, kParamFoldTypeOH,
 
 	kNumParams,
 };
@@ -194,9 +272,74 @@ static int ModRouteParam( int route, int which )
 	return kFirstModRouteParam + route * kNumModRouteParams + which;
 }
 
-static char const * const kEnumModelBD[] = { "Analog", "Synthetic", "Elements" };
-static char const * const kEnumModelSD[] = { "Analog", "Synthetic", "Elements" };
-static char const * const kEnumModelHat[] = { "808", "Elements" };
+static char const * const kEnumModelBD[] = { "Analog", "Synthetic", "Elements", "808", "FM" };
+static char const * const kEnumModelSD[] = { "Analog", "Synthetic", "Elements", "808", "FM" };
+static char const * const kEnumModelHat[] = { "808", "Elements", "Cymbal" };
+
+// FM Mode: selects how the FM knob's attack "knock" energy is actually
+// generated on Analog/Synthetic/808. Default adapts per model - Envelope
+// for Analog/Synthetic/808 (the one-shot decaying pulse/envelope already
+// wired up, unchanged sound), and the FM model's own permanent built-in
+// self-modulation blend (it never reads this parameter at all - see
+// peaks/drums/fm_drum.cc - so Default is simply a no-op there, matching
+// "self-FM" already being its whole character). See ResolveFmMode().
+//
+// The Feedback-family modes replace the envelope with genuine audio-rate
+// self-feedback: the *previous rendered sample's magnitude* (not the raw
+// signed sample - see the "no knock" bug below) is reshaped and then
+// multiplied back onto the original sign, so the feedback amount always
+// spans the model's full 0..1 depth range regardless of which curve is
+// picked - only the *timing/shape* of how that depth responds to signal
+// level changes, never the ceiling. Pow2/Pow3 are "expander"-like (an
+// octave-ish crunch on transients that dies away as the signal itself
+// decays, since low-level signal is de-emphasized relative to peaks); Log
+// is the opposite - an "ease-up" curve that stays more sensitive at low
+// signal levels (the closest analogue to a logarithmic response without an
+// actual log() call - see distingnt_libm_symbol_constraints project
+// memory). Both layers the envelope and linear feedback together for the
+// deepest/most unstable result.
+//
+// Bug fix: earlier feedback modes fed back the raw sample directly, which
+// starts at (or near) 0 right at trigger - there's no signal yet to feed
+// back from at the exact instant the knock matters most, so the attack
+// was inaudible. Every model seeds `previous_sample_` with the trigger's
+// own accent right at trigger time now, so feedback modes have a genuine,
+// velocity-scaled kick to work with from sample 0, transitioning to real
+// audio-derived feedback as soon as the excitation actually produces sound.
+enum {
+	kFmModeDefault, kFmModeEnvelope, kFmModeFeedbackLinear,
+	kFmModeFeedbackPow2, kFmModeFeedbackPow3, kFmModeFeedbackLog,
+	kFmModeBoth, kNumFmModes,
+};
+static char const * const kEnumFmMode[] = {
+	"Default", "Envelope", "Fb Linear", "Fb Pow2", "Fb Pow3", "Fb Log", "Both",
+};
+static_assert( ARRAY_SIZE(kEnumFmMode) == kNumFmModes, "" );
+
+// Maps the UI-facing kFmModeXxx value (with Default at 0) to the 0-based
+// mode number Analog/Synthetic/808's Render()/Process() calls actually
+// switch on (0=Envelope..5=Both - see their own header comments) - Default
+// resolves to Envelope for these models specifically.
+static int ResolveFmMode( int uiMode )
+{
+	if ( uiMode == kFmModeDefault )
+		return 0;	// Envelope
+	return uiMode - 1;
+}
+// Knock/Tail split-point source - see kParamMixTypeXX's comment.
+enum { kMixTypeFixed, kMixTypeEnvFollower, kNumMixTypes };
+static char const * const kEnumMixType[] = { "Fixed", "Env Follower" };
+static_assert( ARRAY_SIZE(kEnumMixType) == kNumMixTypes, "" );
+
+// Wavefolder fold curve - see kParamFoldTypeBD's comment and
+// ApplyWavefolder(). All three are libm-safe (LUT or rational-polynomial
+// only - no tanh/sinh/atan, which the firmware's plugin loader isn't
+// confirmed to resolve, see distingnt_libm_symbol_constraints project
+// memory) rather than literal ports of any specific reference circuit.
+enum { kWavefolderTypeSine, kWavefolderTypeTriangle, kWavefolderTypeBuchla, kNumWavefolderTypes };
+static char const * const kEnumWavefolderType[] = { "Sine", "Triangle", "Buchla" };
+static_assert( ARRAY_SIZE(kEnumWavefolderType) == kNumWavefolderTypes, "" );
+
 static char const * const kEnumMidiMode[] = { "Note per slot", "Channel per slot" };
 static char const * const kEnumStereo[] = { "Mono", "Stereo" };
 
@@ -254,10 +397,10 @@ static _NT_parameter parameters[] = {
 	{ .name = "LFO2 rate", .min = 0, .max = ARRAY_SIZE(kEnumLfoRate) - 1, .def = 2, .unit = kNT_unitEnum, .scaling = 0, .enumStrings = kEnumLfoRate },
 	{ .name = "LFO2 shape", .min = 0, .max = 100, .def = 0, .unit = kNT_unitPercent, .scaling = 0, .enumStrings = NULL },
 
-	{ .name = "BD model", .min = 0, .max = 2, .def = 0, .unit = kNT_unitEnum, .scaling = 0, .enumStrings = kEnumModelBD },
-	{ .name = "SD model", .min = 0, .max = 2, .def = 0, .unit = kNT_unitEnum, .scaling = 0, .enumStrings = kEnumModelSD },
-	{ .name = "CH model", .min = 0, .max = 1, .def = 0, .unit = kNT_unitEnum, .scaling = 0, .enumStrings = kEnumModelHat },
-	{ .name = "OH model", .min = 0, .max = 1, .def = 0, .unit = kNT_unitEnum, .scaling = 0, .enumStrings = kEnumModelHat },
+	{ .name = "BD model", .min = 0, .max = 4, .def = 0, .unit = kNT_unitEnum, .scaling = 0, .enumStrings = kEnumModelBD },
+	{ .name = "SD model", .min = 0, .max = 4, .def = 0, .unit = kNT_unitEnum, .scaling = 0, .enumStrings = kEnumModelSD },
+	{ .name = "CH model", .min = 0, .max = 2, .def = 0, .unit = kNT_unitEnum, .scaling = 0, .enumStrings = kEnumModelHat },
+	{ .name = "OH model", .min = 0, .max = 2, .def = 0, .unit = kNT_unitEnum, .scaling = 0, .enumStrings = kEnumModelHat },
 
 	{ .name = "BD release", .min = 0, .max = 100, .def = 40, .unit = kNT_unitPercent, .scaling = 0, .enumStrings = NULL },
 	{ .name = "SD release", .min = 0, .max = 100, .def = 40, .unit = kNT_unitPercent, .scaling = 0, .enumStrings = NULL },
@@ -307,6 +450,49 @@ static _NT_parameter parameters[] = {
 	{ .name = "SD FM", .min = 0, .max = 100, .def = 0, .unit = kNT_unitPercent, .scaling = 0, .enumStrings = NULL },
 	{ .name = "CH FM", .min = 0, .max = 100, .def = 0, .unit = kNT_unitPercent, .scaling = 0, .enumStrings = NULL },
 	{ .name = "OH FM", .min = 0, .max = 100, .def = 0, .unit = kNT_unitPercent, .scaling = 0, .enumStrings = NULL },
+
+	// Post-fx (see kParamFoldBD's comment for why this sits here in the
+	// parameter table rather than next to Filter/Waveshaper).
+	{ .name = "BD wavefolder", .min = 0, .max = 100, .def = 0, .unit = kNT_unitPercent, .scaling = 0, .enumStrings = NULL },
+	{ .name = "SD wavefolder", .min = 0, .max = 100, .def = 0, .unit = kNT_unitPercent, .scaling = 0, .enumStrings = NULL },
+	{ .name = "CH wavefolder", .min = 0, .max = 100, .def = 0, .unit = kNT_unitPercent, .scaling = 0, .enumStrings = NULL },
+	{ .name = "OH wavefolder", .min = 0, .max = 100, .def = 0, .unit = kNT_unitPercent, .scaling = 0, .enumStrings = NULL },
+
+	{ .name = "BD FM mode", .min = 0, .max = kNumFmModes - 1, .def = 0, .unit = kNT_unitEnum, .scaling = 0, .enumStrings = kEnumFmMode },
+	{ .name = "SD FM mode", .min = 0, .max = kNumFmModes - 1, .def = 0, .unit = kNT_unitEnum, .scaling = 0, .enumStrings = kEnumFmMode },
+	{ .name = "CH FM mode", .min = 0, .max = kNumFmModes - 1, .def = 0, .unit = kNT_unitEnum, .scaling = 0, .enumStrings = kEnumFmMode },
+	{ .name = "OH FM mode", .min = 0, .max = kNumFmModes - 1, .def = 0, .unit = kNT_unitEnum, .scaling = 0, .enumStrings = kEnumFmMode },
+
+	// Sample: 0 = None, max starts at 0 (only None selectable) until the
+	// slot's SD card folder is found and its file count known - see
+	// ScanSampleFolders()/parameterChanged(). No static enumStrings (the
+	// file list is only known at runtime) - kNT_unitHasStrings + the
+	// parameterString() callback display it instead, same pattern as the
+	// official distingNT_API samplePlayer.cpp example.
+	{ .name = "BD sample", .min = 0, .max = 0, .def = 0, .unit = kNT_unitHasStrings, .scaling = 0, .enumStrings = NULL },
+	{ .name = "SD sample", .min = 0, .max = 0, .def = 0, .unit = kNT_unitHasStrings, .scaling = 0, .enumStrings = NULL },
+	{ .name = "CH sample", .min = 0, .max = 0, .def = 0, .unit = kNT_unitHasStrings, .scaling = 0, .enumStrings = NULL },
+	{ .name = "OH sample", .min = 0, .max = 0, .def = 0, .unit = kNT_unitHasStrings, .scaling = 0, .enumStrings = NULL },
+
+	{ .name = "BD sample mix", .min = 0, .max = 100, .def = 0, .unit = kNT_unitPercent, .scaling = 0, .enumStrings = NULL },
+	{ .name = "SD sample mix", .min = 0, .max = 100, .def = 0, .unit = kNT_unitPercent, .scaling = 0, .enumStrings = NULL },
+	{ .name = "CH sample mix", .min = 0, .max = 100, .def = 0, .unit = kNT_unitPercent, .scaling = 0, .enumStrings = NULL },
+	{ .name = "OH sample mix", .min = 0, .max = 100, .def = 0, .unit = kNT_unitPercent, .scaling = 0, .enumStrings = NULL },
+
+	{ .name = "BD knock/tail", .min = 0, .max = 100, .def = 0, .unit = kNT_unitPercent, .scaling = 0, .enumStrings = NULL },
+	{ .name = "SD knock/tail", .min = 0, .max = 100, .def = 0, .unit = kNT_unitPercent, .scaling = 0, .enumStrings = NULL },
+	{ .name = "CH knock/tail", .min = 0, .max = 100, .def = 0, .unit = kNT_unitPercent, .scaling = 0, .enumStrings = NULL },
+	{ .name = "OH knock/tail", .min = 0, .max = 100, .def = 0, .unit = kNT_unitPercent, .scaling = 0, .enumStrings = NULL },
+
+	{ .name = "BD mix type", .min = 0, .max = kNumMixTypes - 1, .def = 0, .unit = kNT_unitEnum, .scaling = 0, .enumStrings = kEnumMixType },
+	{ .name = "SD mix type", .min = 0, .max = kNumMixTypes - 1, .def = 0, .unit = kNT_unitEnum, .scaling = 0, .enumStrings = kEnumMixType },
+	{ .name = "CH mix type", .min = 0, .max = kNumMixTypes - 1, .def = 0, .unit = kNT_unitEnum, .scaling = 0, .enumStrings = kEnumMixType },
+	{ .name = "OH mix type", .min = 0, .max = kNumMixTypes - 1, .def = 0, .unit = kNT_unitEnum, .scaling = 0, .enumStrings = kEnumMixType },
+
+	{ .name = "BD fold type", .min = 0, .max = kNumWavefolderTypes - 1, .def = 0, .unit = kNT_unitEnum, .scaling = 0, .enumStrings = kEnumWavefolderType },
+	{ .name = "SD fold type", .min = 0, .max = kNumWavefolderTypes - 1, .def = 0, .unit = kNT_unitEnum, .scaling = 0, .enumStrings = kEnumWavefolderType },
+	{ .name = "CH fold type", .min = 0, .max = kNumWavefolderTypes - 1, .def = 0, .unit = kNT_unitEnum, .scaling = 0, .enumStrings = kEnumWavefolderType },
+	{ .name = "OH fold type", .min = 0, .max = kNumWavefolderTypes - 1, .def = 0, .unit = kNT_unitEnum, .scaling = 0, .enumStrings = kEnumWavefolderType },
 };
 
 static const uint8_t pageRouting[]   = { kParamOutBD, kParamOutBDMode, kParamStereoBD, kParamPanBD, kParamOutSD, kParamOutSDMode, kParamStereoSD, kParamPanSD, kParamOutCH, kParamOutCHMode, kParamStereoCH, kParamPanCH, kParamOutOH, kParamOutOHMode, kParamStereoOH, kParamPanOH };
@@ -323,6 +509,13 @@ static const uint8_t pageVolume[]    = { kParamVolBD, kParamVolSD, kParamVolCH, 
 static const uint8_t pageTone[]      = { kParamToneBD, kParamToneSD, kParamToneCH, kParamToneOH };
 static const uint8_t pageChar[]      = { kParamCharBD, kParamCharSD, kParamCharCH, kParamCharOH };
 static const uint8_t pageFm[]        = { kParamFmBD, kParamFmSD, kParamFmCH, kParamFmOH };
+static const uint8_t pageFmMode[]    = { kParamFmModeBD, kParamFmModeSD, kParamFmModeCH, kParamFmModeOH };
+static const uint8_t pageSample[]    = { kParamSampleBD, kParamSampleSD, kParamSampleCH, kParamSampleOH };
+static const uint8_t pageSampleMix[] = { kParamSampleMixBD, kParamSampleMixSD, kParamSampleMixCH, kParamSampleMixOH };
+static const uint8_t pageKnockTail[] = { kParamKnockTailBD, kParamKnockTailSD, kParamKnockTailCH, kParamKnockTailOH };
+static const uint8_t pageMixType[]   = { kParamMixTypeBD, kParamMixTypeSD, kParamMixTypeCH, kParamMixTypeOH };
+static const uint8_t pageFold[]      = { kParamFoldBD, kParamFoldSD, kParamFoldCH, kParamFoldOH };
+static const uint8_t pageFoldType[]  = { kParamFoldTypeBD, kParamFoldTypeSD, kParamFoldTypeCH, kParamFoldTypeOH };
 
 // The Mod Matrix's 32 params are contiguous (kFirstModRouteParam..+31) in
 // exactly this sequential order already, so this is just that range restated
@@ -353,6 +546,13 @@ static const _NT_parameterPage pages[] = {
 	{ .name = "Tone", .numParams = ARRAY_SIZE(pageTone), .params = pageTone },
 	{ .name = "Character", .numParams = ARRAY_SIZE(pageChar), .params = pageChar },
 	{ .name = "FM", .numParams = ARRAY_SIZE(pageFm), .params = pageFm },
+	{ .name = "FM Mode", .numParams = ARRAY_SIZE(pageFmMode), .params = pageFmMode },
+	{ .name = "Sample", .numParams = ARRAY_SIZE(pageSample), .params = pageSample },
+	{ .name = "Sample Mix", .numParams = ARRAY_SIZE(pageSampleMix), .params = pageSampleMix },
+	{ .name = "Knock/Tail", .numParams = ARRAY_SIZE(pageKnockTail), .params = pageKnockTail },
+	{ .name = "Mix Type", .numParams = ARRAY_SIZE(pageMixType), .params = pageMixType },
+	{ .name = "Wavefolder", .numParams = ARRAY_SIZE(pageFold), .params = pageFold },
+	{ .name = "Wavefolder Type", .numParams = ARRAY_SIZE(pageFoldType), .params = pageFoldType },
 };
 
 static const _NT_parameterPages parameterPages = {
@@ -371,8 +571,11 @@ static const _NT_parameterPages parameterPages = {
 // config, not sound-shaping, so don't need dedicated custom-UI real estate).
 enum {
 	kPageRouting, kPageMidi, kPageEnvelopes, kPageLfos, kPageModMatrix,
-	kPageModel, kPageRelease, kPageCompressor, kPageFilter, kPageWaveshaper,
-	kPagePitch, kPageVolume, kPageTone, kPageCharacter, kPageFm,
+	kPageModel, kPageRelease, kPageCompressor, kPageFilter,
+	kPageWaveshaper,
+	kPagePitch, kPageVolume, kPageTone, kPageCharacter, kPageFm, kPageFmMode,
+	kPageSample, kPageSampleMix, kPageKnockTail, kPageMixType,
+	kPageFold, kPageFoldType,
 	kNumPages,
 };
 enum { kFirstCustomPage = kPageEnvelopes };
@@ -380,66 +583,118 @@ enum { kFirstCustomPage = kPageEnvelopes };
 enum { kPageTypeList, kPageTypeGraph, kPageTypeBar };
 static const int kPageType[kNumPages] = {
 	kPageTypeList, kPageTypeList, kPageTypeGraph, kPageTypeGraph, kPageTypeList,
-	kPageTypeBar, kPageTypeBar, kPageTypeBar, kPageTypeBar, kPageTypeBar,
-	kPageTypeBar, kPageTypeBar, kPageTypeBar, kPageTypeBar, kPageTypeBar,
+	kPageTypeBar, kPageTypeBar, kPageTypeBar, kPageTypeBar,
+	kPageTypeBar,
+	kPageTypeBar, kPageTypeBar, kPageTypeBar, kPageTypeBar, kPageTypeBar, kPageTypeBar,
+	kPageTypeBar, kPageTypeBar, kPageTypeBar, kPageTypeBar,
+	kPageTypeBar, kPageTypeBar,
 };
 // List pages (Routing/MIDI/Mod Matrix) use these via SetupPageParams()/
-// SetupPageItemCount(); graph/bar pages (Envelopes/LFOs/Model..FM) use
+// SetupPageItemCount(); graph/bar pages (Envelopes/LFOs/Model..Fold Type) use
 // kPageParams directly since they always have exactly 4 params (one per
 // pot/encoder control - see customUi()).
 static const uint8_t* const kPageParams[kNumPages] = {
 	pageRouting, pageMidi, pageEnvelopes, pageLfos, pageModMatrix,
-	pageModel, pageRelease, pageComp, pageFilter, pageDrive,
-	pagePitch, pageVolume, pageTone, pageChar, pageFm,
+	pageModel, pageRelease, pageComp, pageFilter,
+	pageDrive,
+	pagePitch, pageVolume, pageTone, pageChar, pageFm, pageFmMode,
+	pageSample, pageSampleMix, pageKnockTail, pageMixType,
+	pageFold, pageFoldType,
 };
 static const int kPageItemCount[kNumPages] = {
 	(int)ARRAY_SIZE(pageRouting), (int)ARRAY_SIZE(pageMidi), 0, 0, (int)ARRAY_SIZE(pageModMatrix),
-	0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+	0, 0, 0, 0,
+	0,
+	0, 0, 0, 0, 0, 0,
+	0, 0, 0, 0,
+	0, 0,
 };
 static const char* const kPageNames[kNumPages] = {
 	"ROUTING", "MIDI", "ENVELOPES", "LFOS", "MOD MATRIX",
-	"MODEL", "RELEASE", "COMPRESSOR", "FILTER", "WAVESHAPE",
-	"PITCH", "VOLUME", "TONE", "CHARACTER", "FM",
+	"MODEL", "RELEASE", "COMPRESSOR", "FILTER",
+	"WAVESHAPE",
+	"PITCH", "VOLUME", "TONE", "CHARACTER", "FM", "FM MODE",
+	"SAMPLE", "SAMPLE MIX", "KNOCK/TAIL", "MIX TYPE",
+	"WAVEFOLDER", "FOLD TYPE",
 };
 static const bool kPageBipolar[kNumPages] = {
 	false, false, false, false, false,
-	false, false, false, true, false, false, false, false, false, false,
+	false, false, false, true,
+	false,
+	false, false, false, false, false, false,
+	false, false, false, false,
+	false, false,
 };
-// kConceptXxx for each bar-style page, or -1 for non-bar pages and Model
-// itself (not a modulatable concept).
+// kConceptXxx for each bar-style page, or -1 for non-bar pages and Model/FM
+// Mode/Fold Type/Sample/Mix Type (none of which are modulatable concepts).
 static const int kPageConcept[kNumPages] = {
 	-1, -1, -1, -1, -1,
-	-1, kConceptRelease, kConceptCompressor, kConceptFilter, kConceptDrive,
-	kConceptPitch, kConceptVolume, kConceptTone, kConceptCharacter, kConceptFm,
+	-1, kConceptRelease, kConceptCompressor, kConceptFilter,
+	kConceptDrive,
+	kConceptPitch, kConceptVolume, kConceptTone, kConceptCharacter, kConceptFm, -1,
+	-1, -1, -1, -1,
+	kConceptFold, -1,
 };
 
-// The 9 concepts below Model get smoothed for the preset-load fade (Model
+// The 10 concepts below Model get smoothed for the preset-load fade (Model
 // itself snaps instantly - "models are loaded directly" per the spec).
-// They're contiguous in the parameter enum (kParamRelBD..kParamFmOH), so
-// a smoothed parameter's shadow-state index is just paramIndex - kFirstSmoothedParam.
+// They're contiguous in the parameter enum (kParamRelBD..kParamFoldOH -
+// Wavefolder is appended at the very end of this range, after FM, rather
+// than sitting next to Filter/Waveshaper where it applies in the actual
+// signal chain - see kParamFoldBD's comment for why), so a smoothed
+// parameter's shadow-state index is just paramIndex - kFirstSmoothedParam.
 enum {
 	kFirstSmoothedParam = kParamRelBD,
-	kNumSmoothedParams = kParamFmOH - kParamRelBD + 1,
+	kNumSmoothedParams = kParamFoldOH - kParamRelBD + 1,
 };
-static_assert( kNumSmoothedParams == 36, "expected 9 smoothed concepts x 4 slots" );
+static_assert( kNumSmoothedParams == 40, "expected 10 smoothed concepts x 4 slots" );
 
-// A saved "kit" preset covers Model through FM (also contiguous) -
+// A saved "kit" preset covers Model through Wavefolder (also contiguous) -
 // deliberately *not* Routing/MIDI, which are how this instance is patched
 // into the rig rather than part of the drum sound, so loading a different
 // kit doesn't silently move which bus/MIDI note each slot responds to.
 enum {
 	kFirstKitParam = kParamModelBD,
-	kNumKitParams = kParamFmOH - kParamModelBD + 1,
+	kNumKitParams = kParamFoldOH - kParamModelBD + 1,
 };
-static_assert( kNumKitParams == 40, "expected 4 model + 36 smoothed params" );
+static_assert( kNumKitParams == 44, "expected 4 model + 40 smoothed params" );
 
 // Second preset block: everything that isn't part of the contiguous kit
-// range above - the 8 Envelope/LFO globals plus the Mod Matrix's 32
-// contiguous route params (see SavePreset()/LoadPreset()/serialise()/
-// deserialise()).
+// range above - the 8 Envelope/LFO globals, FM Mode (4) and the 16
+// Sample-layer params (Sample/Sample Mix/Knock-Tail/Mix Type x4 slots -
+// none of these three groups are contiguous with the kit range or each
+// other, but this block is just a flat index list, not a range, so that's
+// not a requirement), plus the Mod Matrix's 32 contiguous route params
+// (see SavePreset()/LoadPreset()/serialise()/deserialise()). All snap
+// instantly on preset load like Model, rather than fading in - matches
+// this whole block's existing "no fade" treatment.
+//
+// UNVERIFIED HYPOTHESIS, under test: an earlier version of this session
+// had the Sample-layer params here too, and shortly after, saving a preset
+// triggered the host's own "preset too complex to load, please report as a
+// bug" error on the next load. That was pulled out under the theory that
+// the added ~1000 ints of extra JSON payload (16 params x 64 preset slots)
+// crossed some host-side size limit. But that save happened shortly after
+// a separate, real bug (the Env Follower analysis running an uninterrupted
+// O(sample length) scan synchronously in the load callback, since fixed -
+// see AdvanceSampleAnalysis()) had reportedly overloaded the device's CPU -
+// so the corruption may equally have been the save itself glitching under
+// an already-overloaded device, unrelated to payload size at all. Re-added
+// here specifically so that can be tested in isolation, now that the CPU
+// overload itself is fixed: save/load a preset with real sample data in a
+// normal (non-overloaded) session and see whether "too complex" recurs. If
+// if it does, the payload-size theory holds and this needs a different fix
+// (e.g. not all 64 slots' worth); if not, the CPU overload was the whole
+// story and this can just stay as-is.
 static const uint8_t kModParams[] = {
 	kParamEnv1Morph, kParamEnv1Shape, kParamEnv2Morph, kParamEnv2Shape,
 	kParamLfo1Rate, kParamLfo1Shape, kParamLfo2Rate, kParamLfo2Shape,
+	kParamFmModeBD, kParamFmModeSD, kParamFmModeCH, kParamFmModeOH,
+	kParamSampleBD, kParamSampleSD, kParamSampleCH, kParamSampleOH,
+	kParamSampleMixBD, kParamSampleMixSD, kParamSampleMixCH, kParamSampleMixOH,
+	kParamKnockTailBD, kParamKnockTailSD, kParamKnockTailCH, kParamKnockTailOH,
+	kParamMixTypeBD, kParamMixTypeSD, kParamMixTypeCH, kParamMixTypeOH,
+	kParamFoldTypeBD, kParamFoldTypeSD, kParamFoldTypeCH, kParamFoldTypeOH,
 };
 enum { kNumModRouteParamsTotal = kNumModRoutes * kNumModRouteParams };
 enum { kNumModParams = ARRAY_SIZE(kModParams) + kNumModRouteParamsTotal };
@@ -506,6 +761,24 @@ struct _drumVoicePost
 	_envelopeState env1;
 	_envelopeState env2;
 
+	// FM state for models with no internal per-sample FM hook of their own
+	// (Elements, plaits::HiHat, braids::Cymbal) - see ComputeExternalFmPush().
+	// A coarser, per-BLOCK approximation of the same Envelope/Feedback
+	// family Analog/Synthetic/808 already do per-sample internally.
+	float fmEnvLevel;
+	float fmEnvElapsed;
+	float fmPrevSample;
+
+	// Sample-layer playback state (see MixSampleLayer()) - a continuous
+	// one-shot read position (in the loaded sample's own native frame rate,
+	// not this project's, so playback resamples via a fractional increment
+	// exactly like the official distingNT_API samplePlayer.cpp example),
+	// and a dedicated highpass distinct from hpFilter above (that one's
+	// owned by ApplyPost()'s DJ-style Filter page - reusing it here would
+	// fight over its cachedFilterParam-driven coefficients).
+	float samplePos;
+	stmlib::Svf sampleHp;
+
 	void Init()
 	{
 		lpFilter.Init();
@@ -518,6 +791,16 @@ struct _drumVoicePost
 		cachedFilterParam = 9999;
 		env1.Init();
 		env2.Init();
+		fmEnvLevel = 0.0f;
+		fmEnvElapsed = 0.0f;
+		fmPrevSample = 0.0f;
+		samplePos = 0.0f;
+		sampleHp.Init();
+		// Fixed cutoff (not user-adjustable - Knock/Tail already owns this
+		// page's controls), so it's cheap to set once here rather than
+		// recomputing set_f_q() every block in MixSampleLayer() the way
+		// ApplyPost()'s user-adjustable Filter page has to.
+		sampleHp.set_f_q<stmlib::FREQUENCY_FAST>( 700.0f / plaits::kSampleRate, 0.6f );
 	}
 };
 
@@ -527,6 +810,8 @@ struct _kickVoice : _drumVoicePost
 	plaits::SyntheticBassDrum synthetic;
 	elements::Exciter elementsExciter;
 	elements::Resonator elementsResonator;
+	peaks::BassDrum peaksBass;
+	peaks::FmDrum peaksFm;
 
 	void Init()
 	{
@@ -535,6 +820,8 @@ struct _kickVoice : _drumVoicePost
 		synthetic.Init();
 		elementsExciter.Init();
 		elementsResonator.Init();
+		peaksBass.Init();
+		peaksFm.Init();
 	}
 };
 
@@ -544,6 +831,8 @@ struct _snareVoice : _drumVoicePost
 	plaits::SyntheticSnareDrum synthetic;
 	elements::Exciter elementsExciter;
 	elements::Resonator elementsResonator;
+	peaks::SnareDrum peaksSnare;
+	peaks::FmDrum peaksFm;
 
 	void Init()
 	{
@@ -552,6 +841,8 @@ struct _snareVoice : _drumVoicePost
 		synthetic.Init();
 		elementsExciter.Init();
 		elementsResonator.Init();
+		peaksSnare.Init();
+		peaksFm.Init();
 	}
 };
 
@@ -560,8 +851,18 @@ struct _hatVoice : _drumVoicePost
 	plaits::HiHat<plaits::SquareNoise, plaits::SwingVCA, true, false> hihat;
 	elements::Exciter elementsExciter;
 	elements::Resonator elementsResonator;
+	braids::Cymbal braidsCymbal;
 	float* scratch1;	// [maxFramesPerStep], points into dram
 	float* scratch2;	// [maxFramesPerStep], points into dram
+
+	// Unlike every other model, Braids' Cymbal has no envelope of its own
+	// (it's a continuously-running texture) - see braids/cymbal.h's header
+	// comment. This is this voice's own simple linear decay, driven by the
+	// Release knob same as any other model, applied as a post-multiply on
+	// Cymbal's output in ProcessHat().
+	float cymbalElapsed;
+	float cymbalTotalS;
+	bool cymbalActive;
 
 	void Init()
 	{
@@ -569,6 +870,10 @@ struct _hatVoice : _drumVoicePost
 		hihat.Init();
 		elementsExciter.Init();
 		elementsResonator.Init();
+		braidsCymbal.Init();
+		cymbalElapsed = 0.0f;
+		cymbalTotalS = 1.0f;
+		cymbalActive = false;
 	}
 };
 
@@ -578,6 +883,53 @@ struct _drumMachineAlgorithm_DTC
 	_snareVoice snare;
 	_hatVoice closedHat;
 	_hatVoice openHat;
+};
+
+// Per-slot SD-card sample state - lives in SRAM (alongside the algorithm
+// struct itself). Playback uses the disting NT streaming API
+// (NT_streamOpen()/NT_streamRender(), see distingNT_API/examples/
+// sampleStreamer.cpp) rather than a bulk NT_readSampleFrames() load into a
+// big per-slot buffer - an earlier version used the bulk-load approach and
+// it froze the device when all 4 slots loaded a fresh preset at once (4
+// simultaneous multi-second reads). Streaming opens near-instantly (see
+// MixSampleLayer(), which calls NT_streamOpen() on every trigger to
+// restart playback from the top) and pulls only the current block's worth
+// of audio each step(), so cost is spread evenly instead of front-loaded.
+// `stream` points into DTC, `streamBuffer` into DRAM (both sized from
+// NT_globals.streamSizeBytes/streamBufferSizeBytes at construct() time,
+// since neither is a compile-time constant).
+struct _sampleSlot
+{
+	int folderIndex;		// -1 = this slot's named folder not found (yet, or at all)
+	int numSampleFiles;
+	int sampleFileIndex;	// which file within the folder, 0-based; -1 = None selected
+	bool hasSample;			// true once a valid (non-None) sample is selected
+	float loadedSampleRate;
+	uint32_t loadedNumFrames;	// total frames in the file (NT_getSampleFileInfo) - used for idle-tail sizing, not buffering
+	// Both split-point candidates - Fixed is a plain formula, computed
+	// immediately on selection; Env Follower needs to actually look at the
+	// audio, which (now that full-file buffering is gone) means a small,
+	// separate, bounded analysis read - see the shared (not per-slot)
+	// analysis* fields on _drumMachineAlgorithm and RequestAnalysis().
+	// splitFrameEnvFollower defaults to the Fixed value until that
+	// analysis completes, so Mix Type is always usable immediately.
+	int splitFrameFixed;
+	int splitFrameEnvFollower;
+
+	_NT_stream stream;
+	void* streamBuffer;
+
+	void Init()
+	{
+		folderIndex = -1;
+		numSampleFiles = 0;
+		sampleFileIndex = -1;
+		hasSample = false;
+		loadedSampleRate = 48000.0f;
+		loadedNumFrames = 0;
+		splitFrameFixed = 0;
+		splitFrameEnvFollower = 0;
+	}
 };
 
 // Shadow state for one of the 32 smoothed parameters (see kFirstSmoothedParam).
@@ -593,7 +945,7 @@ struct _paramSmoother
 	int samplesRemaining;
 };
 
-static const int kNumPresets = 8;
+static const int kNumPresets = 64;
 
 // Auto-naming for saved presets: splices one word from each list together
 // (e.g. "SHADOW VENOM", "WINTERMOOD BABE") so slots get a recallable name
@@ -619,6 +971,18 @@ struct _drumMachineAlgorithm : public _NT_algorithm
 	float* renderScratch;	// [maxFramesPerStep], points into dram
 	float* dryScratch;		// [maxFramesPerStep], points into dram - dry copy for the waveshaper crossfade
 	float* elementsExciteScratch;	// [maxFramesPerStep], points into dram - shared, reused sequentially across voices like renderScratch
+
+	// Own, mutable copy of the static `parameters` table - needed so the
+	// Sample params' `.max` can be updated per-instance at runtime (once
+	// each slot's SD card folder file count is known - see
+	// ScanSampleFolders()/NT_updateParameterDefinition()) without one
+	// instance's discovered file count leaking into every other loaded
+	// instance of this algorithm, which sharing the single static table
+	// directly would do. Same pattern as the official distingNT_API
+	// samplePlayer.cpp example. Every other read of pThis->parameters[...]
+	// elsewhere in this file already goes through this pointer, so no other
+	// code needed to change when this stopped pointing at the static table.
+	_NT_parameter params[kNumParams];
 
 	_paramSmoother smoother[kNumSmoothedParams];
 	bool smoothersInitialized;
@@ -737,21 +1101,300 @@ struct _drumMachineAlgorithm : public _NT_algorithm
 	// modulation (ModulatedViaMatrix()) and for the LFOs page's live display.
 	float lfo1Phase, lfo2Phase;
 	float lfo1Value, lfo2Value;
+
+	// SD card sample-layer state, one per slot (BD/SD/CH/OH, matching
+	// kSlotXxx) - see _sampleSlot's own comment, ScanSampleFolders(), and
+	// MixSampleLayer().
+	_sampleSlot sampleSlot[kNumSlots];
+	// Debounced NT_isSdCardMounted() transition - re-triggers a folder
+	// rescan on remount (e.g. a different card with different sample
+	// folders), same pattern as the official samplePlayer.cpp example.
+	bool sdCardWasMounted;
+
+	// Shared (not per-slot) Env Follower analysis state - a small, bounded
+	// NT_readSampleFrames() read (analysisBuffer, ~0.25s, into DRAM - see
+	// calculateRequirements()) purely to locate the Knock/Tail split point,
+	// entirely separate from actual playback (which streams - see
+	// _sampleSlot::stream). Only one slot's analysis is ever in flight at a
+	// time - a second/third/fourth request (e.g. all 4 slots getting a
+	// fresh sample on one preset load) queues in analysisPending[] instead
+	// of firing simultaneously, so even this small read never bursts 4-wide
+	// at once. See RequestAnalysis()/AdvanceSampleAnalysis().
+	float* analysisBuffer;
+	int analysisMaxFrames;
+	_NT_wavRequest analysisRequest;
+	int analysisCurrentSlot;		// -1 = idle
+	bool analysisAwaitingCallback;
+	int analysisLoadedNumFrames;
+	int analysisScanPos;
+	int analysisScanPhase;			// 0 = scanning for the buffer's peak, 1 = scanning post-peak for the decay threshold
+	float analysisScanEnv;
+	float analysisScanPeak;
+	int analysisScanPeakFrame;
+	bool analysisPending[kNumSlots];
+
+	// Counts down (in samples, decremented once per step() - see
+	// SampleSystemBusy()) after any sample-loading-related activity - a
+	// preset load (ours via LoadPreset(), or the host's own via
+	// deserialise()), or a live Sample param edit via StartSampleLoad().
+	// While non-zero (or while an analysis read is actually in flight -
+	// see SampleSystemBusy()), MixSampleLayer() skips opening/rendering
+	// its stream entirely, even on trigger. Confirmed by testing: a preset
+	// with samples loaded fine with playback stopped, but froze the device
+	// loading during active playback - the sample-streaming API's
+	// NT_streamOpen()/NT_streamRender() calls (fired on every trigger)
+	// colliding with the SD card activity a preset load itself involves
+	// (the host's own preset-file read, plus our analysis reads) is the
+	// most likely explanation, so this gate keeps triggered hits from
+	// touching the sample-streaming API at all until things have settled.
+	int sampleSystemGraceSamples;
 };
 
 // ---------------------------------------------------------------------
 // Requirements / construction
 // ---------------------------------------------------------------------
 
+// Per-slot sample buffer capacity - 2 seconds, matching IdleSamples()'s own
+// kMaxTailSeconds ceiling (same "as long as any model's decay could ever
+// run" reasoning). A separate function (not a constant) since it depends on
+// NT_globals.sampleRate, which calculateRequirements() and construct() must
+// both derive identically - factored once here so they can never drift
+// apart from each other.
+//
+// Analysis buffer capacity - deliberately small (~0.25s) since it exists
+// only to locate the Knock/Tail Env Follower split point, which for a
+// drum one-shot is virtually always within the attack/first decay, not
+// somewhere deep into a multi-second file. Actual playback no longer
+// buffers the file at all (see _sampleSlot::stream) - this is a
+// completely separate, much smaller, one-off read.
+static int AnalysisMaxFrames()
+{
+	return (int)( 0.25f * NT_globals.sampleRate );
+}
+
+// (Re)starts the sample-system "settle" window - see
+// sampleSystemGraceSamples's comment on the algorithm struct. Called from
+// anywhere sample-loading-related SD activity might be about to happen:
+// LoadPreset(), deserialise(), and StartSampleLoad() (covering both a
+// preset load and a live Sample param edit).
+static void ExtendSampleSystemGrace( _drumMachineAlgorithm* pThis )
+{
+	pThis->sampleSystemGraceSamples = (int)( 0.5f * NT_globals.sampleRate );
+}
+
+// True while it's not safe to touch the sample-streaming API (see
+// MixSampleLayer()) - either an analysis read is actually in flight/queued,
+// or we're still within the settle window after some sample-loading-
+// related activity (see ExtendSampleSystemGrace()).
+static bool SampleSystemBusy( _drumMachineAlgorithm* pThis )
+{
+	if ( pThis->analysisCurrentSlot != -1 || pThis->sampleSystemGraceSamples > 0 )
+		return true;
+	for ( int i=0; i<kNumSlots; ++i )
+		if ( pThis->analysisPending[i] )
+			return true;
+	return false;
+}
+
+static void StartAnalysisRead( _drumMachineAlgorithm* pThis, int slot );
+
+// Starts the next queued slot's analysis, if any - shared by both the
+// normal "scan finished" path and StartAnalysisRead()'s own failure path
+// (NT_readSampleFrames() returning false). The failure path used to leave
+// any other already-queued slots stuck in analysisPending[] forever, since
+// nothing else ever re-checked the queue once analysisCurrentSlot reset to
+// -1 outside of a successful scan completion.
+static void AdvanceAnalysisQueue( _drumMachineAlgorithm* pThis )
+{
+	for ( int i=0; i<kNumSlots; ++i )
+	{
+		if ( pThis->analysisPending[i] )
+		{
+			StartAnalysisRead( pThis, i );
+			return;
+		}
+	}
+}
+
+// Computes the Fixed split point immediately (a plain O(1) formula, always
+// available even before/without any analysis read) and queues the Env
+// Follower scan (see analysisPending[]) - deliberately never starts the
+// actual NT_readSampleFrames() read here, even if nothing else is in
+// flight. This can be called from LoadPreset()/deserialise(), which is
+// itself already in the middle of an SD card read (the preset file) -
+// issuing another SD read synchronously from that same call stack froze
+// the device on every preset load that selected a sample, immediately,
+// before any trigger, even with just one slot involved (confirmed by
+// testing - not proportional to sample count or read size, ruling out the
+// earlier bulk-buffer/CPU-overload theories). AdvanceSampleAnalysis(),
+// called only from step() on a normal audio-processing cycle - never from
+// a parameter-change/preset-load callback - is now the sole place that
+// ever actually starts a read, guaranteeing at least one full return to
+// the audio loop happens first.
+static void RequestAnalysis( _drumMachineAlgorithm* pThis, int slot )
+{
+	_sampleSlot& s = pThis->sampleSlot[slot];
+	constexpr float kFixedKnockSeconds = 0.08f;
+	int fixed = (int)( kFixedKnockSeconds * s.loadedSampleRate );
+	if ( s.loadedNumFrames > 0 && fixed >= (int)s.loadedNumFrames ) fixed = (int)s.loadedNumFrames - 1;
+	if ( fixed < 0 ) fixed = 0;
+	s.splitFrameFixed = fixed;
+	s.splitFrameEnvFollower = fixed;
+
+	if ( s.loadedNumFrames == 0 )
+		return;
+
+	pThis->analysisPending[slot] = true;
+}
+
+static void StartAnalysisRead( _drumMachineAlgorithm* pThis, int slot )
+{
+	_sampleSlot& s = pThis->sampleSlot[slot];
+	int numFrames = (int)s.loadedNumFrames;
+	if ( numFrames > pThis->analysisMaxFrames ) numFrames = pThis->analysisMaxFrames;
+
+	pThis->analysisCurrentSlot = slot;
+	pThis->analysisPending[slot] = false;
+	pThis->analysisRequest.folder = s.folderIndex;
+	pThis->analysisRequest.sample = s.sampleFileIndex;
+	pThis->analysisRequest.dst = pThis->analysisBuffer;
+	pThis->analysisRequest.numFrames = numFrames;
+	pThis->analysisLoadedNumFrames = numFrames;
+	if ( NT_readSampleFrames( pThis->analysisRequest ) )
+		pThis->analysisAwaitingCallback = true;
+	else
+	{
+		pThis->analysisCurrentSlot = -1;	// couldn't even start - leave the Fixed fallback, don't get stuck
+		AdvanceAnalysisQueue( pThis );		// ...but don't strand any other slots still waiting in the queue
+	}
+}
+
+// callbackData is `pThis` - there's only ever one analysis request in
+// flight for the whole algorithm instance (see analysisCurrentSlot).
+static void AnalysisLoadCallback( void* callbackData, bool success )
+{
+	_drumMachineAlgorithm* pThis = (_drumMachineAlgorithm*)callbackData;
+	pThis->analysisAwaitingCallback = false;
+	if ( !success )
+	{
+		pThis->analysisCurrentSlot = -1;	// leave the Fixed fallback in place
+		return;
+	}
+	pThis->analysisScanPos = 0;
+	pThis->analysisScanPhase = 0;
+	pThis->analysisScanEnv = 0.0f;
+	pThis->analysisScanPeak = 0.0f;
+	pThis->analysisScanPeakFrame = 0;
+}
+
+// Advances the current slot's in-flight Env Follower scan by a small,
+// fixed chunk of frames - called once per step() (see step()), so the
+// full scan (one-pole envelope of |sample|, find peak, then the first
+// post-peak frame where it's decayed below 25% of that peak, ~-12dB)
+// completes gradually over a handful of blocks instead of costing any one
+// block much - even more comfortably now that the analysis buffer itself
+// is only ~0.25s (see AnalysisMaxFrames()) rather than up to 2 full
+// seconds. Once done, starts the next queued slot's analysis, if any.
+static void AdvanceSampleAnalysis( _drumMachineAlgorithm* pThis )
+{
+	constexpr int kChunkFrames = 2000;
+	constexpr float kAttackCoeff = 0.3f;
+	constexpr float kReleaseCoeff = 0.01f;
+
+	// The only place a queued analysis read is actually started (see
+	// RequestAnalysis()'s comment) - this runs from step(), a normal
+	// audio-processing cycle, never synchronously from within a preset
+	// load or parameter change.
+	if ( pThis->analysisCurrentSlot == -1 )
+		AdvanceAnalysisQueue( pThis );
+
+	int slot = pThis->analysisCurrentSlot;
+	if ( slot < 0 || pThis->analysisAwaitingCallback )
+		return;
+
+	const float* buffer = pThis->analysisBuffer;
+	int loadedNumFrames = pThis->analysisLoadedNumFrames;
+	bool done = false;
+
+	int remaining = kChunkFrames;
+	if ( pThis->analysisScanPhase == 0 )
+	{
+		while ( remaining > 0 && pThis->analysisScanPos < loadedNumFrames )
+		{
+			float absIn = fabsf( buffer[pThis->analysisScanPos] );
+			float coeff = absIn > pThis->analysisScanEnv ? kAttackCoeff : kReleaseCoeff;
+			pThis->analysisScanEnv += ( absIn - pThis->analysisScanEnv ) * coeff;
+			if ( pThis->analysisScanEnv > pThis->analysisScanPeak )
+			{
+				pThis->analysisScanPeak = pThis->analysisScanEnv;
+				pThis->analysisScanPeakFrame = pThis->analysisScanPos;
+			}
+			++pThis->analysisScanPos;
+			--remaining;
+		}
+		if ( pThis->analysisScanPos >= loadedNumFrames )
+		{
+			if ( pThis->analysisScanPeak <= 0.0f )
+				done = true;	// silent buffer - keep the Fixed fallback
+			else
+			{
+				pThis->analysisScanPhase = 1;
+				pThis->analysisScanPos = pThis->analysisScanPeakFrame;
+				pThis->analysisScanEnv = pThis->analysisScanPeak;
+			}
+		}
+	}
+	else
+	{
+		float threshold = pThis->analysisScanPeak * 0.25f;
+		while ( remaining > 0 && pThis->analysisScanPos < loadedNumFrames )
+		{
+			float absIn = fabsf( buffer[pThis->analysisScanPos] );
+			float coeff = absIn > pThis->analysisScanEnv ? kAttackCoeff : kReleaseCoeff;
+			pThis->analysisScanEnv += ( absIn - pThis->analysisScanEnv ) * coeff;
+			if ( pThis->analysisScanEnv <= threshold ) break;
+			++pThis->analysisScanPos;
+			--remaining;
+		}
+		if ( pThis->analysisScanEnv <= threshold || pThis->analysisScanPos >= loadedNumFrames )
+		{
+			int split = pThis->analysisScanPos;
+			if ( split > loadedNumFrames - 1 ) split = loadedNumFrames - 1;
+			pThis->sampleSlot[slot].splitFrameEnvFollower = split;
+			done = true;
+		}
+	}
+
+	if ( !done )
+		return;
+
+	pThis->analysisCurrentSlot = -1;
+	AdvanceAnalysisQueue( pThis );
+}
+
 void	calculateRequirements( _NT_algorithmRequirements& req, const int32_t* specifications )
 {
 	req.numParameters = ARRAY_SIZE(parameters);
 	req.sram = sizeof(_drumMachineAlgorithm);
-	req.dtc = sizeof(_drumMachineAlgorithm_DTC);
+	// Base struct plus kNumSlots' worth of _NT_stream storage tacked on
+	// after it - NT_globals.streamSizeBytes is a runtime value (varies by
+	// platform build), not a compile-time constant, so it can't be a member
+	// of _drumMachineAlgorithm_DTC itself (same reason the official
+	// sampleStreamer.cpp example computes its own DTC size this way rather
+	// than sizeof()-ing a fixed-size field for it).
+	req.dtc = sizeof(_drumMachineAlgorithm_DTC) + kNumSlots * NT_globals.streamSizeBytes;
 	// renderScratch + dryScratch + 2x closedHat scratch + 2x openHat scratch
 	// + elementsExciteScratch = 7 buffers, each sized to the largest block
-	// this instance will ever be asked to render in one step() call.
-	req.dram = 7 * NT_globals.maxFramesPerStep * sizeof(float);
+	// this instance will ever be asked to render in one step() call; plus
+	// one small shared Env Follower analysis buffer (~0.25s - see
+	// AnalysisMaxFrames()); plus one streaming buffer per slot (BD/SD/CH/OH)
+	// for actual sample playback (NT_streamOpen()/NT_streamRender() - see
+	// MixSampleLayer()). No more full-file per-slot buffers - an earlier
+	// bulk-load version of this feature froze the device when all 4 slots
+	// loaded a fresh preset's samples at once.
+	req.dram = 7 * NT_globals.maxFramesPerStep * sizeof(float)
+		+ AnalysisMaxFrames() * sizeof(float)
+		+ kNumSlots * NT_globals.streamBufferSizeBytes;
 	req.itc = 0;
 }
 
@@ -776,6 +1419,38 @@ _NT_algorithm*	construct( const _NT_algorithmMemoryPtrs& ptrs, const _NT_algorit
 	alg->dtc->openHat.scratch1 = dram; dram += maxFrames;
 	alg->dtc->openHat.scratch2 = dram; dram += maxFrames;
 	alg->elementsExciteScratch = dram; dram += maxFrames;
+
+	alg->analysisMaxFrames = AnalysisMaxFrames();
+	alg->analysisBuffer = dram; dram += alg->analysisMaxFrames;
+
+	// Stream buffers (DRAM) continue right after the float-based scratch
+	// buffers above, sized in bytes (NT_globals.streamBufferSizeBytes) not
+	// floats - hence the cast/byte-pointer arithmetic here. Stream storage
+	// itself (opaque _NT_stream state) lives in the DTC bytes tacked on
+	// after _drumMachineAlgorithm_DTC's own fixed-size fields - see
+	// calculateRequirements()'s matching comment.
+	uint8_t* dramBytes = (uint8_t*)dram;
+	uint8_t* dtcStreamBase = (uint8_t*)ptrs.dtc + sizeof(_drumMachineAlgorithm_DTC);
+	for ( int slot=0; slot<kNumSlots; ++slot )
+	{
+		_sampleSlot& s = alg->sampleSlot[slot];
+		s.Init();
+		s.streamBuffer = dramBytes; dramBytes += NT_globals.streamBufferSizeBytes;
+		s.stream = (_NT_stream)( dtcStreamBase + slot * NT_globals.streamSizeBytes );
+	}
+
+	alg->analysisRequest.callback = AnalysisLoadCallback;
+	alg->analysisRequest.callbackData = alg;
+	alg->analysisRequest.bits = kNT_WavBits32;
+	alg->analysisRequest.channels = kNT_WavMono;
+	alg->analysisRequest.progress = kNT_WavNoProgress;
+	alg->analysisRequest.startOffset = 0;
+	alg->analysisCurrentSlot = -1;
+	alg->analysisAwaitingCallback = false;
+	for ( int i=0; i<kNumSlots; ++i )
+		alg->analysisPending[i] = false;
+	alg->sdCardWasMounted = false;
+	alg->sampleSystemGraceSamples = 0;
 
 	alg->dtc->kick.Init();
 	alg->dtc->snare.Init();
@@ -816,7 +1491,8 @@ _NT_algorithm*	construct( const _NT_algorithmMemoryPtrs& ptrs, const _NT_algorit
 	alg->lfo1Value = 0.0f;
 	alg->lfo2Value = 0.0f;
 
-	alg->parameters = parameters;
+	memcpy( alg->params, parameters, sizeof(parameters) );
+	alg->parameters = alg->params;
 	alg->parameterPages = &parameterPages;
 	return alg;
 }
@@ -1210,6 +1886,7 @@ static const float kConceptRange[kNumConcepts] = {
 	100.0f,	// Tone
 	100.0f,	// Character
 	100.0f,	// FM
+	100.0f,	// Wavefolder
 };
 
 static float ModulatedViaMatrix( _drumMachineAlgorithm* pThis, int concept, int slot, float baseValue, float env1Level, float env2Level )
@@ -1269,6 +1946,70 @@ static int FindRoute( _drumMachineAlgorithm* pThis, int source, int slot, int co
 	return -1;
 }
 
+// Coarser, per-BLOCK approximation of the Envelope/Feedback FM family (see
+// kFmModeXxx's comment) for models with no internal per-sample FM hook of
+// their own (Elements, plaits::HiHat, braids::Cymbal) - Analog/Synthetic/808
+// compute this same family sample-by-sample inside their own Render() calls
+// instead, since they already had a natural place to hook in; these models
+// don't, so a single push value is computed once per block here and applied
+// to f0/pitch before calling into them. Returns a small multiplier-ish term
+// (order -0.9..3.0, same safety-clamped range used internally by the other
+// models) - the caller scales it by its own FM amount and a model-
+// appropriate gain.
+static float ComputeExternalFmPush( _drumVoicePost& v, bool trig, float accent, int fmMode, float blockSeconds )
+{
+	// Decays by *elapsed time*, not by call count - a per-block multiply
+	// (the first version of this) decays at wildly different real-world
+	// rates depending on how many samples happen to be in a block, and at
+	// this platform's actual block sizes it collapsed to ~0 within a
+	// fraction of a millisecond, well before it could ever be audible (see
+	// the "not really audible on the hihat models" bug report). A plain
+	// linear decay over a fixed ~30ms window - matching the same rough
+	// timescale as the other models' own envelope-driven knock - avoids
+	// needing exp()/expf() (see distingnt_libm_symbol_constraints project
+	// memory) while staying independent of block size.
+	const float kEnvTotalS = 0.03f;
+	if ( trig )
+	{
+		v.fmEnvLevel = 1.0f;
+		v.fmEnvElapsed = 0.0f;
+		if ( fmMode >= 1 )
+			v.fmPrevSample = accent * 1.5f;
+	}
+	else
+	{
+		v.fmEnvElapsed += blockSeconds;
+		v.fmEnvLevel = 1.0f - v.fmEnvElapsed / kEnvTotalS;
+		if ( v.fmEnvLevel < 0.0f ) v.fmEnvLevel = 0.0f;
+	}
+
+	if ( fmMode == 0 )
+		return v.fmEnvLevel;
+
+	const float kRange = 1.5f;
+	float fb = v.fmPrevSample;
+	CONSTRAIN( fb, -kRange, kRange );
+	float mag = fabsf( fb ) * ( 1.0f / kRange );
+	float sign = fb < 0.0f ? -1.0f : 1.0f;
+	float shaped = mag;
+	if ( fmMode == 2 ) shaped = mag * mag;
+	else if ( fmMode == 3 ) shaped = mag * mag * mag;
+	else if ( fmMode == 4 ) shaped = mag * ( 2.0f - mag );
+	float feedbackTerm = sign * shaped;
+
+	float total = ( fmMode == 5 ) ? ( v.fmEnvLevel + feedbackTerm ) : feedbackTerm;
+	CONSTRAIN( total, -0.9f, 3.0f );
+	return total;
+}
+
+// Captures this block's last rendered sample for the next block's feedback -
+// call once after any Render() that used ComputeExternalFmPush()'s result.
+static void UpdateFmFeedback( _drumVoicePost& v, const float* scratch, int numFrames )
+{
+	if ( numFrames > 0 )
+		v.fmPrevSample = scratch[numFrames - 1];
+}
+
 // Shared "Elements" model glue - a struck-mallet excitation into a modal
 // resonator bank (see third_party/mi_elements/ATTRIBUTION.md). Reuses this
 // voice's existing knobs rather than exposing new ones: Pitch->frequency,
@@ -1293,10 +2034,156 @@ static void RenderElements( elements::Exciter& exciter, elements::Resonator& res
 		out[i] *= accent;
 }
 
+// Defined later (customUi() section) - forward-declared so the sample-layer
+// helpers below (used by parameterChanged(), which comes first) can clamp a
+// Sample param's value the same way any other live edit does.
+static void SetParam( _drumMachineAlgorithm* pThis, int paramIndex, int value );
+
+static const int kSampleParam[kNumSlots] = { kParamSampleBD, kParamSampleSD, kParamSampleCH, kParamSampleOH };
+
+// Finds this slot's SD card sample folder by exact name match against
+// kSlotNames ("BD"/"SD"/"CH"/"OH") and records its file count - called once
+// per mount (see step()'s NT_isSdCardMounted() transition check). A slot
+// whose folder doesn't exist (no such subfolder, or no card at all) just
+// keeps folderIndex at -1 and its Sample param stuck at max=0/"None" -
+// matches "no sample by default" needing no extra guard anywhere else.
+static void ScanSampleFolders( _drumMachineAlgorithm* pThis )
+{
+	int algIdx = NT_algorithmIndex( pThis );
+	int numFolders = (int)NT_getNumSampleFolders();
+	for ( int slot=0; slot<kNumSlots; ++slot )
+	{
+		_sampleSlot& s = pThis->sampleSlot[slot];
+		s.folderIndex = -1;
+		s.numSampleFiles = 0;
+		for ( int f=0; f<numFolders; ++f )
+		{
+			_NT_wavFolderInfo info;
+			NT_getSampleFolderInfo( f, info );
+			if ( info.name && strcmp( info.name, kSlotNames[slot] ) == 0 )
+			{
+				s.folderIndex = f;
+				s.numSampleFiles = (int)info.numSampleFiles;
+				break;
+			}
+		}
+		int paramIndex = kSampleParam[slot];
+		pThis->params[paramIndex].max = s.numSampleFiles;
+		NT_updateParameterDefinition( algIdx, paramIndex );
+		if ( pThis->v[paramIndex] > s.numSampleFiles )
+			SetParam( pThis, paramIndex, s.numSampleFiles );
+	}
+}
+
+// Responds to a slot's Sample param changing (see parameterChanged()) -
+// looks up the file's metadata (sample rate/frame count, needed for
+// playback speed and idle-tail sizing) and queues the Knock/Tail Env
+// Follower analysis (see RequestAnalysis()). Deliberately does NOT open
+// the actual playback stream here - that happens per-trigger instead (see
+// OpenSampleStream(), called from MixSampleLayer()), since a persistent
+// "kit" choice (which sample is loaded into this slot) and "start playing
+// it now" are different events for a drum machine that retriggers the same
+// sample on every hit, unlike a one-shot demo that streams once from
+// selection onward.
+static void StartSampleLoad( _drumMachineAlgorithm* pThis, int slot )
+{
+	_sampleSlot& s = pThis->sampleSlot[slot];
+	int value = pThis->v[ kSampleParam[slot] ];
+	if ( value <= 0 || s.folderIndex < 0 )
+	{
+		s.hasSample = false;
+		s.sampleFileIndex = -1;
+		return;
+	}
+
+	int fileIndex = value - 1;
+	// LoadPreset() calls this unconditionally for all 4 slots on every
+	// preset load, even when a slot's sample selection hasn't actually
+	// changed - skip the metadata lookup and (more importantly) queuing
+	// another analysis read entirely in that case, rather than needlessly
+	// re-reading and re-scanning a sample that's already loaded and
+	// already has a valid, up-to-date splitFrameEnvFollower.
+	if ( s.hasSample && s.sampleFileIndex == fileIndex )
+		return;
+
+	_NT_wavInfo info;
+	NT_getSampleFileInfo( s.folderIndex, fileIndex, info );
+	s.loadedSampleRate = info.sampleRate > 0 ? (float)info.sampleRate : 48000.0f;
+	s.loadedNumFrames = info.numFrames;
+	s.sampleFileIndex = fileIndex;
+	s.hasSample = true;
+
+	ExtendSampleSystemGrace( pThis );
+	RequestAnalysis( pThis, slot );
+}
+
+// Called at trigger time (see MixSampleLayer()) - (re)starts this slot's
+// stream from the top of the currently-selected file. NT_streamOpen() is a
+// lightweight seek/reset, not a bulk read (see distingNT_API/examples/
+// sampleStreamer.cpp), so calling it on every hit (rather than once at
+// selection time) is the intended usage for one-shot retriggering.
+static void OpenSampleStream( _drumMachineAlgorithm* pThis, int slot, float accent )
+{
+	_sampleSlot& s = pThis->sampleSlot[slot];
+	_NT_streamOpenData data = {
+		.streamBuffer = s.streamBuffer,
+		.folder = (uint32_t)s.folderIndex,
+		.sample = (uint32_t)s.sampleFileIndex,
+		.velocity = accent,
+		.startOffset = 0,
+		.reverse = false,
+		.rrMode = kNT_RRModeSequential,
+	};
+	NT_streamOpen( s.stream, data );
+}
+
+// Shared by parameterString() (standard menu) and DrawBarPage() (custom UI)
+// - value 0 = "None" (the default/no-sample state), else looks up the
+// (value-1)'th file's name in this slot's own folder. Returns false (no
+// name available - e.g. folder not found yet) if nothing was written.
+static bool GetSampleDisplayName( _drumMachineAlgorithm* pThis, int slot, int value, char* buff, int buffSize )
+{
+	if ( value <= 0 )
+	{
+		strncpy( buff, "None", buffSize - 1 );
+		buff[buffSize-1] = 0;
+		return true;
+	}
+	_sampleSlot& s = pThis->sampleSlot[slot];
+	if ( s.folderIndex < 0 )
+		return false;
+	_NT_wavInfo info;
+	NT_getSampleFileInfo( s.folderIndex, value - 1, info );
+	if ( !info.name )
+		return false;
+	strncpy( buff, info.name, buffSize - 1 );
+	buff[buffSize-1] = 0;
+	return true;
+}
+
+int	parameterString( _NT_algorithm* self, int p, int v, char* buff )
+{
+	_drumMachineAlgorithm* pThis = (_drumMachineAlgorithm*)self;
+	int slot;
+	if ( p == kParamSampleBD ) slot = kSlotBD;
+	else if ( p == kParamSampleSD ) slot = kSlotSD;
+	else if ( p == kParamSampleCH ) slot = kSlotCH;
+	else if ( p == kParamSampleOH ) slot = kSlotOH;
+	else return 0;
+
+	if ( !GetSampleDisplayName( pThis, slot, v, buff, kNT_parameterStringSize ) )
+		return 0;
+	return (int)strlen( buff );
+}
+
 void	parameterChanged( _NT_algorithm* self, int p )
 {
 	_drumMachineAlgorithm* pThis = (_drumMachineAlgorithm*)self;
-	if ( p == kParamMidiMode )
+	if ( p == kParamSampleBD ) StartSampleLoad( pThis, kSlotBD );
+	else if ( p == kParamSampleSD ) StartSampleLoad( pThis, kSlotSD );
+	else if ( p == kParamSampleCH ) StartSampleLoad( pThis, kSlotCH );
+	else if ( p == kParamSampleOH ) StartSampleLoad( pThis, kSlotOH );
+	else if ( p == kParamMidiMode )
 	{
 		bool notePerSlot = ( pThis->v[kParamMidiMode] == 0 );
 		int algIdx = NT_algorithmIndex( self );
@@ -1481,7 +2368,79 @@ static float HardClip( float x )
 // (last, bus-style - see ApplyCompressor()), applied in place. `dryBuf` is
 // scratch space (same size as `buf`) used to hold an unprocessed copy for
 // the waveshaper's dry/wet crossfade.
-static void ApplyPost( _drumVoicePost& v, float* buf, float* dryBuf, int numFrames, int filterParam, int compParam, int driveParam, int volParam )
+// Reflects x into [-1,1] via a bounded number of fold-point reflections -
+// purely arithmetic (branch/subtract only, no libm), safe since `x` is a
+// bounded audio sample scaled by a capped drive amount, so the number of
+// reflections needed to settle is always small in practice; the fixed
+// iteration count below is just a safety ceiling against a pathological
+// input, not the normal-case cost.
+static float ReflectFold( float x )
+{
+	for ( int iter = 0; iter < 8; ++iter )
+	{
+		if ( x > 1.0f ) x = 2.0f - x;
+		else if ( x < -1.0f ) x = -2.0f - x;
+		else break;
+	}
+	return x;
+}
+
+// Post-fx wavefolder - runs between Filter and Waveshaper in ApplyPost()
+// (folding generates new harmonics right after tone-shaping, then the
+// Waveshaper's soft/hard clip acts on the already-folded signal - the
+// alternative, folding an already-clipped signal, tends to sound chaotic
+// rather than characterful). `amount` is 0..1. All three types are
+// libm-safe (LUT or rational-polynomial only - no tanh/sinh/atan, which
+// the firmware's plugin loader isn't confirmed to resolve, see
+// distingnt_libm_symbol_constraints project memory) rather than literal
+// ports of any one specific reference circuit (Buchla 259 etc. reference
+// models are typically tanh/diode-table based).
+static void ApplyWavefolder( float* buf, int numFrames, float amount, int type )
+{
+	if ( amount <= 0.0f )
+		return;
+
+	float drive = 1.0f + amount * 7.0f;	// 0%->1x (near passthrough), 100%->8x (deep multi-fold)
+
+	if ( type == kWavefolderTypeSine )
+	{
+		// Classic West Coast sine fold - reuses the already-vendored,
+		// LUT-based plaits::Sine() (safe for phase >= 0.0f, wraps
+		// internally - see sine_oscillator.h). Magnitude/sign split keeps
+		// the phase argument always non-negative while preserving the
+		// fold's odd symmetry.
+		for ( int i=0; i<numFrames; ++i )
+		{
+			float x = buf[i];
+			float mag = fabsf( x ) * drive;
+			float sign = x < 0.0f ? -1.0f : 1.0f;
+			buf[i] = sign * plaits::Sine( mag * 0.5f );
+		}
+	}
+	else if ( type == kWavefolderTypeTriangle )
+	{
+		// Serge-style hard reflect fold - harder-edged/more digital than
+		// Sine, with audible sharp corners at each fold point.
+		for ( int i=0; i<numFrames; ++i )
+			buf[i] = ReflectFold( buf[i] * drive );
+	}
+	else
+	{
+		// Buchla-style: the same reflect fold, then rounded off with a
+		// cheap rational ease-out curve (same family as Overdrive's
+		// soft-clip below) to soften the reflection's sharp corners for a
+		// smoother, more "analog" character than the raw Triangle fold.
+		for ( int i=0; i<numFrames; ++i )
+		{
+			float folded = ReflectFold( buf[i] * drive );
+			float mag = fabsf( folded );
+			float sign = folded < 0.0f ? -1.0f : 1.0f;
+			buf[i] = sign * mag * ( 1.5f - 0.5f * mag * mag );
+		}
+	}
+}
+
+static void ApplyPost( _drumVoicePost& v, float* buf, float* dryBuf, int numFrames, int filterParam, int foldParam, int foldType, int compParam, int driveParam, int volParam )
 {
 	if ( filterParam < 0 )
 	{
@@ -1511,6 +2470,8 @@ static void ApplyPost( _drumVoicePost& v, float* buf, float* dryBuf, int numFram
 		}
 		v.hpFilter.Process<stmlib::FILTER_MODE_HIGH_PASS>( buf, buf, numFrames );
 	}
+
+	ApplyWavefolder( buf, numFrames, foldParam * 0.01f, foldType );
 
 	if ( driveParam > 0 )
 	{
@@ -1606,6 +2567,161 @@ static void WriteVoiceOutput( float* busFrames, int numFrames, const float* scra
 	}
 }
 
+// ---------------------------------------------------------------------
+// Sample layer - mixes a loaded WAV into a voice's rendered signal, before
+// ApplyPost() (per the explicit "mix should happen early on... so that the
+// postfx still applies to the mix as well" spec). See kParamSampleBD,
+// kParamSampleMixBD, and kParamKnockTailBD's comments for the 3 controls'
+// exact behaviour, and _sampleSlot for the loaded-sample state itself.
+// ---------------------------------------------------------------------
+
+static const int kSampleMixParam[kNumSlots] = { kParamSampleMixBD, kParamSampleMixSD, kParamSampleMixCH, kParamSampleMixOH };
+static const int kKnockTailParam[kNumSlots] = { kParamKnockTailBD, kParamKnockTailSD, kParamKnockTailCH, kParamKnockTailOH };
+static const int kMixTypeParam[kNumSlots]   = { kParamMixTypeBD, kParamMixTypeSD, kParamMixTypeCH, kParamMixTypeOH };
+
+// At trigger time, extends the voice's own idle-tail budget (see
+// IdleSamples()) to also cover the loaded sample's remaining playback
+// length when one is mixed in - otherwise a short synth release could cut
+// the sample's tail off early, since the idle-skip check returns before
+// MixSampleLayer() ever runs. A no-op when no sample would play.
+static void ExtendIdleForSample( _drumMachineAlgorithm* pThis, _drumVoicePost& v, int slot )
+{
+	_sampleSlot& s = pThis->sampleSlot[slot];
+	if ( !s.hasSample || pThis->v[ kSampleMixParam[slot] ] <= 0 || SampleSystemBusy( pThis ) )
+		return;
+	float inc = s.loadedSampleRate / (float)NT_globals.sampleRate;
+	if ( inc <= 0.0f )
+		return;
+	int sampleTailFrames = (int)( (float)s.loadedNumFrames / inc );
+	if ( sampleTailFrames > v.samplesUntilIdle )
+		v.samplesUntilIdle = sampleTailFrames;
+}
+
+// Mixes a slot's loaded sample into `scratch` (already holding the synth
+// voice's rendered output this block) - a no-op (skips the entire sample-
+// player path, not just a silent pass) when no sample is loaded, Sample
+// Mix is at 0, or the sample system is still busy/settling after some
+// loading-related activity (see SampleSystemBusy()) - confirmed by testing
+// that calling into the sample-streaming API while a preset load's own SD
+// activity is still in flight froze the device, specifically when actively
+// playing (not when idle), so hits are simply not sample-layered at all
+// during that window rather than risk the same collision. On trigger,
+// (re)opens this slot's stream from the top (see OpenSampleStream()) -
+// playback itself is pulled from the disting NT streaming API
+// (NT_streamRender(), into NT_globals.workBuffer - transient scratch valid
+// only for this step() call, same as the official sampleStreamer.cpp
+// example uses it) rather than read from a pre-loaded buffer; `pos`/`inc`
+// still track the equivalent *native-file* playback position ourselves
+// (for the Knock/Tail split-point comparison below) even though the actual
+// resampling now happens inside NT_streamRender(). Reuses
+// pThis->dryScratch/elementsExciteScratch as working buffers for the
+// windowed/highpassed sample signal - both are free at this point in
+// ProcessKick/Snare/Hat.
+static void MixSampleLayer( _drumMachineAlgorithm* pThis, _drumVoicePost& v, int slot, bool trig, float accent, float* scratch, int numFrames )
+{
+	_sampleSlot& s = pThis->sampleSlot[slot];
+	int mixValue = pThis->v[ kSampleMixParam[slot] ];
+	if ( !s.hasSample || mixValue <= 0 || s.loadedNumFrames < 2 || SampleSystemBusy( pThis ) )
+		return;
+
+	if ( trig )
+	{
+		v.samplePos = 0.0f;
+		OpenSampleStream( pThis, slot, accent );
+	}
+
+	if ( NT_globals.workBufferSizeBytes < (uint32_t)numFrames * sizeof(_NT_frame) )
+		return;	// not enough transient scratch this block - skip rather than risk an overrun
+	_NT_frame* renderBuffer = (_NT_frame*)NT_globals.workBuffer;
+
+	float inc = s.loadedSampleRate / (float)NT_globals.sampleRate;
+	uint32_t framesRendered = NT_streamRender( s.stream, renderBuffer, (uint32_t)numFrames, inc );
+
+	// 5-zone knock/tail curve - see kParamKnockTailBD's comment for the
+	// exact spec: 0=full sample; 0.25=knock only; 0.25-0.5=highpass fades
+	// in (still knock only); 0.5-0.75=crossfades to the tail with the
+	// highpass held; 0.75-1.0=highpass fades back out, tail only.
+	int mixType = pThis->v[ kMixTypeParam[slot] ];
+	int splitFrame = ( mixType == kMixTypeEnvFollower ) ? s.splitFrameEnvFollower : s.splitFrameFixed;
+	float knobT = pThis->v[ kKnockTailParam[slot] ] * 0.01f;
+	float preGain, postGain, hpAmount;
+	if ( knobT <= 0.25f )
+	{
+		preGain = 1.0f;
+		postGain = 1.0f - knobT * 4.0f;
+		hpAmount = 0.0f;
+	}
+	else if ( knobT <= 0.5f )
+	{
+		preGain = 1.0f;
+		postGain = 0.0f;
+		hpAmount = ( knobT - 0.25f ) * 4.0f;
+	}
+	else if ( knobT <= 0.75f )
+	{
+		float t = ( knobT - 0.5f ) * 4.0f;
+		preGain = 1.0f - t;
+		postGain = t;
+		hpAmount = 1.0f;
+	}
+	else
+	{
+		preGain = 0.0f;
+		postGain = 1.0f;
+		hpAmount = 1.0f - ( knobT - 0.75f ) * 4.0f;
+	}
+
+	float declick = 0.005f * s.loadedSampleRate;	// ~5ms declick window around the split point, avoids a click from the pre/post gain step
+	if ( declick < 1.0f ) declick = 1.0f;
+
+	float* sampleBuf = pThis->dryScratch;
+	float* hpBuf = pThis->elementsExciteScratch;
+
+	float pos = v.samplePos;
+	int lastValid = (int)s.loadedNumFrames - 1;
+	for ( int i=0; i<numFrames; ++i )
+	{
+		float raw = 0.0f;
+		if ( i < (int)framesRendered && pos < (float)lastValid )
+		{
+			raw = renderBuffer[i][0];
+			pos += inc;
+		}
+
+		float edge = ( pos - (float)splitFrame + declick ) / ( 2.0f * declick );
+		CONSTRAIN( edge, 0.0f, 1.0f );
+		float gain = preGain + ( postGain - preGain ) * edge;
+		sampleBuf[i] = raw * gain;
+	}
+	v.samplePos = pos;
+
+	if ( hpAmount > 0.0f )
+	{
+		memcpy( hpBuf, sampleBuf, numFrames * sizeof(float) );
+		v.sampleHp.Process<stmlib::FILTER_MODE_HIGH_PASS>( hpBuf, hpBuf, numFrames );
+		for ( int i=0; i<numFrames; ++i )
+			sampleBuf[i] += ( hpBuf[i] - sampleBuf[i] ) * hpAmount;
+	}
+
+	float mix = mixValue * 0.01f;
+	if ( mix <= 0.5f )
+	{
+		// 0-50%: sample fades in additively under the synth voice, which
+		// stays at full level throughout this range.
+		float sampleGain = mix * 2.0f;
+		for ( int i=0; i<numFrames; ++i )
+			scratch[i] += sampleBuf[i] * sampleGain;
+	}
+	else
+	{
+		// 50-100%: crossfades the synth voice out until only the sample
+		// remains (sample is already at full gain from the first branch).
+		float synthGain = 1.0f - ( mix - 0.5f ) * 2.0f;
+		for ( int i=0; i<numFrames; ++i )
+			scratch[i] = scratch[i] * synthGain + sampleBuf[i];
+	}
+}
+
 static void ProcessKick( _drumMachineAlgorithm* pThis, float* busFrames, int numFrames )
 {
 	_kickVoice& v = pThis->dtc->kick;
@@ -1613,7 +2729,10 @@ static void ProcessKick( _drumMachineAlgorithm* pThis, float* busFrames, int num
 	v.pendingTrigger = false;
 	float baseDecay = Smoothed( pThis, kParamRelBD ) * 0.01f;
 	if ( trig )
+	{
 		v.samplesUntilIdle = IdleSamples( baseDecay );	// unmodulated - just needs to be safely long enough
+		ExtendIdleForSample( pThis, v, kSlotBD );
+	}
 
 	// Envelopes advance every block regardless of the voice's own idle-skip
 	// state (below), so they always run to completion and the bar-page
@@ -1641,42 +2760,102 @@ static void ProcessKick( _drumMachineAlgorithm* pThis, float* busFrames, int num
 	float decay = ModulatedViaMatrix( pThis, kConceptRelease, kSlotBD, Smoothed( pThis, kParamRelBD ), env1Level, env2Level ) * 0.01f;
 	float tone = ModulatedViaMatrix( pThis, kConceptTone, kSlotBD, Smoothed( pThis, kParamToneBD ), env1Level, env2Level ) * 0.01f;
 	float character = ModulatedViaMatrix( pThis, kConceptCharacter, kSlotBD, Smoothed( pThis, kParamCharBD ), env1Level, env2Level ) * 0.01f;
-	// FM: self-contained internal modulation, no audio input - only the
-	// Synthetic model exposes a free "fm_envelope_amount" input (its own
-	// internal self-FM decay envelope); Analog already uses both of its FM
-	// inputs (attack_fm_amount/self_fm_amount) for Character, so FM is a
-	// no-op there.
+	// FM: self-contained internal modulation depth, no audio input - drives
+	// the attack pitch-knock on Analog/Synthetic/808 (see kParamFmModeBD
+	// below for *how* it's generated) and the core FM amount on the FM
+	// model itself. A no-op on Elements.
 	float fm = ModulatedViaMatrix( pThis, kConceptFm, kSlotBD, Smoothed( pThis, kParamFmBD ), env1Level, env2Level ) * 0.01f;
 	CONSTRAIN( decay, 0.0f, 1.0f );
 	CONSTRAIN( tone, 0.0f, 1.0f );
 	CONSTRAIN( character, 0.0f, 1.0f );
 	CONSTRAIN( fm, 0.0f, 1.0f );
 	float accent = v.pendingAccent;
+	// FM Mode: how the FM knob's knock energy is generated - see
+	// kFmModeXxx's comment. Not modulatable (no Mod Matrix entry, like
+	// Model), so read directly rather than through ModulatedViaMatrix().
+	int fmMode = ResolveFmMode( pThis->v[kParamFmModeBD] );
+	// Analog/Synthetic/808's knock math can push their internal oscillator/
+	// resonator frequency to (or past) zero right at the very top of the FM
+	// knob's range, which reads as a broken/silent knock rather than an
+	// intense one - capping the knob's effective ceiling below that danger
+	// zone keeps the exact curve shape (and sound) everywhere it's actually
+	// reachable, rather than clamping the DSP math directly (which changed
+	// the knock's character even at moderate settings - see each model's
+	// header comment). FmDrum's own set_fm_amount is unaffected (uses fm).
+	float fmKnock = fm * 0.8f;
 
 	if ( pThis->v[kParamModelBD] == 0 )
 	{
-		float attackFm = std::min( character * 2.0f, 1.0f );
-		float selfFm = std::max( character * 2.0f - 1.0f, 0.0f );
-		v.analog.Render( trig, accent, f0, tone, decay, attackFm, selfFm, scratch, numFrames );
+		// attack_fm_amount is Plaits' own name for exactly the "knock" the
+		// user wants FM to control (a brief pitch-up burst right at the
+		// attack, the classic 808/909 kick trick) - now driven by FM
+		// directly instead of splitting Character's range across it and
+		// self_fm_amount (a separate, ongoing self-FM "growl" during the
+		// body, which Character now controls over its full range instead).
+		v.analog.Render( trig, accent, f0, tone, decay, fmKnock, character, fmMode, scratch, numFrames );
 	}
 	else if ( pThis->v[kParamModelBD] == 1 )
 	{
-		v.synthetic.Render( false, trig, accent, f0, tone, decay, character, fm, 0.5f, scratch, numFrames );
+		// fm_envelope_amount here is the same attack-knock idea (fm_ starts
+		// at 1.0 on trigger and decays, modulating pitch) - already wired to
+		// FM directly, so Synthetic gets the same knock with no change.
+		v.synthetic.Render( false, trig, accent, f0, tone, decay, character, fmKnock, 0.5f, fmMode, scratch, numFrames );
+	}
+	else if ( pThis->v[kParamModelBD] == 2 )
+	{
+		// See ComputeExternalFmPush()'s comment - Elements has no internal
+		// per-sample FM hook, so FM pushes its resonator frequency externally,
+		// once per block, instead.
+		float fmPush = ComputeExternalFmPush( v, trig, accent, fmMode, blockSeconds );
+		float modulatedF0 = f0 * ( 1.0f + fmPush * fm * 1.5f );
+		CONSTRAIN( modulatedF0, 0.001f, 0.49f );
+		RenderElements( v.elementsExciter, v.elementsResonator, pThis->elementsExciteScratch, trig, accent, modulatedF0, tone, decay, character, scratch, numFrames );
+		UpdateFmFeedback( v, scratch, numFrames );
+	}
+	else if ( pThis->v[kParamModelBD] == 3 )
+	{
+		// 808-style bass drum (Peaks BassDrum / Braids Kick - the same
+		// algorithm, see third_party/mi_peaks/ATTRIBUTION.md) - Character
+		// drives punch (dynamic Q push on the resonant body); FM drives the
+		// attack pitch-knock (originally a fixed, un-knobbed 17-semitone
+		// push - see bass_drum.h), same knock the Analog/Synthetic models'
+		// own FM input already gives.
+		v.peaksBass.set_frequency( pitchIdx << 7 );
+		v.peaksBass.set_decay( (uint16_t)( decay * 65535.0f ) );
+		v.peaksBass.set_tone( (uint16_t)( tone * 65535.0f ) );
+		v.peaksBass.set_punch( (uint16_t)( character * 65535.0f ) );
+		v.peaksBass.set_attack_fm_amount( (uint16_t)( fmKnock * 65535.0f ) );
+		v.peaksBass.set_fm_mode( fmMode );
+		v.peaksBass.Process( trig, accent, scratch, numFrames );
+		for ( int i=0; i<numFrames; ++i ) scratch[i] *= accent;
 	}
 	else
 	{
-		RenderElements( v.elementsExciter, v.elementsResonator, pThis->elementsExciteScratch, trig, accent, f0, tone, decay, character, scratch, numFrames );
+		// Sine-FM drum (Peaks FmDrum, "similar to the BD/SD in Anushri") -
+		// FM knob finally drives a literal FM-amount parameter; Character
+		// drives the noise/overdrive blend; Tone is a no-op here (this model
+		// has no separate tone control of its own).
+		v.peaksFm.set_frequency( pitchIdx << 7 );
+		v.peaksFm.set_decay( (uint16_t)( decay * 65535.0f ) );
+		v.peaksFm.set_fm_amount( (uint16_t)( fm * 65535.0f ) );
+		v.peaksFm.set_noise( (uint16_t)( character * 65535.0f ) );
+		v.peaksFm.Process( trig, kMidiNoteFreq, plaits::kSampleRate, scratch, numFrames );
+		for ( int i=0; i<numFrames; ++i ) scratch[i] *= accent;
 	}
 
+	MixSampleLayer( pThis, v, kSlotBD, trig, accent, scratch, numFrames );
+
 	int filtParam = RoundToInt( ModulatedViaMatrix( pThis, kConceptFilter, kSlotBD, Smoothed( pThis, kParamFiltBD ), env1Level, env2Level ) );
+	int foldParam = RoundToInt( ModulatedViaMatrix( pThis, kConceptFold, kSlotBD, Smoothed( pThis, kParamFoldBD ), env1Level, env2Level ) );
 	int compParam = RoundToInt( ModulatedViaMatrix( pThis, kConceptCompressor, kSlotBD, Smoothed( pThis, kParamCompBD ), env1Level, env2Level ) );
 	int driveParam = RoundToInt( ModulatedViaMatrix( pThis, kConceptDrive, kSlotBD, Smoothed( pThis, kParamDriveBD ), env1Level, env2Level ) );
 	int volParam = RoundToInt( ModulatedViaMatrix( pThis, kConceptVolume, kSlotBD, Smoothed( pThis, kParamVolBD ), env1Level, env2Level ) );
 	CONSTRAIN( filtParam, -100, 100 );
+	CONSTRAIN( foldParam, 0, 100 );
 	CONSTRAIN( compParam, 0, 100 );
 	CONSTRAIN( driveParam, 0, 100 );
 	CONSTRAIN( volParam, 0, 200 );
-	ApplyPost( v, scratch, pThis->dryScratch, numFrames, filtParam, compParam, driveParam, volParam );
+	ApplyPost( v, scratch, pThis->dryScratch, numFrames, filtParam, foldParam, pThis->v[kParamFoldTypeBD], compParam, driveParam, volParam );
 
 	v.samplesUntilIdle -= numFrames;
 	if ( v.samplesUntilIdle < 0 ) v.samplesUntilIdle = 0;
@@ -1691,7 +2870,10 @@ static void ProcessSnare( _drumMachineAlgorithm* pThis, float* busFrames, int nu
 	v.pendingTrigger = false;
 	float baseDecay = Smoothed( pThis, kParamRelSD ) * 0.01f;
 	if ( trig )
+	{
 		v.samplesUntilIdle = IdleSamples( baseDecay );
+		ExtendIdleForSample( pThis, v, kSlotSD );
+	}
 
 	float blockSeconds = numFrames / plaits::kSampleRate;
 	float env1Level = AdvanceEnvelope( v.env1, trig, v.pendingAccent, pThis->v[kParamEnv1Morph], pThis->v[kParamEnv1Shape], blockSeconds );
@@ -1729,23 +2911,61 @@ static void ProcessSnare( _drumMachineAlgorithm* pThis, float* busFrames, int nu
 	CONSTRAIN( character, 0.0f, 1.0f );
 	CONSTRAIN( fm, 0.0f, 1.0f );
 	float accent = v.pendingAccent;
+	int fmMode = ResolveFmMode( pThis->v[kParamFmModeSD] );
+	// See ProcessKick()'s matching comment - Synthetic's knock math can push
+	// its phase increment through 0 right at the very top of the FM knob's
+	// range.
+	float fmKnock = fm * 0.8f;
 
 	if ( pThis->v[kParamModelSD] == 0 )
 		v.analog.Render( trig, accent, f0, tone, decay, character, scratch, numFrames );
 	else if ( pThis->v[kParamModelSD] == 1 )
-		v.synthetic.Render( false, trig, accent, f0, fm, decay, character, scratch, numFrames );
+		v.synthetic.Render( false, trig, accent, f0, fmKnock, decay, character, fmMode, scratch, numFrames );
+	else if ( pThis->v[kParamModelSD] == 2 )
+	{
+		float fmPush = ComputeExternalFmPush( v, trig, accent, fmMode, blockSeconds );
+		float modulatedF0 = f0 * ( 1.0f + fmPush * fm * 1.5f );
+		CONSTRAIN( modulatedF0, 0.001f, 0.49f );
+		RenderElements( v.elementsExciter, v.elementsResonator, pThis->elementsExciteScratch, trig, accent, modulatedF0, tone, decay, character, scratch, numFrames );
+		UpdateFmFeedback( v, scratch, numFrames );
+	}
+	else if ( pThis->v[kParamModelSD] == 3 )
+	{
+		// 808-style snare (Peaks SnareDrum / Braids Snare - same algorithm,
+		// see third_party/mi_peaks/ATTRIBUTION.md) - Character drives snappy
+		// (noise-band amount).
+		v.peaksSnare.set_frequency( pitchIdx << 7 );
+		v.peaksSnare.set_decay( (uint16_t)( decay * 65535.0f ) );
+		v.peaksSnare.set_tone( (uint16_t)( tone * 65535.0f ) );
+		v.peaksSnare.set_snappy( (uint16_t)( character * 65535.0f ) );
+		v.peaksSnare.Process( trig, scratch, numFrames );
+		for ( int i=0; i<numFrames; ++i ) scratch[i] *= accent;
+	}
 	else
-		RenderElements( v.elementsExciter, v.elementsResonator, pThis->elementsExciteScratch, trig, accent, f0, tone, decay, character, scratch, numFrames );
+	{
+		// Sine-FM drum (Peaks FmDrum) - same as the BD FM model, its own
+		// per-voice instance so BD/SD's self-FM sweeps never interact.
+		v.peaksFm.set_frequency( pitchIdx << 7 );
+		v.peaksFm.set_decay( (uint16_t)( decay * 65535.0f ) );
+		v.peaksFm.set_fm_amount( (uint16_t)( fm * 65535.0f ) );
+		v.peaksFm.set_noise( (uint16_t)( character * 65535.0f ) );
+		v.peaksFm.Process( trig, kMidiNoteFreq, plaits::kSampleRate, scratch, numFrames );
+		for ( int i=0; i<numFrames; ++i ) scratch[i] *= accent;
+	}
+
+	MixSampleLayer( pThis, v, kSlotSD, trig, accent, scratch, numFrames );
 
 	int filtParam = RoundToInt( ModulatedViaMatrix( pThis, kConceptFilter, kSlotSD, Smoothed( pThis, kParamFiltSD ), env1Level, env2Level ) );
+	int foldParam = RoundToInt( ModulatedViaMatrix( pThis, kConceptFold, kSlotSD, Smoothed( pThis, kParamFoldSD ), env1Level, env2Level ) );
 	int compParam = RoundToInt( ModulatedViaMatrix( pThis, kConceptCompressor, kSlotSD, Smoothed( pThis, kParamCompSD ), env1Level, env2Level ) );
 	int driveParam = RoundToInt( ModulatedViaMatrix( pThis, kConceptDrive, kSlotSD, Smoothed( pThis, kParamDriveSD ), env1Level, env2Level ) );
 	int volParam = RoundToInt( ModulatedViaMatrix( pThis, kConceptVolume, kSlotSD, Smoothed( pThis, kParamVolSD ), env1Level, env2Level ) );
 	CONSTRAIN( filtParam, -100, 100 );
+	CONSTRAIN( foldParam, 0, 100 );
 	CONSTRAIN( compParam, 0, 100 );
 	CONSTRAIN( driveParam, 0, 100 );
 	CONSTRAIN( volParam, 0, 200 );
-	ApplyPost( v, scratch, pThis->dryScratch, numFrames, filtParam, compParam, driveParam, volParam );
+	ApplyPost( v, scratch, pThis->dryScratch, numFrames, filtParam, foldParam, pThis->v[kParamFoldTypeSD], compParam, driveParam, volParam );
 
 	v.samplesUntilIdle -= numFrames;
 	if ( v.samplesUntilIdle < 0 ) v.samplesUntilIdle = 0;
@@ -1763,12 +2983,16 @@ static void ProcessHat( _drumMachineAlgorithm* pThis, float* busFrames, int numF
 	int toneParamIdx = isOpen ? kParamToneOH : kParamToneCH;
 	int charParamIdx = isOpen ? kParamCharOH : kParamCharCH;
 	int filtParamIdx = isOpen ? kParamFiltOH : kParamFiltCH;
+	int foldParamIdx = isOpen ? kParamFoldOH : kParamFoldCH;
+	int foldTypeParamIdx = isOpen ? kParamFoldTypeOH : kParamFoldTypeCH;
 	int compParamIdx = isOpen ? kParamCompOH : kParamCompCH;
 	int driveParamIdx = isOpen ? kParamDriveOH : kParamDriveCH;
 	int volParamIdx = isOpen ? kParamVolOH : kParamVolCH;
 	int stereoParamIdx = isOpen ? kParamStereoOH : kParamStereoCH;
 	int panParamIdx = isOpen ? kParamPanOH : kParamPanCH;
 	int modelParamIdx = isOpen ? kParamModelOH : kParamModelCH;
+	int fmParamIdx = isOpen ? kParamFmOH : kParamFmCH;
+	int fmModeParamIdx = isOpen ? kParamFmModeOH : kParamFmModeCH;
 
 	int slot = isOpen ? kSlotOH : kSlotCH;
 
@@ -1776,7 +3000,10 @@ static void ProcessHat( _drumMachineAlgorithm* pThis, float* busFrames, int numF
 	v.pendingTrigger = false;
 	float baseDecay = Smoothed( pThis, relParamIdx ) * 0.01f;
 	if ( trig )
+	{
 		v.samplesUntilIdle = IdleSamples( baseDecay );
+		ExtendIdleForSample( pThis, v, slot );
+	}
 
 	float blockSeconds = numFrames / plaits::kSampleRate;
 	float env1Level = AdvanceEnvelope( v.env1, trig, v.pendingAccent, pThis->v[kParamEnv1Morph], pThis->v[kParamEnv1Shape], blockSeconds );
@@ -1797,31 +3024,84 @@ static void ProcessHat( _drumMachineAlgorithm* pThis, float* busFrames, int numF
 	int pitchIdx = RoundToInt( ModulatedViaMatrix( pThis, kConceptPitch, slot, Smoothed( pThis, pitchParamIdx ), env1Level, env2Level ) );
 	CONSTRAIN( pitchIdx, 0, 127 );
 	float f0 = kMidiNoteFreq[ pitchIdx ] / plaits::kSampleRate;
-	// FM: HiHat::Render() has no FM-capable input at all (confirmed by
-	// reading hi_hat.h) - the FM knob/depth still exist for CH/OH for UI/
-	// preset consistency but are a no-op here, same as Analog kick/snare.
 	float decay = ModulatedViaMatrix( pThis, kConceptRelease, slot, Smoothed( pThis, relParamIdx ), env1Level, env2Level ) * 0.01f;
 	float tone = ModulatedViaMatrix( pThis, kConceptTone, slot, Smoothed( pThis, toneParamIdx ), env1Level, env2Level ) * 0.01f;
 	float noisiness = ModulatedViaMatrix( pThis, kConceptCharacter, slot, Smoothed( pThis, charParamIdx ), env1Level, env2Level ) * 0.01f;
+	// FM: pushes pitch on all 3 models here - see ComputeExternalFmPush()'s
+	// comment (none of them have an internal per-sample FM hook the way
+	// Analog/Synthetic/808 do, so it's applied externally, once per block).
+	float fm = ModulatedViaMatrix( pThis, kConceptFm, slot, Smoothed( pThis, fmParamIdx ), env1Level, env2Level ) * 0.01f;
 	CONSTRAIN( decay, 0.0f, 1.0f );
 	CONSTRAIN( tone, 0.0f, 1.0f );
 	CONSTRAIN( noisiness, 0.0f, 1.0f );
+	CONSTRAIN( fm, 0.0f, 1.0f );
 	float accent = v.pendingAccent;
+	int fmMode = ResolveFmMode( pThis->v[fmModeParamIdx] );
 
 	if ( pThis->v[modelParamIdx] == 0 )
-		v.hihat.Render( trig, accent, f0, tone, decay, noisiness, v.scratch1, v.scratch2, scratch, numFrames );
+	{
+		float fmPush = ComputeExternalFmPush( v, trig, accent, fmMode, blockSeconds );
+		float modulatedF0 = f0 * ( 1.0f + fmPush * fm * 1.5f );
+		CONSTRAIN( modulatedF0, 0.001f, 0.49f );
+		v.hihat.Render( trig, accent, modulatedF0, tone, decay, noisiness, v.scratch1, v.scratch2, scratch, numFrames );
+		UpdateFmFeedback( v, scratch, numFrames );
+	}
+	else if ( pThis->v[modelParamIdx] == 1 )
+	{
+		float fmPush = ComputeExternalFmPush( v, trig, accent, fmMode, blockSeconds );
+		float modulatedF0 = f0 * ( 1.0f + fmPush * fm * 1.5f );
+		CONSTRAIN( modulatedF0, 0.001f, 0.49f );
+		RenderElements( v.elementsExciter, v.elementsResonator, pThis->elementsExciteScratch, trig, accent, modulatedF0, tone, decay, noisiness, scratch, numFrames );
+		UpdateFmFeedback( v, scratch, numFrames );
+	}
 	else
-		RenderElements( v.elementsExciter, v.elementsResonator, pThis->elementsExciteScratch, trig, accent, f0, tone, decay, noisiness, scratch, numFrames );
+	{
+		// Braids' cymbal/hi-hat model has no envelope of its own (a
+		// continuously-running metallic/noise texture - see
+		// third_party/mi_braids/braids/cymbal.h) - this voice supplies a
+		// simple linear decay envelope itself, timed off the same Release
+		// knob as every other model, and applies it as a post-multiply.
+		if ( trig )
+		{
+			v.cymbalElapsed = 0.0f;
+			v.cymbalTotalS = NormToSeconds( decay * decay, 0.05f, 2.0f );
+			v.cymbalActive = true;
+		}
+		float cymbalAmp = 0.0f;
+		if ( v.cymbalActive )
+		{
+			v.cymbalElapsed += blockSeconds;
+			if ( v.cymbalElapsed >= v.cymbalTotalS )
+				v.cymbalActive = false;
+			else
+				cymbalAmp = 1.0f - v.cymbalElapsed / v.cymbalTotalS;
+		}
+		// FM pushes pitch here too (Q7 units, ~1 semitone per unit of
+		// fmPush*fm*18 below) - see ComputeExternalFmPush()'s comment.
+		float fmPush = ComputeExternalFmPush( v, trig, accent, fmMode, blockSeconds );
+		int32_t pitchPush = (int32_t)( fmPush * fm * 18.0f * 128.0f );
+		v.braidsCymbal.set_pitch( ( pitchIdx << 7 ) + pitchPush );
+		v.braidsCymbal.set_tone( (uint16_t)( tone * 65535.0f ) );
+		v.braidsCymbal.set_xfade( (uint16_t)( noisiness * 65535.0f ) );
+		v.braidsCymbal.Process( kMidiNoteFreq, plaits::kSampleRate, scratch, numFrames );
+		float amp = cymbalAmp * accent;
+		for ( int i=0; i<numFrames; ++i ) scratch[i] *= amp;
+		UpdateFmFeedback( v, scratch, numFrames );
+	}
+
+	MixSampleLayer( pThis, v, slot, trig, accent, scratch, numFrames );
 
 	int filtParam = RoundToInt( ModulatedViaMatrix( pThis, kConceptFilter, slot, Smoothed( pThis, filtParamIdx ), env1Level, env2Level ) );
+	int foldParam = RoundToInt( ModulatedViaMatrix( pThis, kConceptFold, slot, Smoothed( pThis, foldParamIdx ), env1Level, env2Level ) );
 	int compParam = RoundToInt( ModulatedViaMatrix( pThis, kConceptCompressor, slot, Smoothed( pThis, compParamIdx ), env1Level, env2Level ) );
 	int driveParam = RoundToInt( ModulatedViaMatrix( pThis, kConceptDrive, slot, Smoothed( pThis, driveParamIdx ), env1Level, env2Level ) );
 	int volParam = RoundToInt( ModulatedViaMatrix( pThis, kConceptVolume, slot, Smoothed( pThis, volParamIdx ), env1Level, env2Level ) );
 	CONSTRAIN( filtParam, -100, 100 );
+	CONSTRAIN( foldParam, 0, 100 );
 	CONSTRAIN( compParam, 0, 100 );
 	CONSTRAIN( driveParam, 0, 100 );
 	CONSTRAIN( volParam, 0, 200 );
-	ApplyPost( v, scratch, pThis->dryScratch, numFrames, filtParam, compParam, driveParam, volParam );
+	ApplyPost( v, scratch, pThis->dryScratch, numFrames, filtParam, foldParam, pThis->v[foldTypeParamIdx], compParam, driveParam, volParam );
 
 	v.samplesUntilIdle -= numFrames;
 	if ( v.samplesUntilIdle < 0 ) v.samplesUntilIdle = 0;
@@ -1833,6 +3113,24 @@ void 	step( _NT_algorithm* self, float* busFrames, int numFramesBy4 )
 {
 	_drumMachineAlgorithm* pThis = (_drumMachineAlgorithm*)self;
 	int numFrames = numFramesBy4 * 4;
+
+	// Algorithms should defer SD-card activity until it's known to be
+	// mounted, which might be well after construct() - watch for the mount
+	// transition here (matches the official distingNT_API samplePlayer.cpp
+	// example) and (re)scan for this instance's BD/SD/CH/OH folders then.
+	bool cardMounted = NT_isSdCardMounted();
+	if ( cardMounted != pThis->sdCardWasMounted )
+	{
+		pThis->sdCardWasMounted = cardMounted;
+		if ( cardMounted )
+			ScanSampleFolders( pThis );
+	}
+	AdvanceSampleAnalysis( pThis );
+	if ( pThis->sampleSystemGraceSamples > 0 )
+	{
+		pThis->sampleSystemGraceSamples -= numFrames;
+		if ( pThis->sampleSystemGraceSamples < 0 ) pThis->sampleSystemGraceSamples = 0;
+	}
 
 	AdvanceSmoothers( pThis, numFrames );
 	DecayVelocityMeters( pThis, numFrames );
@@ -1995,6 +3293,8 @@ static void LoadPreset( _drumMachineAlgorithm* pThis, int slot )
 	if ( !pThis->presetBankValid[slot] )
 		return;
 
+	ExtendSampleSystemGrace( pThis );
+
 	int algIdx = NT_algorithmIndex( pThis );
 	uint32_t off = NT_parameterOffset();
 
@@ -2027,6 +3327,17 @@ static void LoadPreset( _drumMachineAlgorithm* pThis, int slot )
 		int p = ModParamAt(i);
 		NT_setParameterFromUi( algIdx, p + off, pThis->modBank[slot][i] );
 	}
+
+	// parameterChanged()'s callback timing for changes originating from our
+	// own NT_setParameterFromUi() calls above isn't guaranteed (see
+	// SetParam()'s matching comment) - Sample's side effect (kicking off the
+	// actual SD card read) can't be left to chance the way the other
+	// kModParams entries can (none of which have a load-time side effect),
+	// so explicitly (re)start each slot's load here regardless.
+	StartSampleLoad( pThis, kSlotBD );
+	StartSampleLoad( pThis, kSlotSD );
+	StartSampleLoad( pThis, kSlotCH );
+	StartSampleLoad( pThis, kSlotOH );
 
 	pThis->potHasLastPos[0] = pThis->potHasLastPos[1] = pThis->potHasLastPos[2] = false;
 	pThis->potAccum[0] = pThis->potAccum[1] = pThis->potAccum[2] = 0.0f;
@@ -2620,9 +3931,9 @@ static void DrawBarPage( _drumMachineAlgorithm* pThis )
 		// unfilled circle (the only circle variant available) reads as a
 		// much bigger blob than its bounding box suggests at this size.
 		{
-			int dotCx = bx1 + labelColWidth / 2;
-			int dotCy = y0 + 3;
 			int dotR = 1;
+			int dotCx = bx1 + 2 + dotR;	// same 2px gap from the bar as the label text below
+			int dotCy = y0 + 3;
 			int vcol = (int)( pThis->velocityMeter[slot] * 15.0f );
 			CONSTRAIN( vcol, 0, 15 );
 			NT_drawShapeI( kNT_rectangle, dotCx - dotR, dotCy - dotR, dotCx + dotR, dotCy + dotR, vcol );
@@ -2641,6 +3952,15 @@ static void DrawBarPage( _drumMachineAlgorithm* pThis )
 			int idx = value - pMin;
 			if ( idx >= 0 && idx <= ( pMax - pMin ) )
 				NT_drawText( bx0 + barWidth/2, ( y0 + y1 ) / 2 + 3, pThis->parameters[paramIndex].enumStrings[idx], 15, kNT_textCentre, kNT_textTiny );
+		}
+		else if ( !editingDepth && pThis->parameters[paramIndex].unit == kNT_unitHasStrings )
+		{
+			// Sample page - dynamic file name (or "None"), not a static
+			// enumStrings list, since the file list is only known at
+			// runtime - see GetSampleDisplayName().
+			char sbuff[32];
+			if ( GetSampleDisplayName( pThis, slot, value, sbuff, sizeof(sbuff) ) )
+				NT_drawText( bx0 + barWidth/2, ( y0 + y1 ) / 2 + 3, sbuff, 15, kNT_textCentre, kNT_textTiny );
 		}
 		else
 		{
@@ -2685,7 +4005,7 @@ static void DrawPresetMenu( _drumMachineAlgorithm* pThis )
 	}
 	NT_drawShapeI( kNT_line, 0, kHeaderDividerY, 255, kHeaderDividerY, 4 );
 
-	// Scrolling window - kNumPresets (8) doesn't fit in the ~5 visible rows,
+	// Scrolling window - kNumPresets (64) doesn't fit in the ~5 visible rows,
 	// so without this the selection could scroll right off screen with no
 	// indication (matches the same fix already applied to DrawSetupPage()).
 	constexpr int kVisibleItems = 5;
@@ -2770,18 +4090,37 @@ void	serialise( _NT_algorithm* self, _NT_jsonStream& stream )
 		stream.openObject();
 		stream.addMemberName( "valid" );
 		stream.addBoolean( pThis->presetBankValid[slot] );
-		stream.addMemberName( "name" );
-		stream.addString( pThis->presetName[slot] );
-		stream.addMemberName( "v" );
-		stream.openArray();
-		for ( int i=0; i<kNumKitParams; ++i )
-			stream.addNumber( (int)pThis->presetBank[slot][i] );
-		stream.closeArray();
-		stream.addMemberName( "mod" );
-		stream.openArray();
-		for ( int i=0; i<kNumModParams; ++i )
-			stream.addNumber( (int)pThis->modBank[slot][i] );
-		stream.closeArray();
+		// An empty/never-saved slot has nothing worth writing - the "v"/
+		// "mod" arrays would just be every param's own default, 116 numbers
+		// of pure padding, x however many of the 64 slots are still unused
+		// (most of them, for most users, most of the time). Writing that
+		// unconditionally for every slot regardless of use is what actually
+		// caused a real "preset too complex to load, please report as a
+		// bug" failure once the Sample-layer/FM Mode params were added to
+		// this per-slot payload - confirmed by a direct test (a freshly
+		// re-saved preset failed to load; an older, smaller-payload one
+		// kept loading fine even against this same build). Skipping unused
+		// slots' payload entirely scales with how much of the bank is
+		// actually in use instead of always paying for the full 64, which
+		// should buy back much more headroom than removing any one
+		// feature's params would - deserialise() already tolerates a slot
+		// object with "name"/"v"/"mod" absent (its defaults kick in), so no
+		// changes needed on that side.
+		if ( pThis->presetBankValid[slot] )
+		{
+			stream.addMemberName( "name" );
+			stream.addString( pThis->presetName[slot] );
+			stream.addMemberName( "v" );
+			stream.openArray();
+			for ( int i=0; i<kNumKitParams; ++i )
+				stream.addNumber( (int)pThis->presetBank[slot][i] );
+			stream.closeArray();
+			stream.addMemberName( "mod" );
+			stream.openArray();
+			for ( int i=0; i<kNumModParams; ++i )
+				stream.addNumber( (int)pThis->modBank[slot][i] );
+			stream.closeArray();
+		}
 		stream.closeObject();
 	}
 	stream.closeArray();
@@ -2790,6 +4129,12 @@ void	serialise( _NT_algorithm* self, _NT_jsonStream& stream )
 bool	deserialise( _NT_algorithm* self, _NT_jsonParse& parse )
 {
 	_drumMachineAlgorithm* pThis = (_drumMachineAlgorithm*)self;
+	// The host calls this while restoring a saved preset - which itself
+	// involves reading the preset file from the same SD card the sample
+	// layer uses. See sampleSystemGraceSamples's comment: overlapping that
+	// with the sample-streaming API caused a real device freeze, confirmed
+	// specifically tied to loading while actively playing (not idle).
+	ExtendSampleSystemGrace( pThis );
 	int numMembers;
 	if ( !parse.numberOfObjectMembers( numMembers ) )
 		return false;
@@ -2908,6 +4253,7 @@ static const _NT_factory factory =
 	.setupUi = setupUi,
 	.serialise = serialise,
 	.deserialise = deserialise,
+	.parameterString = parameterString,
 };
 
 uintptr_t pluginEntry( _NT_selector selector, uint32_t data )

@@ -26,6 +26,18 @@
 //
 // Naive bass drum model (modulated oscillator with FM + envelope).
 // Inadvertently 909-ish.
+//
+// Modification: added `fm_mode` to Render() - besides the original's
+// envelope-driven `fm_envelope_amount` (fm_ starts at 1.0 on trigger and
+// decays, modulating pitch - unrelated to the actual output signal),
+// `fm_mode` (0=Envelope, 1=Feedback Linear, 2=Feedback Pow2, 3=Feedback
+// Pow3, 4=Feedback Log, 5=Both) can select genuine audio-rate self-feedback
+// instead - the previous rendered sample's *magnitude*, reshaped and
+// rescaled back to the same peak range, modulates pitch (see
+// drumMachine.cpp's kFmModeXxx/"FM Mode" page, and analog_bass_drum.h's
+// matching comment, for the full rationale). `previous_sample_` is seeded
+// with the trigger's own accent at trigger time so feedback modes have a
+// real kick from sample 0.
 
 #ifndef PLAITS_DSP_DRUMS_SYNTHETIC_BASS_DRUM_H_
 #define PLAITS_DSP_DRUMS_SYNTHETIC_BASS_DRUM_H_
@@ -106,7 +118,8 @@ class SyntheticBassDrum {
     fm_pulse_width_ = 0;
     tone_lp_ = 0.0f;
     sustain_gain_ = 0.0f;
-    
+    previous_sample_ = 0.0f;
+
     click_.Init();
     noise_.Init();
   }
@@ -136,6 +149,7 @@ class SyntheticBassDrum {
       float dirtiness,
       float fm_envelope_amount,
       float fm_envelope_decay,
+      int fm_mode,
       float* out,
       size_t size) {
     decay *= decay;
@@ -155,12 +169,17 @@ class SyntheticBassDrum {
         4.0f * f0 * stmlib::SemitonesToRatio(tone * 108.0f),
         1.0f);
     const float transient_level = tone;
-    
+    // Approximate peak |output| for this voice - see analog_bass_drum.h's
+    // kFeedbackRange for the full rationale (reshape curves preserve
+    // amplitude at this reference; also the trigger-time feedback seed).
+    const float kFeedbackRange = 1.5f;
+
     if (trigger) {
       fm_ = 1.0f;
       body_env_ = transient_env_ = 0.3f + 0.7f * accent;
       body_env_pulse_width_ = kSampleRate * 0.001f;
       fm_pulse_width_ = kSampleRate * 0.0013f;
+      if (fm_mode >= 1) previous_sample_ = accent * kFeedbackRange;
     }
     
     stmlib::ParameterInterpolator sustain_gain(
@@ -186,7 +205,28 @@ class SyntheticBassDrum {
           phase_ = 0.25f;
         } else {
           fm_ *= fm_decay;
-          float fm = 1.0f + fm_envelope_amount * 3.5f * fm_lp_;
+          float fm = 1.0f;
+          if (fm_mode == 0 || fm_mode == 5) {
+            fm += fm_envelope_amount * 3.5f * fm_lp_;
+          }
+          if (fm_mode >= 1) {
+            float fb = previous_sample_;
+            CONSTRAIN(fb, -kFeedbackRange, kFeedbackRange);
+            float mag = fabsf(fb) * (1.0f / kFeedbackRange);
+            float sign = fb < 0.0f ? -1.0f : 1.0f;
+            float shaped = mag;
+            if (fm_mode == 2) shaped = mag * mag;
+            else if (fm_mode == 3) shaped = mag * mag * mag;
+            else if (fm_mode == 4) shaped = mag * (2.0f - mag);
+            fm += fm_envelope_amount * 3.5f * sign * shaped * kFeedbackRange;
+          }
+          // fm multiplies the phase increment directly - if feedback swings
+          // it negative enough, phase_ runs *backward* (only the >= 1.0f
+          // wrap below is handled, not going negative), silently breaking
+          // the oscillator. drumMachine.cpp caps the knob-derived
+          // fm_envelope_amount below that danger zone rather than clamping
+          // here, which flattened the knock's character even well before
+          // the actual danger zone.
           phase_ += std::min(f0_mod.Next() * fm, 0.5f);
           if (phase_ >= 1.0f) {
             phase_ -= 1.0f;
@@ -215,6 +255,7 @@ class SyntheticBassDrum {
 
       ONE_POLE(tone_lp_, mix, tone_f);
       *out++ = tone_lp_;
+      previous_sample_ = tone_lp_;
     }
   }
 
@@ -229,10 +270,11 @@ class SyntheticBassDrum {
   float body_env_lp_;
   float transient_env_;
   float transient_env_lp_;
-  
+
   float sustain_gain_;
-  
+
   float tone_lp_;
+  float previous_sample_;
   
   SyntheticBassDrumClick click_;
   SyntheticBassDrumAttackNoise noise_;

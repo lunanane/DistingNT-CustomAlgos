@@ -11,10 +11,12 @@ NT_API_PATH := distingNT_API
 INCLUDE_PATH := $(NT_API_PATH)/include
 THIRD_PARTY_PATH := third_party/mi_drums
 THIRD_PARTY_ELEMENTS_PATH := third_party/mi_elements
+THIRD_PARTY_PEAKS_PATH := third_party/mi_peaks
+THIRD_PARTY_BRAIDS_PATH := third_party/mi_braids
 
 CXX := arm-none-eabi-c++
 CXXFLAGS := -std=c++11 -mcpu=cortex-m7 -mfpu=fpv5-d16 -mfloat-abi=hard -mthumb \
-            -fno-rtti -fno-exceptions -Os -fPIC -Wall -I$(INCLUDE_PATH) -I$(THIRD_PARTY_PATH) -I$(THIRD_PARTY_ELEMENTS_PATH)
+            -fno-rtti -fno-exceptions -Os -fPIC -Wall -I$(INCLUDE_PATH) -I$(THIRD_PARTY_PATH) -I$(THIRD_PARTY_ELEMENTS_PATH) -I$(THIRD_PARTY_PEAKS_PATH) -I$(THIRD_PARTY_BRAIDS_PATH)
 
 PYTHON := python3
 
