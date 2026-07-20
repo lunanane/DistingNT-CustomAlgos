@@ -630,6 +630,16 @@ struct _drumMachineAlgorithm : public _NT_algorithm
 	// rotate now adjusts the highlighted item's value, push again to
 	// return to browsing. Reset to false on every page change.
 	bool setupEditMode;
+	// Quick modulation-depth-edit mode on a bar page (button 4): cycles
+	// kModSrcNone (Normal) -> kModSrcEnv1 -> kModSrcEnv2 -> kModSrcLfo1 ->
+	// kModSrcLfo2 -> Normal - deliberately reuses the kModSrcXxx enum values
+	// directly (Normal == kModSrcNone == 0) so this doubles as "which source
+	// is being quick-edited". Only meaningful on the 9 concept bar pages
+	// (kPageConcept[..] != -1, i.e. not Model). While active, the 4
+	// pot/encoder controls edit that source's Mod Matrix depth for each slot
+	// instead of the concept's base value - see FindOrAllocRoute()/
+	// customUi(). Reset to Normal (0) on every page change.
+	int barPageMode;
 
 	// Relative/incremental mode for the 3 bar-page pots (potL/potC/potR),
 	// replacing an earlier "wait until the pot crosses the current value"
@@ -755,6 +765,7 @@ _NT_algorithm*	construct( const _NT_algorithmMemoryPtrs& ptrs, const _NT_algorit
 	alg->currentPage = kFirstCustomPage;
 	alg->setupSelectedItem = 0;
 	alg->setupEditMode = false;
+	alg->barPageMode = kModSrcNone;
 	alg->potHasLastPos[0] = alg->potHasLastPos[1] = alg->potHasLastPos[2] = false;
 	alg->potAccum[0] = alg->potAccum[1] = alg->potAccum[2] = 0.0f;
 	alg->smoothersInitialized = false;
@@ -1184,23 +1195,22 @@ static float ModulatedViaMatrix( _drumMachineAlgorithm* pThis, int concept, int 
 	return result;
 }
 
-// Total possible swing (sum of |depth| across every route targeting this
-// concept/slot) - used by the bar-page overlay to show the full range the
-// live value could reach, independent of the sources' current phase/level.
-static float ModSwing( _drumMachineAlgorithm* pThis, int concept, int slot )
+// Read-only lookup: the route currently mapping `source` to (concept, slot),
+// or -1 if none - used for display (DrawBarPage()) and as the first step of
+// FindOrAllocRoute() below. Never mutates, unlike FindOrAllocRoute().
+static int FindRoute( _drumMachineAlgorithm* pThis, int source, int slot, int concept )
 {
-	float swing = 0.0f;
 	for ( int r=0; r<kNumModRoutes; ++r )
 	{
-		if ( pThis->v[ ModRouteParam( r, kModParamSource ) ] == kModSrcNone )
+		if ( pThis->v[ ModRouteParam( r, kModParamSource ) ] != source )
 			continue;
 		if ( pThis->v[ ModRouteParam( r, kModParamSlot ) ] != slot )
 			continue;
 		if ( pThis->v[ ModRouteParam( r, kModParamConcept ) ] != concept )
 			continue;
-		swing += std::abs( (float)pThis->v[ ModRouteParam( r, kModParamDepth ) ] ) * 0.01f;
+		return r;
 	}
-	return swing;
+	return -1;
 }
 
 // Shared "Elements" model glue - a struck-mallet excitation into a modal
@@ -1785,7 +1795,7 @@ void 	step( _NT_algorithm* self, float* busFrames, int numFramesBy4 )
 
 uint32_t	hasCustomUi( _NT_algorithm* self )
 {
-	return kNT_encoderL | kNT_encoderR | kNT_encoderButtonR | kNT_potL | kNT_potC | kNT_potR | kNT_button3;
+	return kNT_encoderL | kNT_encoderR | kNT_encoderButtonR | kNT_potL | kNT_potC | kNT_potR | kNT_button3 | kNT_button4;
 }
 
 static int SetupPageItemCount( int page ) { return kPageItemCount[page]; }
@@ -1928,6 +1938,39 @@ static void LoadPreset( _drumMachineAlgorithm* pThis, int slot )
 	pThis->potAccum[0] = pThis->potAccum[1] = pThis->potAccum[2] = 0.0f;
 }
 
+// Resolves the route mapping `source` to (concept, slot) for quick-edit
+// (button 4) depth adjustment on a bar page - reuses an existing matching
+// route if one exists (via the read-only FindRoute()), otherwise claims a
+// free (Source=None) route by writing its Source/Slot/Concept (leaving
+// Depth at 0) so the pot/encoder delta in customUi() has somewhere to
+// write. Returns -1 if no matching route exists AND all kNumModRoutes are
+// already claimed by other mappings - that slot's quick-edit control is
+// then a no-op until a route frees up elsewhere.
+static int FindOrAllocRoute( _drumMachineAlgorithm* pThis, int source, int slot, int concept )
+{
+	int existing = FindRoute( pThis, source, slot, concept );
+	if ( existing >= 0 )
+		return existing;
+
+	int freeRoute = -1;
+	for ( int r=0; r<kNumModRoutes; ++r )
+	{
+		if ( pThis->v[ ModRouteParam( r, kModParamSource ) ] == kModSrcNone )
+		{
+			freeRoute = r;
+			break;
+		}
+	}
+	if ( freeRoute < 0 )
+		return -1;
+
+	SetParam( pThis, ModRouteParam( freeRoute, kModParamSource ), source );
+	SetParam( pThis, ModRouteParam( freeRoute, kModParamSlot ), slot );
+	SetParam( pThis, ModRouteParam( freeRoute, kModParamConcept ), concept );
+	SetParam( pThis, ModRouteParam( freeRoute, kModParamDepth ), 0 );
+	return freeRoute;
+}
+
 void	customUi( _NT_algorithm* self, const _NT_uiData& data )
 {
 	_drumMachineAlgorithm* pThis = (_drumMachineAlgorithm*)self;
@@ -1980,6 +2023,7 @@ void	customUi( _NT_algorithm* self, const _NT_uiData& data )
 		if ( pThis->currentPage >= kNumPages ) pThis->currentPage = kNumPages - 1;
 		pThis->setupSelectedItem = 0;
 		pThis->setupEditMode = false;
+		pThis->barPageMode = kModSrcNone;
 		pThis->potHasLastPos[0] = pThis->potHasLastPos[1] = pThis->potHasLastPos[2] = false;
 	pThis->potAccum[0] = pThis->potAccum[1] = pThis->potAccum[2] = 0.0f;
 	}
@@ -2024,33 +2068,77 @@ void	customUi( _NT_algorithm* self, const _NT_uiData& data )
 		// report absolute position and the currently-displayed page has no
 		// relation to wherever a pot physically happens to be sitting;
 		// Encoder R is a relative delta already and never has this problem.
-		const uint8_t* params = kPageParams[ pThis->currentPage ];
+		//
+		// On the 9 concept bar pages (not Model), button 4 cycles a quick
+		// modulation-depth-edit mode - Normal -> Env1 -> Env2 -> LFO1 ->
+		// LFO2 -> Normal - so the same 4 controls edit that source's Mod
+		// Matrix depth for each slot instead of the concept's base value,
+		// without needing to leave the page for the Mod Matrix list (see
+		// FindOrAllocRoute()).
+		int concept = kPageConcept[ pThis->currentPage ];
+		bool isBarPage = ( kPageType[pThis->currentPage] == kPageTypeBar );
+
+		if ( isBarPage && concept != -1 && ( data.controls & kNT_button4 ) && !( data.lastButtons & kNT_button4 ) )
+			pThis->barPageMode = ( pThis->barPageMode + 1 ) % kNumModSources;
+
+		bool editingDepth = isBarPage && concept != -1 && pThis->barPageMode != kModSrcNone;
+		const uint8_t* baseParams = kPageParams[ pThis->currentPage ];
+
+		// Resolves control slot i (0=BD..3=OH) to the parameter index it
+		// should actually edit right now - either the concept's own base
+		// value, or (in quick-edit mode) the depth of whichever Mod Matrix
+		// route maps the active source to this concept/slot, allocating one
+		// on the fly if none exists yet. Returns -1 if quick-edit is active
+		// but every route is already claimed elsewhere (control is inert).
+		auto resolveParam = [&]( int slotIdx ) -> int
+		{
+			if ( !editingDepth )
+				return baseParams[slotIdx];
+			int route = FindOrAllocRoute( pThis, pThis->barPageMode, slotIdx, concept );
+			return route < 0 ? -1 : ModRouteParam( route, kModParamDepth );
+		};
 
 		if ( data.controls & kNT_potL )
 		{
-			const _NT_parameter& p = self->parameters[ params[0] ];
-			int newValue;
-			if ( PotRelativeUpdate( pThis, 0, data.pots[0], p.min, p.max, self->v[ params[0] ], &newValue ) )
-				SetParam( pThis, params[0], newValue );
+			int paramIndex = resolveParam( 0 );
+			if ( paramIndex >= 0 )
+			{
+				const _NT_parameter& p = self->parameters[paramIndex];
+				int newValue;
+				if ( PotRelativeUpdate( pThis, 0, data.pots[0], p.min, p.max, self->v[paramIndex], &newValue ) )
+					SetParam( pThis, paramIndex, newValue );
+			}
 		}
 		if ( data.controls & kNT_potC )
 		{
-			const _NT_parameter& p = self->parameters[ params[1] ];
-			int newValue;
-			if ( PotRelativeUpdate( pThis, 1, data.pots[1], p.min, p.max, self->v[ params[1] ], &newValue ) )
-				SetParam( pThis, params[1], newValue );
+			int paramIndex = resolveParam( 1 );
+			if ( paramIndex >= 0 )
+			{
+				const _NT_parameter& p = self->parameters[paramIndex];
+				int newValue;
+				if ( PotRelativeUpdate( pThis, 1, data.pots[1], p.min, p.max, self->v[paramIndex], &newValue ) )
+					SetParam( pThis, paramIndex, newValue );
+			}
 		}
 		if ( data.controls & kNT_potR )
 		{
-			const _NT_parameter& p = self->parameters[ params[3] ];
-			int newValue;
-			if ( PotRelativeUpdate( pThis, 2, data.pots[2], p.min, p.max, self->v[ params[3] ], &newValue ) )
-				SetParam( pThis, params[3], newValue );
+			int paramIndex = resolveParam( 3 );
+			if ( paramIndex >= 0 )
+			{
+				const _NT_parameter& p = self->parameters[paramIndex];
+				int newValue;
+				if ( PotRelativeUpdate( pThis, 2, data.pots[2], p.min, p.max, self->v[paramIndex], &newValue ) )
+					SetParam( pThis, paramIndex, newValue );
+			}
 		}
 		if ( data.encoders[1] != 0 )
 		{
-			int current = self->v[ params[2] ];
-			SetParam( pThis, params[2], current + data.encoders[1] );
+			int paramIndex = resolveParam( 2 );
+			if ( paramIndex >= 0 )
+			{
+				int current = self->v[paramIndex];
+				SetParam( pThis, paramIndex, current + data.encoders[1] );
+			}
 		}
 	}
 }
@@ -2080,11 +2168,22 @@ void	setupUi( _NT_algorithm* self, _NT_float3& pots )
 // Drawing
 // ---------------------------------------------------------------------
 
-static void DrawSetupPage( _drumMachineAlgorithm* pThis, const char* title )
+// Every custom-UI page shares one header: the page's title on the left, a
+// divider line marking off the content area below, and (space permitting)
+// a small "lnxdrum v5.0" watermark top-right - `rightTag` overrides that
+// watermark for pages that need the top-right corner for something more
+// important (DrawSetupPage's "EDIT" indicator), so the two never overlap.
+static void DrawHeader( const char* title, const char* rightTag = "lnxdrum v5.0" )
 {
 	NT_drawText( 4, 12, title, 15, kNT_textLeft, kNT_textNormal );
-	if ( pThis->setupEditMode )
-		NT_drawText( 251, 12, "EDIT", 15, kNT_textRight, kNT_textNormal );
+	if ( rightTag )
+		NT_drawText( 252, 12, rightTag, 5, kNT_textRight, kNT_textTiny );
+	NT_drawShapeI( kNT_line, 0, 18, 255, 18, 4 );
+}
+
+static void DrawSetupPage( _drumMachineAlgorithm* pThis, const char* title )
+{
+	DrawHeader( title, pThis->setupEditMode ? "EDIT" : "lnxdrum v5.0" );
 
 	int itemCount = SetupPageItemCount( pThis->currentPage );
 	const uint8_t* params = SetupPageParams( pThis->currentPage );
@@ -2117,8 +2216,6 @@ static void DrawSetupPage( _drumMachineAlgorithm* pThis, const char* title )
 			NT_drawText( 160, y, buff, colour, kNT_textLeft, kNT_textTiny );
 		}
 	}
-
-	NT_drawShapeI( kNT_line, 0, 18, 255, 18, 4 );
 }
 
 // Samples `numSamples` points of `level(i/(numSamples-1))` (must return 0..1)
@@ -2160,8 +2257,7 @@ static void DrawGraphBoxOutline( int bx0, int bx1, int y0, int y1 )
 
 static void DrawEnvelopesPage( _drumMachineAlgorithm* pThis )
 {
-	NT_drawText( 4, 12, "ENVELOPES", 15, kNT_textLeft, kNT_textNormal );
-	NT_drawShapeI( kNT_line, 0, 18, 255, 18, 4 );
+	DrawHeader( "ENVELOPES" );
 
 	constexpr int y0 = 22;
 	constexpr int y1 = 44;
@@ -2215,8 +2311,7 @@ static void DrawEnvelopesPage( _drumMachineAlgorithm* pThis )
 
 static void DrawLfosPage( _drumMachineAlgorithm* pThis )
 {
-	NT_drawText( 4, 12, "LFOS", 15, kNT_textLeft, kNT_textNormal );
-	NT_drawShapeI( kNT_line, 0, 18, 255, 18, 4 );
+	DrawHeader( "LFOS" );
 
 	constexpr int y0 = 22;
 	constexpr int y1 = 44;
@@ -2248,41 +2343,63 @@ static void DrawLfosPage( _drumMachineAlgorithm* pThis )
 	}
 }
 
+static char const * const kQuickModeNames[kNumModSources] = {
+	NULL, "ENV1 DEPTH", "ENV2 DEPTH", "LFO1 DEPTH", "LFO2 DEPTH",
+};
+static char const * const kModSourceTag[kNumModSources] = { NULL, "E1", "E2", "L1", "L2" };
+
 static void DrawBarPage( _drumMachineAlgorithm* pThis )
 {
 	int page = pThis->currentPage;
 	int concept = kPageConcept[page];
+	bool editingDepth = ( concept != -1 ) && ( pThis->barPageMode != kModSrcNone );
+
+	if ( editingDepth )
+	{
+		char titleBuff[32];
+		strcpy( titleBuff, kPageNames[page] );
+		strcat( titleBuff, " - " );
+		strcat( titleBuff, kQuickModeNames[pThis->barPageMode] );
+		DrawHeader( titleBuff );
+	}
+	else
+	{
+		DrawHeader( kPageNames[page] );
+	}
+
 	const uint8_t* params = kPageParams[page];
-	bool bipolar = kPageBipolar[page];
+	bool bipolar = editingDepth ? true : kPageBipolar[page];
 
-	NT_drawText( 4, 20, kPageNames[page], 15, kNT_textLeft, kNT_textNormal );
-
-	constexpr int y0 = 8;
-	constexpr int y1 = 60;
-	// One integrated bar per slot - no separate indicator-box column (the
-	// old "1 big bar + 4 small indicator boxes" layout read as busy per user
-	// feedback). Modulation range and velocity are now folded into this same
-	// bar instead: modulation range as a light stipple inside the fill,
-	// velocity as a bright tick at the top decaying downward - see below.
-	// Reclaiming the indicator column's width lets the bar itself go wider.
-	constexpr int barWidth = 40;
-	constexpr int slotGap = 12;
+	// Equal-width bars, centered as a group on the 256px-wide display (was
+	// left-justified before - "not centered" per feedback). The gap between
+	// bars is wide enough for the mapped-source tags ("E1"/"E2"/"L1"/"L2")
+	// to sit legibly below each one without crowding its neighbor.
+	constexpr int y0 = 21;
+	constexpr int y1 = 46;
+	constexpr int barWidth = 44;
+	constexpr int slotGap = 16;
 	constexpr int slotFootprint = barWidth + slotGap;
-	constexpr int x0 = 12;
+	constexpr int x0 = ( 256 - ( kNumSlots * barWidth + ( kNumSlots - 1 ) * slotGap ) ) / 2;
 
 	for ( int slot=0; slot<kNumSlots; ++slot )
 	{
-		int paramIndex = params[slot];
-		const _NT_parameter& p = pThis->parameters[paramIndex];
-		int value = pThis->v[paramIndex];
+		// In quick-edit mode, the bar shows the resolved route's depth
+		// (read-only lookup - drawing must never allocate a route, only
+		// actually turning a control does, via FindOrAllocRoute() in
+		// customUi()); an unmapped slot just shows as 0/centered.
+		int paramIndex = editingDepth ? -1 : params[slot];
+		int route = editingDepth ? FindRoute( pThis, pThis->barPageMode, slot, concept ) : -1;
+		int value = editingDepth ? ( route < 0 ? 0 : pThis->v[ ModRouteParam( route, kModParamDepth ) ] ) : pThis->v[paramIndex];
+		int pMin = editingDepth ? -100 : pThis->parameters[paramIndex].min;
+		int pMax = editingDepth ? 100 : pThis->parameters[paramIndex].max;
 
 		int bx0 = x0 + slot * slotFootprint;
 		int bx1 = bx0 + barWidth;
 
 		NT_drawShapeI( kNT_box, bx0, y0, bx1, y1, 8 );
 
-		float range = (float)( p.max - p.min );
-		float t = range > 0.0f ? ( value - p.min ) / range : 0.0f;
+		float range = (float)( pMax - pMin );
+		float t = range > 0.0f ? ( value - pMin ) / range : 0.0f;
 
 		if ( bipolar )
 		{
@@ -2304,7 +2421,7 @@ static void DrawBarPage( _drumMachineAlgorithm* pThis )
 
 		auto valueToY = [&]( float v )
 		{
-			float vt = range > 0.0f ? ( v - p.min ) / range : 0.0f;
+			float vt = range > 0.0f ? ( v - pMin ) / range : 0.0f;
 			CONSTRAIN( vt, 0.0f, 1.0f );
 			if ( !bipolar )
 				return y1 - (int)( vt * ( y1 - y0 ) );
@@ -2313,53 +2430,77 @@ static void DrawBarPage( _drumMachineAlgorithm* pThis )
 			return midY - (int)( signedVt * ( midY - y0 ) );
 		};
 
-		// Modulation overlay: a light stipple *inside* the bar's own fill
-		// area (instead of a separate strip) showing the full range the Mod
-		// Matrix's routes could swing this value across, plus a bright line
-		// at the currently-modulated value. Skipped on Model (concept == -1,
-		// not modulatable).
-		if ( concept != -1 )
+		// Modulation overlay (normal mode only - in quick-edit mode the bar
+		// itself already *is* one route's depth): one thin contrasted line
+		// per source currently mapped to this concept/slot - "a row of bars
+		// if multiple apply" - at the value that source would push to at its
+		// current depth, plus a brighter line at the actual live (combined,
+		// all-sources) modulated value. Skipped on Model (concept == -1).
+		if ( !editingDepth && concept != -1 )
 		{
-			float swing = ModSwing( pThis, concept, slot );
-			float modulated = ModulatedViaMatrix( pThis, concept, slot, (float)value, pThis->currentEnv1Level[slot], pThis->currentEnv2Level[slot] );
-
-			int loY = valueToY( (float)value - swing * range );
-			int hiY = valueToY( (float)value + swing * range );
-			if ( loY > hiY ) { int tmp = loY; loY = hiY; hiY = tmp; }
-			int midX = ( bx0 + bx1 ) / 2;
-			for ( int yy=loY; yy<=hiY; yy+=3 )
+			for ( int s=kModSrcEnv1; s<=kModSrcLfo2; ++s )
 			{
-				int xx = midX + ( ( ( yy / 3 ) & 1 ) ? -7 : 7 );
-				NT_drawShapeI( kNT_line, xx, yy, xx, yy, 6 );
+				int r = FindRoute( pThis, s, slot, concept );
+				if ( r < 0 )
+					continue;
+				int depth = pThis->v[ ModRouteParam( r, kModParamDepth ) ];
+				int yy = valueToY( (float)value + ( depth * 0.01f ) * range );
+				NT_drawShapeI( kNT_line, bx0 + 2, yy, bx1 - 2, yy, 7 );
 			}
 
+			float modulated = ModulatedViaMatrix( pThis, concept, slot, (float)value, pThis->currentEnv1Level[slot], pThis->currentEnv2Level[slot] );
 			int modY = valueToY( modulated );
 			NT_drawShapeI( kNT_line, bx0, modY, bx1, modY, 15 );
 		}
 
-		// Velocity: a bright tick starting at the top of the bar on a hit,
-		// decaying downward toward y1 as velocityMeter[slot] falls back to 0
-		// (see DecayVelocityMeters()) - replaces the old separate indicator
-		// box.
-		if ( pThis->velocityMeter[slot] > 0.0f )
+		// Velocity: a round dot top-right of the bar, brightness 0 (no
+		// recent hit) to 15 (just hit) tracking velocityMeter[slot]'s decay
+		// (see DecayVelocityMeters()) - visually separates "incoming note
+		// energy" (this dot) from "what's mapped" (tags below) and "how
+		// modulation applies right now" (lines above), instead of one
+		// combined pumping bar.
 		{
-			int tickY = y0 + (int)( ( 1.0f - pThis->velocityMeter[slot] ) * ( y1 - y0 ) );
-			NT_drawShapeI( kNT_line, bx0, tickY, bx1, tickY, 15 );
+			int dotCx = bx1 + 7;
+			int dotCy = y0 + 4;
+			int dotR = 3;
+			int vcol = (int)( pThis->velocityMeter[slot] * 15.0f );
+			CONSTRAIN( vcol, 0, 15 );
+			NT_drawShapeI( kNT_circle, dotCx - dotR, dotCy - dotR, dotCx + dotR, dotCy + dotR, vcol );
 		}
 
-		NT_drawText( bx0 + barWidth/2, y1 + 9, kSlotNames[slot], 15, kNT_textCentre, kNT_textTiny );
-
 		char buff[16];
-		if ( p.unit == kNT_unitEnum && p.enumStrings != NULL )
+		if ( !editingDepth && pThis->parameters[paramIndex].unit == kNT_unitEnum && pThis->parameters[paramIndex].enumStrings != NULL )
 		{
-			int idx = value - p.min;
-			if ( idx >= 0 && idx <= ( p.max - p.min ) )
-				NT_drawText( bx0 + barWidth/2, ( y0 + y1 ) / 2 + 3, p.enumStrings[idx], 15, kNT_textCentre, kNT_textTiny );
+			int idx = value - pMin;
+			if ( idx >= 0 && idx <= ( pMax - pMin ) )
+				NT_drawText( bx0 + barWidth/2, ( y0 + y1 ) / 2 + 3, pThis->parameters[paramIndex].enumStrings[idx], 15, kNT_textCentre, kNT_textTiny );
 		}
 		else
 		{
 			NT_intToString( buff, value );
 			NT_drawText( bx0 + barWidth/2, ( y0 + y1 ) / 2 + 3, buff, 15, kNT_textCentre, kNT_textTiny );
+		}
+
+		NT_drawText( bx0 + barWidth/2, y1 + 7, kSlotNames[slot], 15, kNT_textCentre, kNT_textTiny );
+
+		// Mapped-source tags, bottom row - only the sources actually
+		// assigned to this concept/slot are printed (per feedback: "could
+		// be printed on the bottom... when those are assigned as mappings").
+		if ( !editingDepth && concept != -1 )
+		{
+			char tagBuff[24] = "";
+			bool any = false;
+			for ( int s=kModSrcEnv1; s<=kModSrcLfo2; ++s )
+			{
+				if ( FindRoute( pThis, s, slot, concept ) < 0 )
+					continue;
+				if ( any )
+					strcat( tagBuff, " " );
+				strcat( tagBuff, kModSourceTag[s] );
+				any = true;
+			}
+			if ( any )
+				NT_drawText( bx0 + barWidth/2, y1 + 14, tagBuff, 10, kNT_textCentre, kNT_textTiny );
 		}
 	}
 }
