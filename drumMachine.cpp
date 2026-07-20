@@ -123,7 +123,14 @@ static char const * const kEnumModSource[] = { "None", "Env1", "Env2", "LFO1", "
 static char const * const kEnumModSlot[] = { "BD", "SD", "CH", "OH" };
 
 enum { kModParamSource, kModParamSlot, kModParamConcept, kModParamDepth, kNumModRouteParams };
-enum { kNumModRoutes = 8 };
+// 8 -> 12: the original budget turned out tight in practice (shared across
+// every concept/slot/source combination in the whole plugin, not per-page) -
+// bumped after confirming the extra 16 params (4 routes x 4) still lands
+// comfortably under the ~134 total that's confirmed to load reliably (214
+// is confirmed to silently fail - see kFirstModRouteParam's history). Not
+// pushed further in one jump since the exact ceiling above 134 is still
+// unverified.
+enum { kNumModRoutes = 12 };
 
 enum
 {
@@ -235,6 +242,7 @@ static _NT_parameter parameters[] = {
 
 	MOD_ROUTE_PARAMS(1) MOD_ROUTE_PARAMS(2) MOD_ROUTE_PARAMS(3) MOD_ROUTE_PARAMS(4)
 	MOD_ROUTE_PARAMS(5) MOD_ROUTE_PARAMS(6) MOD_ROUTE_PARAMS(7) MOD_ROUTE_PARAMS(8)
+	MOD_ROUTE_PARAMS(9) MOD_ROUTE_PARAMS(10) MOD_ROUTE_PARAMS(11) MOD_ROUTE_PARAMS(12)
 
 	{ .name = "Env1 morph", .min = 0, .max = 100, .def = 50, .unit = kNT_unitPercent, .scaling = 0, .enumStrings = NULL },
 	{ .name = "Env1 shape", .min = 0, .max = 100, .def = 0, .unit = kNT_unitPercent, .scaling = 0, .enumStrings = NULL },
@@ -677,6 +685,18 @@ struct _drumMachineAlgorithm : public _NT_algorithm
 	int presetMenuAction;	// 0 = Load, 1 = Save
 	int presetMenuIndex;	// which of kNumPresets slots is selected
 
+	// Delete-modifier confirm dialog - opened by clicking the pot/encoder
+	// for a given slot while in quick-edit depth mode on a bar page (see
+	// customUi()), same "defaults to the safe choice" pattern as the preset
+	// menu's Load/Save. Only ever open while on a bar page in quick-edit
+	// mode, so currentPage/barPageMode (read fresh, not snapshotted here)
+	// still identify which (source, concept) the dialog is acting on -
+	// safe because this dialog owns every claimed control while open, so
+	// neither can change out from under it.
+	bool deleteConfirmOpen;
+	int deleteConfirmSlot;
+	int deleteConfirmChoice;	// 0 = No, 1 = Yes
+
 	int16_t presetBank[kNumPresets][kNumKitParams];
 	bool presetBankValid[kNumPresets];
 	char presetName[kNumPresets][kPresetNameLen];
@@ -774,6 +794,9 @@ _NT_algorithm*	construct( const _NT_algorithmMemoryPtrs& ptrs, const _NT_algorit
 	alg->presetMenuStage = 0;
 	alg->presetMenuAction = 0;
 	alg->presetMenuIndex = 0;
+	alg->deleteConfirmOpen = false;
+	alg->deleteConfirmSlot = 0;
+	alg->deleteConfirmChoice = 0;
 	memset( alg->presetBankValid, 0, sizeof(alg->presetBankValid) );
 	memset( alg->velocityMeter, 0, sizeof(alg->velocityMeter) );
 	memset( alg->currentEnv1Level, 0, sizeof(alg->currentEnv1Level) );
@@ -1168,6 +1191,27 @@ static float AdvanceEnvelope( _envelopeState& env, bool trig, float accent, int 
 // earlier dense per-concept-per-slot-per-source parameter grid.
 // ---------------------------------------------------------------------
 
+// Depth is a *percentage of the concept's own range* (-100..100, same
+// convention the bar-page overlay already displays it in - see
+// DrawBarPage()'s per-source thin lines, which scale by the live
+// parameter's own p.max-p.min): 100% depth means a source at full level can
+// swing the value across its entire range. All 4 slots of a given concept
+// share one min/max in `parameters[]`, so a flat per-concept table is exact,
+// not an approximation. (Bug fix: this used to be missing entirely - depth
+// was applied as a flat +-1.0-unit swing regardless of the concept's actual
+// range, e.g. +-1 out of Pitch's 0..127, which was never audible.)
+static const float kConceptRange[kNumConcepts] = {
+	100.0f,	// Release
+	100.0f,	// Compressor
+	200.0f,	// Filter (-100..100)
+	100.0f,	// Waveshaper/Drive
+	127.0f,	// Pitch
+	200.0f,	// Volume (0..200)
+	100.0f,	// Tone
+	100.0f,	// Character
+	100.0f,	// FM
+};
+
 static float ModulatedViaMatrix( _drumMachineAlgorithm* pThis, int concept, int slot, float baseValue, float env1Level, float env2Level )
 {
 	float result = baseValue;
@@ -1190,9 +1234,21 @@ static float ModulatedViaMatrix( _drumMachineAlgorithm* pThis, int concept, int 
 		default:          srcValue = pThis->lfo2Value; break;	// kModSrcLfo2
 		}
 		float depth = (float)pThis->v[ ModRouteParam( r, kModParamDepth ) ] * 0.01f;
-		result += srcValue * depth;
+		result += srcValue * depth * kConceptRange[concept];
 	}
 	return result;
+}
+
+// True if at least one of the kNumModRoutes routes is still unclaimed
+// (Source == None) - used to show a "FULL" indicator on the bar page
+// instead of silently doing nothing when quick-edit (button 4) can't find
+// or allocate a route for an unmapped slot (see DrawBarPage()).
+static bool AnyRouteFree( _drumMachineAlgorithm* pThis )
+{
+	for ( int r=0; r<kNumModRoutes; ++r )
+		if ( pThis->v[ ModRouteParam( r, kModParamSource ) ] == kModSrcNone )
+			return true;
+	return false;
 }
 
 // Read-only lookup: the route currently mapping `source` to (concept, slot),
@@ -1795,7 +1851,8 @@ void 	step( _NT_algorithm* self, float* busFrames, int numFramesBy4 )
 
 uint32_t	hasCustomUi( _NT_algorithm* self )
 {
-	return kNT_encoderL | kNT_encoderR | kNT_encoderButtonR | kNT_potL | kNT_potC | kNT_potR | kNT_button3 | kNT_button4;
+	return kNT_encoderL | kNT_encoderR | kNT_encoderButtonR | kNT_potL | kNT_potC | kNT_potR
+		| kNT_potButtonL | kNT_potButtonC | kNT_potButtonR | kNT_button3 | kNT_button4;
 }
 
 static int SetupPageItemCount( int page ) { return kPageItemCount[page]; }
@@ -1856,12 +1913,49 @@ static bool PotRelativeUpdate( _drumMachineAlgorithm* pThis, int potIdx, float r
 	float delta = rawPos - pThis->potLastPos[potIdx];
 	pThis->potLastPos[potIdx] = rawPos;
 
-	// Accumulate in parameter units and only ever act on the whole-integer
-	// part, carrying the fractional remainder forward - see potAccum's
-	// comment on the algorithm struct for why this is needed (high-
-	// resolution pots report movement in increments far finer than one
-	// parameter step).
-	pThis->potAccum[potIdx] += delta * ( paramMax - paramMin );
+	int range = paramMax - paramMin;
+
+	// Low-cardinality parameters (a handful of discrete options - e.g.
+	// Model's 3-way enum, or LFO Rate's 7 divisions) feel broken under the
+	// plain `delta * range` scaling below: reaching a full step requires
+	// accumulating HALF the pot's *entire* physical travel for a range as
+	// small as 2. Since the pot's resting position has no relation to the
+	// logical value (see potLastPos's comment), it commonly ends up resting
+	// close to one physical end already - leaving less than half a turn of
+	// travel available in that direction, so some options become
+	// physically unreachable no matter how far you turn, without first
+	// "winding up" the other way (not an obvious or discoverable move).
+	// Below this threshold, use a fixed "distance per step" in pot-travel
+	// terms instead, independent of range, so a comfortable partial turn
+	// from *any* resting position reaches every option, and every step is a
+	// deliberate, discrete +-1 that never skips over one.
+	constexpr int kDetentRangeThreshold = 8;
+	if ( range > 0 && range <= kDetentRangeThreshold )
+	{
+		constexpr float kDetentDistance = 0.12f;	// ~12% of full travel per step
+		pThis->potAccum[potIdx] += delta;
+		if ( pThis->potAccum[potIdx] >= kDetentDistance )
+		{
+			pThis->potAccum[potIdx] -= kDetentDistance;
+			*outValue = currentValue + 1;
+			return true;
+		}
+		if ( pThis->potAccum[potIdx] <= -kDetentDistance )
+		{
+			pThis->potAccum[potIdx] += kDetentDistance;
+			*outValue = currentValue - 1;
+			return true;
+		}
+		return false;
+	}
+
+	// Continuous parameters keep the original proportional scaling - a full
+	// careful sweep can reach close to the whole range in one deliberate
+	// motion, with the fractional carry (potAccum) preserving any sub-step
+	// motion between calls instead of discarding it (needed since these are
+	// typically high-resolution pots reporting many small deltas per
+	// physical turn).
+	pThis->potAccum[potIdx] += delta * (float)range;
 	int intDelta = (int)pThis->potAccum[potIdx];	// truncates toward zero
 	if ( intDelta == 0 )
 		return false;
@@ -1971,6 +2065,68 @@ static int FindOrAllocRoute( _drumMachineAlgorithm* pThis, int source, int slot,
 	return freeRoute;
 }
 
+// Applies one pot's relative delta to control slotIdx's value on the
+// current bar page - either the concept's own base parameter, or (in
+// quick-edit depth mode) the active source's Mod Matrix depth for that
+// slot. Route lookup for the pot's baseline/delta tracking is read-only
+// (FindRoute(), same as DrawBarPage()'s display) so merely holding a pot
+// over an unassigned slot never silently claims one of the 8 routes -
+// only an actual committed change (PotRelativeUpdate() returning true)
+// calls the allocating FindOrAllocRoute(). Bug fix: this used to resolve
+// the parameter to edit via a single helper that called the *allocating*
+// lookup unconditionally on every UI tick a pot was active (not just on an
+// actual change), so simply entering a quick-edit mode immediately claimed
+// routes for all 4 slots before any knob was ever turned - by the time a
+// 3rd/4th source was tried on the same page, all 8 routes were already
+// silently used up, so its pots had nothing left to allocate and did
+// nothing.
+static void ApplyBarPot( _drumMachineAlgorithm* pThis, int potIdx, float rawPos, bool editingDepth, int source, int concept, const uint8_t* baseParams, int slotIdx )
+{
+	if ( editingDepth )
+	{
+		int route = FindRoute( pThis, source, slotIdx, concept );
+		int currentDepth = route < 0 ? 0 : pThis->v[ ModRouteParam( route, kModParamDepth ) ];
+		int newValue;
+		if ( !PotRelativeUpdate( pThis, potIdx, rawPos, -100, 100, currentDepth, &newValue ) )
+			return;
+		int r = FindOrAllocRoute( pThis, source, slotIdx, concept );
+		if ( r >= 0 )
+			SetParam( pThis, ModRouteParam( r, kModParamDepth ), newValue );
+	}
+	else
+	{
+		int paramIndex = baseParams[slotIdx];
+		const _NT_parameter& p = pThis->parameters[paramIndex];
+		int newValue;
+		if ( PotRelativeUpdate( pThis, potIdx, rawPos, p.min, p.max, pThis->v[paramIndex], &newValue ) )
+			SetParam( pThis, paramIndex, newValue );
+	}
+}
+
+// Same idea as ApplyBarPot() but for Encoder R, which reports a ready-made
+// relative delta directly (no PotRelativeUpdate()/baseline tracking
+// needed) - still only allocates a route once there's an actual nonzero
+// delta to commit.
+static void ApplyBarEncoder( _drumMachineAlgorithm* pThis, int delta, bool editingDepth, int source, int concept, const uint8_t* baseParams, int slotIdx )
+{
+	if ( editingDepth )
+	{
+		int route = FindRoute( pThis, source, slotIdx, concept );
+		int currentDepth = route < 0 ? 0 : pThis->v[ ModRouteParam( route, kModParamDepth ) ];
+		int newValue = currentDepth + delta;
+		CONSTRAIN( newValue, -100, 100 );
+		int r = FindOrAllocRoute( pThis, source, slotIdx, concept );
+		if ( r >= 0 )
+			SetParam( pThis, ModRouteParam( r, kModParamDepth ), newValue );
+	}
+	else
+	{
+		int paramIndex = baseParams[slotIdx];
+		int current = pThis->v[paramIndex];
+		SetParam( pThis, paramIndex, current + delta );
+	}
+}
+
 void	customUi( _NT_algorithm* self, const _NT_uiData& data )
 {
 	_drumMachineAlgorithm* pThis = (_drumMachineAlgorithm*)self;
@@ -2014,6 +2170,28 @@ void	customUi( _NT_algorithm* self, const _NT_uiData& data )
 			pThis->presetMenuOpen = false;
 		}
 		return;	// preset menu owns every claimed control while it's open
+	}
+
+	if ( pThis->deleteConfirmOpen )
+	{
+		// Same interaction idiom as the preset menu's Load/Save toggle:
+		// rotate Encoder R to switch the choice, push to confirm - defaults
+		// to No so a stray click when opening the dialog can never delete
+		// anything by itself.
+		if ( data.encoders[1] != 0 )
+			pThis->deleteConfirmChoice = pThis->deleteConfirmChoice == 0 ? 1 : 0;
+		if ( ( data.controls & kNT_encoderButtonR ) && !( data.lastButtons & kNT_encoderButtonR ) )
+		{
+			if ( pThis->deleteConfirmChoice == 1 )
+			{
+				int concept = kPageConcept[ pThis->currentPage ];
+				int route = FindRoute( pThis, pThis->barPageMode, pThis->deleteConfirmSlot, concept );
+				if ( route >= 0 )
+					SetParam( pThis, ModRouteParam( route, kModParamSource ), kModSrcNone );
+			}
+			pThis->deleteConfirmOpen = false;
+		}
+		return;	// delete-confirm dialog owns every claimed control while it's open
 	}
 
 	if ( data.encoders[0] != 0 )
@@ -2084,62 +2262,33 @@ void	customUi( _NT_algorithm* self, const _NT_uiData& data )
 		bool editingDepth = isBarPage && concept != -1 && pThis->barPageMode != kModSrcNone;
 		const uint8_t* baseParams = kPageParams[ pThis->currentPage ];
 
-		// Resolves control slot i (0=BD..3=OH) to the parameter index it
-		// should actually edit right now - either the concept's own base
-		// value, or (in quick-edit mode) the depth of whichever Mod Matrix
-		// route maps the active source to this concept/slot, allocating one
-		// on the fly if none exists yet. Returns -1 if quick-edit is active
-		// but every route is already claimed elsewhere (control is inert).
-		auto resolveParam = [&]( int slotIdx ) -> int
+		// Clicking the pot/encoder for a mapped slot while in quick-edit
+		// mode opens a delete-confirm dialog (see deleteConfirmOpen's
+		// comment) instead of adjusting the depth - only meaningful when
+		// that slot actually has a route to delete.
+		if ( editingDepth )
 		{
-			if ( !editingDepth )
-				return baseParams[slotIdx];
-			int route = FindOrAllocRoute( pThis, pThis->barPageMode, slotIdx, concept );
-			return route < 0 ? -1 : ModRouteParam( route, kModParamDepth );
-		};
+			static const uint16_t kSlotButton[kNumSlots] = { kNT_potButtonL, kNT_potButtonC, kNT_encoderButtonR, kNT_potButtonR };
+			for ( int slotIdx=0; slotIdx<kNumSlots; ++slotIdx )
+			{
+				if ( ( data.controls & kSlotButton[slotIdx] ) && !( data.lastButtons & kSlotButton[slotIdx] )
+					&& FindRoute( pThis, pThis->barPageMode, slotIdx, concept ) >= 0 )
+				{
+					pThis->deleteConfirmOpen = true;
+					pThis->deleteConfirmSlot = slotIdx;
+					pThis->deleteConfirmChoice = 0;	// default No - never accidentally delete
+				}
+			}
+		}
 
 		if ( data.controls & kNT_potL )
-		{
-			int paramIndex = resolveParam( 0 );
-			if ( paramIndex >= 0 )
-			{
-				const _NT_parameter& p = self->parameters[paramIndex];
-				int newValue;
-				if ( PotRelativeUpdate( pThis, 0, data.pots[0], p.min, p.max, self->v[paramIndex], &newValue ) )
-					SetParam( pThis, paramIndex, newValue );
-			}
-		}
+			ApplyBarPot( pThis, 0, data.pots[0], editingDepth, pThis->barPageMode, concept, baseParams, 0 );
 		if ( data.controls & kNT_potC )
-		{
-			int paramIndex = resolveParam( 1 );
-			if ( paramIndex >= 0 )
-			{
-				const _NT_parameter& p = self->parameters[paramIndex];
-				int newValue;
-				if ( PotRelativeUpdate( pThis, 1, data.pots[1], p.min, p.max, self->v[paramIndex], &newValue ) )
-					SetParam( pThis, paramIndex, newValue );
-			}
-		}
+			ApplyBarPot( pThis, 1, data.pots[1], editingDepth, pThis->barPageMode, concept, baseParams, 1 );
 		if ( data.controls & kNT_potR )
-		{
-			int paramIndex = resolveParam( 3 );
-			if ( paramIndex >= 0 )
-			{
-				const _NT_parameter& p = self->parameters[paramIndex];
-				int newValue;
-				if ( PotRelativeUpdate( pThis, 2, data.pots[2], p.min, p.max, self->v[paramIndex], &newValue ) )
-					SetParam( pThis, paramIndex, newValue );
-			}
-		}
+			ApplyBarPot( pThis, 2, data.pots[2], editingDepth, pThis->barPageMode, concept, baseParams, 3 );
 		if ( data.encoders[1] != 0 )
-		{
-			int paramIndex = resolveParam( 2 );
-			if ( paramIndex >= 0 )
-			{
-				int current = self->v[paramIndex];
-				SetParam( pThis, paramIndex, current + data.encoders[1] );
-			}
-		}
+			ApplyBarEncoder( pThis, data.encoders[1], editingDepth, pThis->barPageMode, concept, baseParams, 2 );
 	}
 }
 
@@ -2173,12 +2322,17 @@ void	setupUi( _NT_algorithm* self, _NT_float3& pots )
 // a small "lnxdrum v5.0" watermark top-right - `rightTag` overrides that
 // watermark for pages that need the top-right corner for something more
 // important (DrawSetupPage's "EDIT" indicator), so the two never overlap.
+// Deliberately compact (tiny text, divider at y=10) - an earlier version
+// used the larger normal-text header used elsewhere, which ate into the
+// content area below for no benefit (the page title doesn't need to be
+// any more prominent than the content it's labelling).
+constexpr int kHeaderDividerY = 10;
 static void DrawHeader( const char* title, const char* rightTag = "lnxdrum v5.0" )
 {
-	NT_drawText( 4, 12, title, 15, kNT_textLeft, kNT_textNormal );
+	NT_drawText( 4, 7, title, 15, kNT_textLeft, kNT_textTiny );
 	if ( rightTag )
-		NT_drawText( 252, 12, rightTag, 5, kNT_textRight, kNT_textTiny );
-	NT_drawShapeI( kNT_line, 0, 18, 255, 18, 4 );
+		NT_drawText( 252, 7, rightTag, 5, kNT_textRight, kNT_textTiny );
+	NT_drawShapeI( kNT_line, 0, kHeaderDividerY, 255, kHeaderDividerY, 4 );
 }
 
 static void DrawSetupPage( _drumMachineAlgorithm* pThis, const char* title )
@@ -2196,7 +2350,7 @@ static void DrawSetupPage( _drumMachineAlgorithm* pThis, const char* title )
 	if ( windowStart > itemCount - kVisibleItems ) windowStart = itemCount - kVisibleItems;
 	if ( windowStart < 0 ) windowStart = 0;
 
-	int y = 22;
+	int y = kHeaderDividerY + 4;
 	for ( int i=windowStart; i<itemCount && i<windowStart+kVisibleItems && y < 62; ++i, y += 8 )
 	{
 		int paramIndex = params[i];
@@ -2259,8 +2413,8 @@ static void DrawEnvelopesPage( _drumMachineAlgorithm* pThis )
 {
 	DrawHeader( "ENVELOPES" );
 
-	constexpr int y0 = 22;
-	constexpr int y1 = 44;
+	constexpr int y0 = 14;
+	constexpr int y1 = 40;
 	constexpr int boxWidth = 100;
 	constexpr int gap = 20;
 	constexpr int x0 = 14;
@@ -2313,8 +2467,8 @@ static void DrawLfosPage( _drumMachineAlgorithm* pThis )
 {
 	DrawHeader( "LFOS" );
 
-	constexpr int y0 = 22;
-	constexpr int y1 = 44;
+	constexpr int y0 = 14;
+	constexpr int y1 = 40;
 	constexpr int boxWidth = 100;
 	constexpr int gap = 20;
 	constexpr int x0 = 14;
@@ -2370,16 +2524,18 @@ static void DrawBarPage( _drumMachineAlgorithm* pThis )
 	const uint8_t* params = kPageParams[page];
 	bool bipolar = editingDepth ? true : kPageBipolar[page];
 
-	// Equal-width bars, centered as a group on the 256px-wide display (was
-	// left-justified before - "not centered" per feedback). The gap between
-	// bars is wide enough for the mapped-source tags ("E1"/"E2"/"L1"/"L2")
-	// to sit legibly below each one without crowding its neighbor.
-	constexpr int y0 = 21;
-	constexpr int y1 = 46;
+	// Equal-width bars, centered as a group on the 256px-wide display, now
+	// reaching almost the full height below the (compact) header instead of
+	// leaving a large unused band at the bottom. All the small labelling -
+	// slot name, mapped-source tags - lives in a narrow column to the right
+	// of each bar rather than a row underneath, so the reclaimed vertical
+	// space goes to the bar itself, not wasted margin.
+	constexpr int y0 = kHeaderDividerY + 4;
+	constexpr int y1 = 60;
 	constexpr int barWidth = 44;
-	constexpr int slotGap = 16;
-	constexpr int slotFootprint = barWidth + slotGap;
-	constexpr int x0 = ( 256 - ( kNumSlots * barWidth + ( kNumSlots - 1 ) * slotGap ) ) / 2;
+	constexpr int labelColWidth = 18;
+	constexpr int slotFootprint = barWidth + labelColWidth;
+	constexpr int x0 = ( 256 - kNumSlots * slotFootprint ) / 2;
 
 	for ( int slot=0; slot<kNumSlots; ++slot )
 	{
@@ -2453,23 +2609,34 @@ static void DrawBarPage( _drumMachineAlgorithm* pThis )
 			NT_drawShapeI( kNT_line, bx0, modY, bx1, modY, 15 );
 		}
 
-		// Velocity: a round dot top-right of the bar, brightness 0 (no
-		// recent hit) to 15 (just hit) tracking velocityMeter[slot]'s decay
-		// (see DecayVelocityMeters()) - visually separates "incoming note
-		// energy" (this dot) from "what's mapped" (tags below) and "how
-		// modulation applies right now" (lines above), instead of one
-		// combined pumping bar.
+		// Velocity: a small filled square "dot" at the top of the label
+		// column (right of the bar), brightness 0 (no recent hit) to 15
+		// (just hit) tracking velocityMeter[slot]'s decay (see
+		// DecayVelocityMeters()) - visually separates "incoming note energy"
+		// (this dot, top) from "what's mapped" (the label stack below it,
+		// bottom-up) and "how modulation applies right now" (lines inside
+		// the bar), instead of one combined pumping bar. A filled rectangle
+		// at 1px "radius" (a crisp 3x3 square) rather than kNT_circle - an
+		// unfilled circle (the only circle variant available) reads as a
+		// much bigger blob than its bounding box suggests at this size.
 		{
-			int dotCx = bx1 + 7;
-			int dotCy = y0 + 4;
-			int dotR = 3;
+			int dotCx = bx1 + labelColWidth / 2;
+			int dotCy = y0 + 3;
+			int dotR = 1;
 			int vcol = (int)( pThis->velocityMeter[slot] * 15.0f );
 			CONSTRAIN( vcol, 0, 15 );
-			NT_drawShapeI( kNT_circle, dotCx - dotR, dotCy - dotR, dotCx + dotR, dotCy + dotR, vcol );
+			NT_drawShapeI( kNT_rectangle, dotCx - dotR, dotCy - dotR, dotCx + dotR, dotCy + dotR, vcol );
 		}
 
 		char buff[16];
-		if ( !editingDepth && pThis->parameters[paramIndex].unit == kNT_unitEnum && pThis->parameters[paramIndex].enumStrings != NULL )
+		// An unmapped slot in quick-edit mode with no free route anywhere
+		// can't be assigned by turning its control - say so explicitly
+		// instead of just showing an inert "0" (see AnyRouteFree()).
+		if ( editingDepth && route < 0 && !AnyRouteFree( pThis ) )
+		{
+			NT_drawText( bx0 + barWidth/2, ( y0 + y1 ) / 2 + 3, "FULL", 8, kNT_textCentre, kNT_textTiny );
+		}
+		else if ( !editingDepth && pThis->parameters[paramIndex].unit == kNT_unitEnum && pThis->parameters[paramIndex].enumStrings != NULL )
 		{
 			int idx = value - pMin;
 			if ( idx >= 0 && idx <= ( pMax - pMin ) )
@@ -2481,41 +2648,42 @@ static void DrawBarPage( _drumMachineAlgorithm* pThis )
 			NT_drawText( bx0 + barWidth/2, ( y0 + y1 ) / 2 + 3, buff, 15, kNT_textCentre, kNT_textTiny );
 		}
 
-		NT_drawText( bx0 + barWidth/2, y1 + 7, kSlotNames[slot], 15, kNT_textCentre, kNT_textTiny );
+		// Labelling column, right of the bar: a vertical stack, left-aligned,
+		// bottom-anchored to the bar's own bottom line - the slot name's
+		// baseline sits exactly on y1 (matching how the inline value text
+		// above is baseline-positioned via "+3" off the vertical center, not
+		// top-anchored), and each mapped source ("E1"/"E2"/"L1"/"L2") stacks
+		// one row above the last as more mappings apply, instead of a row of
+		// text underneath the bar (which left a large unused band at the
+		// bottom of the screen).
+		int labelX = bx1 + 2;
+		int labelY = y1;
+		NT_drawText( labelX, labelY, kSlotNames[slot], 15, kNT_textLeft, kNT_textTiny );
 
-		// Mapped-source tags, bottom row - only the sources actually
-		// assigned to this concept/slot are printed (per feedback: "could
-		// be printed on the bottom... when those are assigned as mappings").
 		if ( !editingDepth && concept != -1 )
 		{
-			char tagBuff[24] = "";
-			bool any = false;
 			for ( int s=kModSrcEnv1; s<=kModSrcLfo2; ++s )
 			{
 				if ( FindRoute( pThis, s, slot, concept ) < 0 )
 					continue;
-				if ( any )
-					strcat( tagBuff, " " );
-				strcat( tagBuff, kModSourceTag[s] );
-				any = true;
+				labelY -= 8;
+				NT_drawText( labelX, labelY, kModSourceTag[s], 10, kNT_textLeft, kNT_textTiny );
 			}
-			if ( any )
-				NT_drawText( bx0 + barWidth/2, y1 + 14, tagBuff, 10, kNT_textCentre, kNT_textTiny );
 		}
 	}
 }
 
 static void DrawPresetMenu( _drumMachineAlgorithm* pThis )
 {
-	NT_drawText( 4, 12, "PRESET", 15, kNT_textLeft, kNT_textNormal );
+	NT_drawText( 4, 7, "PRESET", 15, kNT_textLeft, kNT_textTiny );
 	if ( pThis->presetMenuStage == 0 )
-		NT_drawText( 251, 12, "PRESS", 8, kNT_textRight, kNT_textNormal );
+		NT_drawText( 251, 7, "PRESS", 8, kNT_textRight, kNT_textTiny );
 	else
 	{
-		NT_drawText( 197, 12, "LOAD", pThis->presetMenuAction == 0 ? 15 : 5, kNT_textLeft, kNT_textNormal );
-		NT_drawText( 232, 12, "SAVE", pThis->presetMenuAction == 1 ? 15 : 5, kNT_textLeft, kNT_textNormal );
+		NT_drawText( 197, 7, "LOAD", pThis->presetMenuAction == 0 ? 15 : 5, kNT_textLeft, kNT_textTiny );
+		NT_drawText( 232, 7, "SAVE", pThis->presetMenuAction == 1 ? 15 : 5, kNT_textLeft, kNT_textTiny );
 	}
-	NT_drawShapeI( kNT_line, 0, 18, 255, 18, 4 );
+	NT_drawShapeI( kNT_line, 0, kHeaderDividerY, 255, kHeaderDividerY, 4 );
 
 	// Scrolling window - kNumPresets (8) doesn't fit in the ~5 visible rows,
 	// so without this the selection could scroll right off screen with no
@@ -2525,7 +2693,7 @@ static void DrawPresetMenu( _drumMachineAlgorithm* pThis )
 	if ( windowStart > kNumPresets - kVisibleItems ) windowStart = kNumPresets - kVisibleItems;
 	if ( windowStart < 0 ) windowStart = 0;
 
-	int y = 22;
+	int y = kHeaderDividerY + 4;
 	for ( int i=windowStart; i<kNumPresets && i<windowStart+kVisibleItems && y < 62; ++i, y += 8 )
 	{
 		bool selected = ( i == pThis->presetMenuIndex );
@@ -2542,12 +2710,37 @@ static void DrawPresetMenu( _drumMachineAlgorithm* pThis )
 	}
 }
 
+static void DrawDeleteConfirm( _drumMachineAlgorithm* pThis )
+{
+	DrawHeader( "DELETE MODIFIER?", NULL );
+	NT_drawText( 100, 24, "NO", pThis->deleteConfirmChoice == 0 ? 15 : 5, kNT_textCentre, kNT_textNormal );
+	NT_drawText( 156, 24, "YES", pThis->deleteConfirmChoice == 1 ? 15 : 5, kNT_textCentre, kNT_textNormal );
+
+	int concept = kPageConcept[ pThis->currentPage ];
+	int route = FindRoute( pThis, pThis->barPageMode, pThis->deleteConfirmSlot, concept );
+	char msg[48] = "";
+	strcpy( msg, kSlotNames[ pThis->deleteConfirmSlot ] );
+	strcat( msg, " " );
+	strcat( msg, kQuickModeNames[ pThis->barPageMode ] );
+	if ( route >= 0 )
+	{
+		char depthBuff[8];
+		NT_intToString( depthBuff, pThis->v[ ModRouteParam( route, kModParamDepth ) ] );
+		strcat( msg, " (" );
+		strcat( msg, depthBuff );
+		strcat( msg, ")" );
+	}
+	NT_drawText( 128, 36, msg, 8, kNT_textCentre, kNT_textTiny );
+}
+
 bool	draw( _NT_algorithm* self )
 {
 	_drumMachineAlgorithm* pThis = (_drumMachineAlgorithm*)self;
 
 	if ( pThis->presetMenuOpen )
 		DrawPresetMenu( pThis );
+	else if ( pThis->deleteConfirmOpen )
+		DrawDeleteConfirm( pThis );
 	else if ( kPageType[pThis->currentPage] == kPageTypeList )
 		DrawSetupPage( pThis, kPageNames[pThis->currentPage] );
 	else if ( pThis->currentPage == kPageEnvelopes )
