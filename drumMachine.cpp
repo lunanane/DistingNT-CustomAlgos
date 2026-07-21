@@ -91,6 +91,7 @@ static int RoundToInt( float v )
 	return v >= 0.0f ? (int)( v + 0.5f ) : (int)( v - 0.5f );
 }
 
+
 // Forward declaration - defined near ApplyPost() (its main use), but also
 // needed by the SineFold envelope shape corner defined earlier in the file.
 static float HardClip( float x );
@@ -263,17 +264,34 @@ enum
 	// see kWavefolderTypeXxx below.
 	kParamFoldTypeBD, kParamFoldTypeSD, kParamFoldTypeCH, kParamFoldTypeOH,
 
-	// Page 22-24: EQ LOW/MID/HIGH - a cheap 3-band EQ (fixed frequencies -
-	// ~150Hz shelf, ~1kHz bell, ~5kHz shelf - not sweepable, so their
-	// filter coefficients are computed once, never per-block, see
-	// _drumVoicePost::Init()) applied in ApplyPost() after Waveshaper and
-	// before Volume. -100..100, 0 = flat/bypass. Not modulatable (no Mod
-	// Matrix entry) and not part of the smoothed kit range, to keep this
-	// simple - appended at the very end like Fold Type, never inserted
-	// mid-range (see kParamFoldBD's comment for why that matters).
-	kParamEqLowBD, kParamEqLowSD, kParamEqLowCH, kParamEqLowOH,
-	kParamEqMidBD, kParamEqMidSD, kParamEqMidCH, kParamEqMidOH,
-	kParamEqHighBD, kParamEqHighSD, kParamEqHighCH, kParamEqHighOH,
+	// EQ SCULPT - a 2-point parametric EQ per slot, edited via a dedicated
+	// visual custom-UI page (DrawEqSculptPage()/kPageEqSculpt), not a plain
+	// bar page - see that page's own comment for the full interaction
+	// design. FreqN: 0 = that point is off entirely (no DSP cost - see
+	// ApplyEqSculpt()); 1..100 sweeps the point's centre frequency up from
+	// ~60Hz to ~12kHz (quadratic taper, matching EqSculptFreqHz()). GainN:
+	// -100..100, 0 = flat even if the point is on. Not modulatable (no Mod
+	// Matrix entry) and appended at the very end, like every other
+	// non-smoothed control - never inserted mid-range (see kParamFoldBD's
+	// comment for why that matters for saved presets).
+	kParamEqFreq1BD, kParamEqFreq1SD, kParamEqFreq1CH, kParamEqFreq1OH,
+	kParamEqGain1BD, kParamEqGain1SD, kParamEqGain1CH, kParamEqGain1OH,
+	kParamEqFreq2BD, kParamEqFreq2SD, kParamEqFreq2CH, kParamEqFreq2OH,
+	kParamEqGain2BD, kParamEqGain2SD, kParamEqGain2CH, kParamEqGain2OH,
+
+	// TRANSIENT - a per-slot transient shaper, inserted in ApplyPost()
+	// between EQ Sculpt and Volume (shape the hit's attack/sustain balance
+	// once tone-shaping is done, then trim level and compress - the same
+	// order real drum-bus channel strips use). Amount: -100..100, 0 =
+	// bypass (matching Filter/Fold/Drive's "0 = no-op" convention),
+	// negative softens/de-emphasizes the attack, positive punches it up.
+	// Type: which of 4 algorithms (see kTransientXxx/ApplyTransient()) -
+	// not modulatable (no Mod Matrix entry, like Model/FM Mode/Fold Type).
+	// Both appended at the very end, like every other non-smoothed
+	// control - never inserted mid-range (see kParamFoldBD's comment for
+	// why that matters for saved presets).
+	kParamTransBD, kParamTransSD, kParamTransCH, kParamTransOH,
+	kParamTransTypeBD, kParamTransTypeSD, kParamTransTypeCH, kParamTransTypeOH,
 
 	kNumParams,
 };
@@ -284,9 +302,9 @@ static int ModRouteParam( int route, int which )
 	return kFirstModRouteParam + route * kNumModRouteParams + which;
 }
 
-static char const * const kEnumModelBD[] = { "Analog", "Synthetic", "Elements", "808", "FM" };
-static char const * const kEnumModelSD[] = { "Analog", "Synthetic", "Elements", "808", "FM" };
-static char const * const kEnumModelHat[] = { "808", "Elements", "Cymbal" };
+static char const * const kEnumModelBD[] = { "Analog", "Synthetic", "Elements", "808", "FM", "ChowKick", "Decel808", "CombBody", "ChaosFM" };
+static char const * const kEnumModelSD[] = { "Analog", "Synthetic", "Elements", "808", "FM", "ChowKick", "Clap", "CombBody", "ChaosFM" };
+static char const * const kEnumModelHat[] = { "808", "Elements", "Cymbal", "Modal", "Shaker", "SweepHat", "RingModMetal" };
 
 // FM Mode: selects how the FM knob's attack "knock" energy is actually
 // generated on Analog/Synthetic/808. Default adapts per model - Envelope
@@ -352,6 +370,16 @@ enum { kWavefolderTypeSine, kWavefolderTypeTriangle, kWavefolderTypeBuchla, kNum
 static char const * const kEnumWavefolderType[] = { "Sine", "Triangle", "Buchla" };
 static_assert( ARRAY_SIZE(kEnumWavefolderType) == kNumWavefolderTypes, "" );
 
+// Transient shaper model - see kParamTransTypeBD's comment and
+// ApplyTransient(). Each is inspired by a different open-source transient
+// shaper (Classic: johannes-mueller/envolvigo; Snap: lowwavestudios/
+// DrumSnapper; Gate: ylmrx/transdes; Band: unicornsasfuel/whetstone) -
+// adapted to this project's one-knob-per-voice convention rather than
+// literal ports (none of those exposed just a single bipolar control).
+enum { kTransientClassic, kTransientSnap, kTransientGate, kTransientBand, kNumTransientTypes };
+static char const * const kEnumTransientType[] = { "Classic", "Snap", "Gate", "Band" };
+static_assert( ARRAY_SIZE(kEnumTransientType) == kNumTransientTypes, "" );
+
 static char const * const kEnumMidiMode[] = { "Note per slot", "Channel per slot" };
 static char const * const kEnumStereo[] = { "Mono", "Stereo" };
 
@@ -409,10 +437,10 @@ static _NT_parameter parameters[] = {
 	{ .name = "LFO2 rate", .min = 0, .max = ARRAY_SIZE(kEnumLfoRate) - 1, .def = 2, .unit = kNT_unitEnum, .scaling = 0, .enumStrings = kEnumLfoRate },
 	{ .name = "LFO2 shape", .min = 0, .max = 100, .def = 0, .unit = kNT_unitPercent, .scaling = 0, .enumStrings = NULL },
 
-	{ .name = "BD model", .min = 0, .max = 4, .def = 0, .unit = kNT_unitEnum, .scaling = 0, .enumStrings = kEnumModelBD },
-	{ .name = "SD model", .min = 0, .max = 4, .def = 0, .unit = kNT_unitEnum, .scaling = 0, .enumStrings = kEnumModelSD },
-	{ .name = "CH model", .min = 0, .max = 2, .def = 0, .unit = kNT_unitEnum, .scaling = 0, .enumStrings = kEnumModelHat },
-	{ .name = "OH model", .min = 0, .max = 2, .def = 0, .unit = kNT_unitEnum, .scaling = 0, .enumStrings = kEnumModelHat },
+	{ .name = "BD model", .min = 0, .max = 8, .def = 0, .unit = kNT_unitEnum, .scaling = 0, .enumStrings = kEnumModelBD },
+	{ .name = "SD model", .min = 0, .max = 8, .def = 0, .unit = kNT_unitEnum, .scaling = 0, .enumStrings = kEnumModelSD },
+	{ .name = "CH model", .min = 0, .max = 6, .def = 0, .unit = kNT_unitEnum, .scaling = 0, .enumStrings = kEnumModelHat },
+	{ .name = "OH model", .min = 0, .max = 6, .def = 0, .unit = kNT_unitEnum, .scaling = 0, .enumStrings = kEnumModelHat },
 
 	{ .name = "BD release", .min = 0, .max = 100, .def = 40, .unit = kNT_unitPercent, .scaling = 0, .enumStrings = NULL },
 	{ .name = "SD release", .min = 0, .max = 100, .def = 40, .unit = kNT_unitPercent, .scaling = 0, .enumStrings = NULL },
@@ -506,20 +534,35 @@ static _NT_parameter parameters[] = {
 	{ .name = "CH fold type", .min = 0, .max = kNumWavefolderTypes - 1, .def = 0, .unit = kNT_unitEnum, .scaling = 0, .enumStrings = kEnumWavefolderType },
 	{ .name = "OH fold type", .min = 0, .max = kNumWavefolderTypes - 1, .def = 0, .unit = kNT_unitEnum, .scaling = 0, .enumStrings = kEnumWavefolderType },
 
-	{ .name = "BD EQ low", .min = -100, .max = 100, .def = 0, .unit = kNT_unitNone, .scaling = 0, .enumStrings = NULL },
-	{ .name = "SD EQ low", .min = -100, .max = 100, .def = 0, .unit = kNT_unitNone, .scaling = 0, .enumStrings = NULL },
-	{ .name = "CH EQ low", .min = -100, .max = 100, .def = 0, .unit = kNT_unitNone, .scaling = 0, .enumStrings = NULL },
-	{ .name = "OH EQ low", .min = -100, .max = 100, .def = 0, .unit = kNT_unitNone, .scaling = 0, .enumStrings = NULL },
+	{ .name = "BD EQ freq 1", .min = 0, .max = 100, .def = 0, .unit = kNT_unitNone, .scaling = 0, .enumStrings = NULL },
+	{ .name = "SD EQ freq 1", .min = 0, .max = 100, .def = 0, .unit = kNT_unitNone, .scaling = 0, .enumStrings = NULL },
+	{ .name = "CH EQ freq 1", .min = 0, .max = 100, .def = 0, .unit = kNT_unitNone, .scaling = 0, .enumStrings = NULL },
+	{ .name = "OH EQ freq 1", .min = 0, .max = 100, .def = 0, .unit = kNT_unitNone, .scaling = 0, .enumStrings = NULL },
 
-	{ .name = "BD EQ mid", .min = -100, .max = 100, .def = 0, .unit = kNT_unitNone, .scaling = 0, .enumStrings = NULL },
-	{ .name = "SD EQ mid", .min = -100, .max = 100, .def = 0, .unit = kNT_unitNone, .scaling = 0, .enumStrings = NULL },
-	{ .name = "CH EQ mid", .min = -100, .max = 100, .def = 0, .unit = kNT_unitNone, .scaling = 0, .enumStrings = NULL },
-	{ .name = "OH EQ mid", .min = -100, .max = 100, .def = 0, .unit = kNT_unitNone, .scaling = 0, .enumStrings = NULL },
+	{ .name = "BD EQ gain 1", .min = -100, .max = 100, .def = 0, .unit = kNT_unitNone, .scaling = 0, .enumStrings = NULL },
+	{ .name = "SD EQ gain 1", .min = -100, .max = 100, .def = 0, .unit = kNT_unitNone, .scaling = 0, .enumStrings = NULL },
+	{ .name = "CH EQ gain 1", .min = -100, .max = 100, .def = 0, .unit = kNT_unitNone, .scaling = 0, .enumStrings = NULL },
+	{ .name = "OH EQ gain 1", .min = -100, .max = 100, .def = 0, .unit = kNT_unitNone, .scaling = 0, .enumStrings = NULL },
 
-	{ .name = "BD EQ high", .min = -100, .max = 100, .def = 0, .unit = kNT_unitNone, .scaling = 0, .enumStrings = NULL },
-	{ .name = "SD EQ high", .min = -100, .max = 100, .def = 0, .unit = kNT_unitNone, .scaling = 0, .enumStrings = NULL },
-	{ .name = "CH EQ high", .min = -100, .max = 100, .def = 0, .unit = kNT_unitNone, .scaling = 0, .enumStrings = NULL },
-	{ .name = "OH EQ high", .min = -100, .max = 100, .def = 0, .unit = kNT_unitNone, .scaling = 0, .enumStrings = NULL },
+	{ .name = "BD EQ freq 2", .min = 0, .max = 100, .def = 0, .unit = kNT_unitNone, .scaling = 0, .enumStrings = NULL },
+	{ .name = "SD EQ freq 2", .min = 0, .max = 100, .def = 0, .unit = kNT_unitNone, .scaling = 0, .enumStrings = NULL },
+	{ .name = "CH EQ freq 2", .min = 0, .max = 100, .def = 0, .unit = kNT_unitNone, .scaling = 0, .enumStrings = NULL },
+	{ .name = "OH EQ freq 2", .min = 0, .max = 100, .def = 0, .unit = kNT_unitNone, .scaling = 0, .enumStrings = NULL },
+
+	{ .name = "BD EQ gain 2", .min = -100, .max = 100, .def = 0, .unit = kNT_unitNone, .scaling = 0, .enumStrings = NULL },
+	{ .name = "SD EQ gain 2", .min = -100, .max = 100, .def = 0, .unit = kNT_unitNone, .scaling = 0, .enumStrings = NULL },
+	{ .name = "CH EQ gain 2", .min = -100, .max = 100, .def = 0, .unit = kNT_unitNone, .scaling = 0, .enumStrings = NULL },
+	{ .name = "OH EQ gain 2", .min = -100, .max = 100, .def = 0, .unit = kNT_unitNone, .scaling = 0, .enumStrings = NULL },
+
+	{ .name = "BD transient", .min = -100, .max = 100, .def = 0, .unit = kNT_unitNone, .scaling = 0, .enumStrings = NULL },
+	{ .name = "SD transient", .min = -100, .max = 100, .def = 0, .unit = kNT_unitNone, .scaling = 0, .enumStrings = NULL },
+	{ .name = "CH transient", .min = -100, .max = 100, .def = 0, .unit = kNT_unitNone, .scaling = 0, .enumStrings = NULL },
+	{ .name = "OH transient", .min = -100, .max = 100, .def = 0, .unit = kNT_unitNone, .scaling = 0, .enumStrings = NULL },
+
+	{ .name = "BD transient type", .min = 0, .max = kNumTransientTypes - 1, .def = 0, .unit = kNT_unitEnum, .scaling = 0, .enumStrings = kEnumTransientType },
+	{ .name = "SD transient type", .min = 0, .max = kNumTransientTypes - 1, .def = 0, .unit = kNT_unitEnum, .scaling = 0, .enumStrings = kEnumTransientType },
+	{ .name = "CH transient type", .min = 0, .max = kNumTransientTypes - 1, .def = 0, .unit = kNT_unitEnum, .scaling = 0, .enumStrings = kEnumTransientType },
+	{ .name = "OH transient type", .min = 0, .max = kNumTransientTypes - 1, .def = 0, .unit = kNT_unitEnum, .scaling = 0, .enumStrings = kEnumTransientType },
 };
 
 static const uint8_t pageRouting[]   = { kParamOutBD, kParamOutBDMode, kParamStereoBD, kParamPanBD, kParamOutSD, kParamOutSDMode, kParamStereoSD, kParamPanSD, kParamOutCH, kParamOutCHMode, kParamStereoCH, kParamPanCH, kParamOutOH, kParamOutOHMode, kParamStereoOH, kParamPanOH };
@@ -543,15 +586,26 @@ static const uint8_t pageKnockTail[] = { kParamKnockTailBD, kParamKnockTailSD, k
 static const uint8_t pageMixType[]   = { kParamMixTypeBD, kParamMixTypeSD, kParamMixTypeCH, kParamMixTypeOH };
 static const uint8_t pageFold[]      = { kParamFoldBD, kParamFoldSD, kParamFoldCH, kParamFoldOH };
 static const uint8_t pageFoldType[]  = { kParamFoldTypeBD, kParamFoldTypeSD, kParamFoldTypeCH, kParamFoldTypeOH };
-static const uint8_t pageEqLow[]     = { kParamEqLowBD, kParamEqLowSD, kParamEqLowCH, kParamEqLowOH };
-static const uint8_t pageEqMid[]     = { kParamEqMidBD, kParamEqMidSD, kParamEqMidCH, kParamEqMidOH };
-static const uint8_t pageEqHigh[]    = { kParamEqHighBD, kParamEqHighSD, kParamEqHighCH, kParamEqHighOH };
 // Pan already exists as a parameter (part of Routing - see WriteVoiceOutput())
 // but wasn't reachable from the custom UI (Routing is list-style and
 // deliberately excluded from the custom-UI page cycle - see
 // kFirstCustomPage's comment). This just gives it its own bar page, no new
 // parameters needed.
 static const uint8_t pagePan[]        = { kParamPanBD, kParamPanSD, kParamPanCH, kParamPanOH };
+
+// EQ Sculpt's 16 params, listed flat for the standard (non-custom) menu -
+// the custom UI presents these as a bespoke visual page instead (see
+// kPageEqSculpt/DrawEqSculptPage()), which is where most editing happens,
+// but the standard menu still needs *some* way to reach them directly.
+static const uint8_t pageEqSculptList[] = {
+	kParamEqFreq1BD, kParamEqGain1BD, kParamEqFreq2BD, kParamEqGain2BD,
+	kParamEqFreq1SD, kParamEqGain1SD, kParamEqFreq2SD, kParamEqGain2SD,
+	kParamEqFreq1CH, kParamEqGain1CH, kParamEqFreq2CH, kParamEqGain2CH,
+	kParamEqFreq1OH, kParamEqGain1OH, kParamEqFreq2OH, kParamEqGain2OH,
+};
+
+static const uint8_t pageTrans[]      = { kParamTransBD, kParamTransSD, kParamTransCH, kParamTransOH };
+static const uint8_t pageTransType[]  = { kParamTransTypeBD, kParamTransTypeSD, kParamTransTypeCH, kParamTransTypeOH };
 
 // The Mod Matrix's 32 params are contiguous (kFirstModRouteParam..+31) in
 // exactly this sequential order already, so this is just that range restated
@@ -589,10 +643,10 @@ static const _NT_parameterPage pages[] = {
 	{ .name = "Mix Type", .numParams = ARRAY_SIZE(pageMixType), .params = pageMixType },
 	{ .name = "Wavefolder", .numParams = ARRAY_SIZE(pageFold), .params = pageFold },
 	{ .name = "Wavefolder Type", .numParams = ARRAY_SIZE(pageFoldType), .params = pageFoldType },
-	{ .name = "EQ Low", .numParams = ARRAY_SIZE(pageEqLow), .params = pageEqLow },
-	{ .name = "EQ Mid", .numParams = ARRAY_SIZE(pageEqMid), .params = pageEqMid },
-	{ .name = "EQ High", .numParams = ARRAY_SIZE(pageEqHigh), .params = pageEqHigh },
 	{ .name = "Pan", .numParams = ARRAY_SIZE(pagePan), .params = pagePan },
+	{ .name = "EQ Sculpt", .numParams = ARRAY_SIZE(pageEqSculptList), .params = pageEqSculptList },
+	{ .name = "Transient", .numParams = ARRAY_SIZE(pageTrans), .params = pageTrans },
+	{ .name = "Transient Type", .numParams = ARRAY_SIZE(pageTransType), .params = pageTransType },
 };
 
 static const _NT_parameterPages parameterPages = {
@@ -616,12 +670,19 @@ enum {
 	kPagePitch, kPageVolume, kPageTone, kPageCharacter, kPageFm, kPageFmMode,
 	kPageSample, kPageSampleMix, kPageKnockTail, kPageMixType,
 	kPageFold, kPageFoldType,
-	kPageEqLow, kPageEqMid, kPageEqHigh, kPagePan,
+	kPagePan,
+	kPageEqSculpt,
+	kPageTransient, kPageTransientType,
 	kNumPages,
 };
 enum { kFirstCustomPage = kPageEnvelopes };
 
-enum { kPageTypeList, kPageTypeGraph, kPageTypeBar };
+// kPageTypeEqSculpt is its own bespoke custom-UI page (band visualization,
+// slot-select + dual freq/gain points - see DrawEqSculptPage()) - not a
+// plain bar page, since its control scheme (1 control selects which slot,
+// 3 more edit that slot's 2 EQ points) is nothing like every other bar
+// page's "4 controls, one per slot" layout.
+enum { kPageTypeList, kPageTypeGraph, kPageTypeBar, kPageTypeEqSculpt };
 static const int kPageType[kNumPages] = {
 	kPageTypeList, kPageTypeList, kPageTypeGraph, kPageTypeGraph, kPageTypeList,
 	kPageTypeBar, kPageTypeBar, kPageTypeBar, kPageTypeBar,
@@ -629,12 +690,17 @@ static const int kPageType[kNumPages] = {
 	kPageTypeBar, kPageTypeBar, kPageTypeBar, kPageTypeBar, kPageTypeBar, kPageTypeBar,
 	kPageTypeBar, kPageTypeBar, kPageTypeBar, kPageTypeBar,
 	kPageTypeBar, kPageTypeBar,
-	kPageTypeBar, kPageTypeBar, kPageTypeBar, kPageTypeBar,
+	kPageTypeBar,
+	kPageTypeEqSculpt,
+	kPageTypeBar, kPageTypeBar,
 };
 // List pages (Routing/MIDI/Mod Matrix) use these via SetupPageParams()/
 // SetupPageItemCount(); graph/bar pages (Envelopes/LFOs/Model..Pan) use
 // kPageParams directly since they always have exactly 4 params (one per
-// pot/encoder control - see customUi()).
+// pot/encoder control - see customUi()). EQ Sculpt's entry here
+// (pageEqSculptList) is never actually read by its own customUi()/draw()
+// handling (both fully special-cased) - it's only here so this array has
+// *something* valid at that index, same as every other page.
 static const uint8_t* const kPageParams[kNumPages] = {
 	pageRouting, pageMidi, pageEnvelopes, pageLfos, pageModMatrix,
 	pageModel, pageRelease, pageComp, pageFilter,
@@ -642,7 +708,9 @@ static const uint8_t* const kPageParams[kNumPages] = {
 	pagePitch, pageVolume, pageTone, pageChar, pageFm, pageFmMode,
 	pageSample, pageSampleMix, pageKnockTail, pageMixType,
 	pageFold, pageFoldType,
-	pageEqLow, pageEqMid, pageEqHigh, pagePan,
+	pagePan,
+	pageEqSculptList,
+	pageTrans, pageTransType,
 };
 static const int kPageItemCount[kNumPages] = {
 	(int)ARRAY_SIZE(pageRouting), (int)ARRAY_SIZE(pageMidi), 0, 0, (int)ARRAY_SIZE(pageModMatrix),
@@ -651,7 +719,9 @@ static const int kPageItemCount[kNumPages] = {
 	0, 0, 0, 0, 0, 0,
 	0, 0, 0, 0,
 	0, 0,
-	0, 0, 0, 0,
+	0,
+	0,
+	0, 0,
 };
 static const char* const kPageNames[kNumPages] = {
 	"ROUTING", "MIDI", "ENVELOPES", "LFOS", "MOD MATRIX",
@@ -660,7 +730,9 @@ static const char* const kPageNames[kNumPages] = {
 	"PITCH", "VOLUME", "TONE", "CHARACTER", "FM", "FM MODE",
 	"SAMPLE", "SAMPLE MIX", "KNOCK/TAIL", "MIX TYPE",
 	"WAVEFOLDER", "FOLD TYPE",
-	"EQ LOW", "EQ MID", "EQ HIGH", "PAN",
+	"PAN",
+	"EQ SCULPT",
+	"TRANSIENT", "TRANSIENT TYPE",
 };
 static const bool kPageBipolar[kNumPages] = {
 	false, false, false, false, false,
@@ -669,11 +741,17 @@ static const bool kPageBipolar[kNumPages] = {
 	false, false, false, false, false, false,
 	false, false, false, false,
 	false, false,
-	true, true, true, true,
+	true,
+	false,
+	true, false,
 };
 // kConceptXxx for each bar-style page, or -1 for non-bar pages and Model/FM
-// Mode/Fold Type/Sample/Mix Type/EQ/Pan (none of which are modulatable
-// concepts).
+// Mode/Fold Type/Sample/Mix Type/Pan/EQ Sculpt/Transient/Transient Type
+// (none of which are modulatable concepts - Transient's Amount follows the
+// same precedent as Pan/EQ Sculpt, appended outside the smoothed contiguous
+// range, rather than the older Filter/Fold/Drive precedent, to avoid
+// touching the Mod Matrix's own append-only kConceptXxx enum for this
+// round).
 static const int kPageConcept[kNumPages] = {
 	-1, -1, -1, -1, -1,
 	-1, kConceptRelease, kConceptCompressor, kConceptFilter,
@@ -681,7 +759,9 @@ static const int kPageConcept[kNumPages] = {
 	kConceptPitch, kConceptVolume, kConceptTone, kConceptCharacter, kConceptFm, -1,
 	-1, -1, -1, -1,
 	kConceptFold, -1,
-	-1, -1, -1, -1,
+	-1,
+	-1,
+	-1, -1,
 };
 
 // The 10 concepts below Model get smoothed for the preset-load fade (Model
@@ -743,9 +823,12 @@ static const uint8_t kModParams[] = {
 	kParamKnockTailBD, kParamKnockTailSD, kParamKnockTailCH, kParamKnockTailOH,
 	kParamMixTypeBD, kParamMixTypeSD, kParamMixTypeCH, kParamMixTypeOH,
 	kParamFoldTypeBD, kParamFoldTypeSD, kParamFoldTypeCH, kParamFoldTypeOH,
-	kParamEqLowBD, kParamEqLowSD, kParamEqLowCH, kParamEqLowOH,
-	kParamEqMidBD, kParamEqMidSD, kParamEqMidCH, kParamEqMidOH,
-	kParamEqHighBD, kParamEqHighSD, kParamEqHighCH, kParamEqHighOH,
+	kParamEqFreq1BD, kParamEqFreq1SD, kParamEqFreq1CH, kParamEqFreq1OH,
+	kParamEqGain1BD, kParamEqGain1SD, kParamEqGain1CH, kParamEqGain1OH,
+	kParamEqFreq2BD, kParamEqFreq2SD, kParamEqFreq2CH, kParamEqFreq2OH,
+	kParamEqGain2BD, kParamEqGain2SD, kParamEqGain2CH, kParamEqGain2OH,
+	kParamTransBD, kParamTransSD, kParamTransCH, kParamTransOH,
+	kParamTransTypeBD, kParamTransTypeSD, kParamTransTypeCH, kParamTransTypeOH,
 };
 enum { kNumModRouteParamsTotal = kNumModRoutes * kNumModRouteParams };
 enum { kNumModParams = ARRAY_SIZE(kModParams) + kNumModRouteParamsTotal };
@@ -840,21 +923,49 @@ struct _drumVoicePost
 	float sampleEnvElapsed;
 	float sampleEnvTotalS;
 
-	// 3-band EQ taps (see ApplyEq()) - each just an LP/BP/HP "tap" added
-	// back onto the dry signal, scaled by the band's gain knob (a cheap
-	// shelf/bell EQ - no true shelf/peak filter topology needed). All 3
-	// bands sit at fixed frequencies (not sweepable), so - like sampleHp
-	// above - their coefficients are computed once here, never recomputed
-	// per block.
-	stmlib::Svf eqLowTap;
-	stmlib::Svf eqMidTap;
-	stmlib::Svf eqHighTap;
-	// Final fixed cleanup filter (not user-adjustable) - removes sub-40Hz
-	// rumble/DC and near-ultrasonic content above 17kHz that no other
-	// stage specifically targets, run last so it catches whatever the
-	// synth, sample layer, Wavefolder, Waveshaper, and EQ all fed into it.
+	// Final fixed cleanup filter (not user-adjustable) - removes sub-25Hz
+	// rumble/DC that no other stage specifically targets, run last so it
+	// catches whatever the synth, sample layer, Wavefolder, and Waveshaper
+	// all fed into it. FREQUENCY_ACCURATE rather than FREQUENCY_FAST here -
+	// its coefficients are set once (below), never recomputed per block,
+	// so the more accurate approximation costs nothing extra at runtime,
+	// unlike ApplyPost()'s user-adjustable Filter page (which recomputes on
+	// every knob change and so has to trade accuracy for speed). A single
+	// highpass, no paired lowpass - an earlier version also added a fixed
+	// 17kHz lowpass, but between the two of them the sound changed audibly
+	// for the worse (confirmed by direct A/B testing), so it's gone rather
+	// than risk the same thing at a different frequency.
 	stmlib::Svf cleanupHp;
-	stmlib::Svf cleanupLp;
+
+	// EQ Sculpt's 2 parametric points (see ApplyEqSculpt()) - each just a
+	// bandpass "tap" of the dry signal added back on, scaled by the gain
+	// knob (same cheap additive-EQ trick as the old 3-band EQ used, and
+	// mathematically what a true RBJ peaking filter reduces to for a
+	// linear-gain tap - see chowdsp_utils' EQBand for the same
+	// state-variable-filter-based approach in a well-known DSP library).
+	// Unlike the old EQ, frequency here *is* user-swept, so - like
+	// ApplyPost()'s Filter page - coefficients only get recomputed when the
+	// knob's value actually changes (cachedEqFreq1/2), not every block.
+	stmlib::Svf eqPoint1Tap;
+	stmlib::Svf eqPoint2Tap;
+	int cachedEqFreq1;
+	int cachedEqFreq2;
+
+	// Transient shaper state (see ApplyTransient()) - transFastEnv/
+	// transSlowEnv are shared by the Classic and Snap models (only one
+	// model is ever active on a given voice at a time, both just need a
+	// fast/slow envelope-follower pair, so there's no need for 2 separate
+	// copies). Gate and Band each need their own, distinct state.
+	float transFastEnv;
+	float transSlowEnv;
+	float transGatePrevAbs;
+	int transGateHoldSamples;
+	// Fixed (not user-adjustable) bandpass covering the ~150Hz-2.5kHz
+	// range most drum transient "knock" energy sits in - centre/Q set once
+	// in Init(), never recomputed per block, same reasoning as cleanupHp.
+	stmlib::Svf transBandFilter;
+	float transBandFastEnv;
+	float transBandSlowEnv;
 
 	void Init()
 	{
@@ -881,20 +992,755 @@ struct _drumVoicePost
 		// ApplyPost()'s user-adjustable Filter page has to.
 		sampleHp.set_f_q<stmlib::FREQUENCY_FAST>( 700.0f / plaits::kSampleRate, 0.6f );
 
-		eqLowTap.Init();
-		eqMidTap.Init();
-		eqHighTap.Init();
-		eqLowTap.set_f_q<stmlib::FREQUENCY_FAST>( 150.0f / plaits::kSampleRate, 0.6f );
-		eqMidTap.set_f_q<stmlib::FREQUENCY_FAST>( 1000.0f / plaits::kSampleRate, 1.0f );
-		eqHighTap.set_f_q<stmlib::FREQUENCY_FAST>( 5000.0f / plaits::kSampleRate, 0.6f );
-
 		cleanupHp.Init();
-		cleanupLp.Init();
-		cleanupHp.set_f_q<stmlib::FREQUENCY_FAST>( 40.0f / plaits::kSampleRate, 0.6f );
+		cleanupHp.set_f_q<stmlib::FREQUENCY_ACCURATE>( 25.0f / plaits::kSampleRate, 0.707f );
+
+		eqPoint1Tap.Init();
+		eqPoint2Tap.Init();
+		cachedEqFreq1 = -1;	// never a real Freq1/2 value (0..100), forces the first block to always compute
+		cachedEqFreq2 = -1;
+
+		transFastEnv = 0.0f;
+		transSlowEnv = 0.0f;
+		transGatePrevAbs = 0.0f;
+		transGateHoldSamples = 0;
+		transBandFilter.Init();
+		transBandFilter.set_f_q<stmlib::FREQUENCY_FAST>( 600.0f / plaits::kSampleRate, 0.7f );
+		transBandFastEnv = 0.0f;
+		transBandSlowEnv = 0.0f;
+	}
+};
+
+// ChowKick-style saturating resonant kick/snare - a short excitation pulse
+// drives a resonant filter whose bandpass state is soft-clipped every
+// sample before feeding back, getting progressively grittier as Character
+// increases - inspired by Chowdhury-DSP's ChowKick
+// (github.com/Chowdhury-DSP/ChowKick, BSD 3-Clause - see ATTRIBUTION.md),
+// itself modeling Kurt Werner's analysis of the TR-808 kick circuit's
+// pulse + resonant-filter topology. Not a literal port: ChowKick's own
+// nonlinear filter solves an implicit (Newton-Raphson) update each sample
+// to exactly match the analog circuit; this saturates the bandpass state
+// explicitly instead (same idea - a nonlinearity inside the resonant
+// feedback loop, not just a post-filter effect - but computed directly
+// rather than iteratively solved), which is unconditionally stable and
+// measured as audibly very close in character, without the risk of a
+// hand-rolled implicit solve diverging. The filter topology itself mirrors
+// stmlib::Svf's own internal Process() math (already used everywhere else
+// in this project) with a saturation step inserted, rather than a
+// from-scratch derivation - state1_/state2_ aren't accessible from outside
+// that class, which is why this needs its own copy at all. tanhf() is
+// confirmed to resolve on this firmware (see
+// distingnt_libm_symbol_constraints project memory - verified with a live
+// hardware load test before this was written).
+struct ChowKickVoice
+{
+	float pulseEnv;
+	float state1, state2;
+	float outputLp;
+	// Explicit Release-driven amplitude envelope. Originally this voice had
+	// no envelope of its own at all - the audible tail was whatever the
+	// resonant filter's own Q happened to ring for, so the Release knob
+	// (which only fed Q, see `q` below) barely moved the perceived length.
+	// This makes Release behave like every other voice's Release knob:
+	// a direct, dominant control over how long the hit lasts.
+	float ampEnv;
+
+	void Init()
+	{
+		pulseEnv = 0.0f;
+		state1 = 0.0f;
+		state2 = 0.0f;
+		outputLp = 0.0f;
+		ampEnv = 0.0f;
+	}
+
+	// f0: normalized centre frequency. decay: 0..1, Release - sets ampEnv's
+	// decay time directly (dominant) and also nudges Q a little further
+	// (secondary, keeps some ring-time coupling with resonance). character01:
+	// 0..1, saturation drive (0 = clean, matching ChowKick's own
+	// LinearFilterProc; higher = grittier, matching its BasicFilterProc).
+	// tone01: 0..1, output lowpass brightness. Accent is applied by the
+	// caller afterward (matching peaks::BassDrum's own convention), not
+	// baked in here.
+	void Render( bool trig, float f0, float decay, float character01, float tone01, float* out, int numFrames )
+	{
+		if ( trig )
 		{
-			float cleanupLpNorm = 17000.0f / plaits::kSampleRate;
-			CONSTRAIN( cleanupLpNorm, 0.001f, 0.49f );
-			cleanupLp.set_f_q<stmlib::FREQUENCY_FAST>( cleanupLpNorm, 0.6f );
+			pulseEnv = 8.0f;
+			ampEnv = 1.0f;
+		}
+
+		float q = 0.6f + decay * 14.0f;
+		float g = stmlib::OnePole::tan<stmlib::FREQUENCY_FAST>( f0 );
+		float r = 1.0f / q;
+		float h = 1.0f / ( 1.0f + r * g + g * g );
+		float drive = 1.0f + character01 * 16.0f;
+		bool saturate = character01 > 0.001f;
+		// Normalizing by tanhf(drive) (which itself approaches 1 as drive
+		// grows) instead of raw `drive` - dividing by raw drive (as high as
+		// 17) crushed the output down to ~1/17 of unity once the saturator
+		// was fully into its curve, which is exactly the "everything above
+		// the lowest Character setting is very subtle" bug: the tanh
+		// saturator's *shape* got grittier as intended, but its *level* kept
+		// shrinking right along with it. tanhf(drive) asymptotically
+		// approaches 1.0 as drive increases, so the makeup gain stays near
+		// unity instead of collapsing.
+		float driveNorm = saturate ? tanhf( drive ) : 1.0f;
+
+		float pulseDecayCoeff = 1.0f - 1.0f / ( 0.002f * plaits::kSampleRate );	// ~2ms exciter pulse
+		float ampDecayCoeff = 1.0f - 1.0f / ( ( 0.05f + decay * 0.95f ) * plaits::kSampleRate );
+
+		float toneHz = 300.0f + tone01 * tone01 * ( 7000.0f - 300.0f );
+		// One-pole smoothing coefficient needs the 2*pi factor to actually
+		// land near toneHz's own cutoff - without it (as this originally
+		// read), the true cutoff was ~6.3x lower than the toneHz label
+		// implied (effectively maxing out under ~1.1kHz even at Tone=100),
+		// which is exactly the "tone doesn't change much above 20" bug: most
+		// of the knob's upper range was spent well past where the source
+		// material has any content left to reveal.
+		float toneCoeff = 6.2831853f * toneHz / plaits::kSampleRate;
+		CONSTRAIN( toneCoeff, 0.001f, 0.9f );
+
+		for ( int i=0; i<numFrames; ++i )
+		{
+			float input = pulseEnv;
+			pulseEnv *= pulseDecayCoeff;
+
+			float hp = ( input - r * state1 - g * state1 - state2 ) * h;
+			float bp = g * hp + state1;
+			float bpOut = saturate ? ( tanhf( bp * drive ) / driveNorm ) : bp;
+			state1 = g * hp + bpOut;
+			float lp = g * bpOut + state2;
+			state2 = g * bpOut + lp;
+
+			outputLp += ( bpOut - outputLp ) * toneCoeff;
+			out[i] = outputLp * ampEnv;
+			ampEnv *= ampDecayCoeff;
+		}
+	}
+};
+
+// Modal synthesis hi-hat/cymbal - a small bank of resonant bandpass
+// filters tuned to fixed inharmonic ratios (characteristic of a struck
+// metal plate/cymbal's partials), excited by a short noise burst.
+// Approximates what a full physical simulation (a finite-difference
+// membrane, or a mass-spring network - see e.g. the FDM/mass-spring
+// repos this was discussed alongside) converges to, at a small fraction
+// of the cost: solving a real 2D membrane/plate PDE or spring lattice
+// every sample for 4 simultaneous voices on this platform isn't
+// realistic, but a handful of coupled resonators still captures the same
+// "inharmonic, chaotic, metallic" character. Each mode reuses
+// stmlib::Svf directly (no custom filter math needed here, unlike
+// ChowKickVoice - nothing needs access to the internal state), same as
+// Elements' own resonator already does with kNumModes=8 - this is
+// actually cheaper than that already-shipped model.
+struct ModalHatVoice
+{
+	static constexpr int kNumModes = 6;
+	// Ratios loosely characteristic of a struck metal plate/cymbal's
+	// inharmonic partials - a fixed, generically "metallic" modal set, not
+	// derived from any one specific instrument (each of the
+	// physical-modeling references solves its own real PDE/spring network
+	// per instrument, which isn't what this approximates).
+	static constexpr float kRatios[kNumModes] = { 1.0f, 1.41f, 1.79f, 2.37f, 3.06f, 3.85f };
+	static constexpr float kModeGain[kNumModes] = { 1.0f, 0.7f, 0.55f, 0.4f, 0.28f, 0.2f };
+
+	stmlib::Svf modes[kNumModes];
+	float modeEnv[kNumModes];
+	float noiseBurstEnv;
+
+	void Init()
+	{
+		for ( int i=0; i<kNumModes; ++i )
+		{
+			modes[i].Init();
+			modeEnv[i] = 0.0f;
+		}
+		noiseBurstEnv = 0.0f;
+	}
+
+	// f0: normalized fundamental. decay: 0..1 overall ring time. tone01:
+	// 0..1, how much the higher modes are engaged (brightness). character01:
+	// 0..1, resonance/Q sharpness (ringy vs damped). Accent is applied by
+	// the caller afterward, matching ChowKickVoice/peaks::BassDrum.
+	void Render( bool trig, float accent, float f0, float decay, float tone01, float character01, float* out, int numFrames )
+	{
+		if ( trig )
+		{
+			noiseBurstEnv = 1.0f;
+			for ( int i=0; i<kNumModes; ++i )
+			{
+				float engage = 1.0f - ( 1.0f - tone01 ) * (float)i / (float)( kNumModes - 1 );
+				CONSTRAIN( engage, 0.0f, 1.0f );
+				modeEnv[i] = accent * kModeGain[i] * engage;
+			}
+		}
+
+		float q = 20.0f + character01 * 180.0f;
+		for ( int m=0; m<kNumModes; ++m )
+		{
+			float modeF0 = f0 * kRatios[m];
+			CONSTRAIN( modeF0, 0.001f, 0.49f );
+			modes[m].set_f_q<stmlib::FREQUENCY_FAST>( modeF0, q );
+		}
+
+		float noiseDecayCoeff = 1.0f - 1.0f / ( 0.003f * plaits::kSampleRate );	// short noise burst
+		// Higher modes ring out faster, matching real inharmonic decay.
+		// `1 - 1/(T*sampleRate)` sets a one-pole's *time constant* to T
+		// seconds (63% decay point), not its audible -60dB ring-out time -
+		// that's ~6.9 time constants away (ln(1000)), so the original
+		// 0.05..1.55s target here was actually an ~0.35..10.7s *audible*
+		// tail. IdleSamples()'s own ceiling caps any voice's render window
+		// at 2s regardless, so once decay pushed the true tail past ~2s
+		// (which happened by well under half of Release's range), the
+		// audible hit was always being cut off at that same fixed ceiling -
+		// Release stopped doing anything for the rest of its own range.
+		// Dividing the target time constant by ~6.9 makes the *audible*
+		// tail match the intended 0.05..~1.8s range instead, comfortably
+		// under the ceiling across Release's whole travel.
+		constexpr float kRt60ToTimeConstant = 1.0f / 6.91f;
+		float modeDecayCoeff[kNumModes];
+		for ( int m=0; m<kNumModes; ++m )
+		{
+			float t60 = ( 0.05f + decay * 1.75f ) / ( 1.0f + (float)m * 0.35f );
+			float t = t60 * kRt60ToTimeConstant;
+			modeDecayCoeff[m] = 1.0f - 1.0f / ( t * plaits::kSampleRate );
+		}
+
+		for ( int i=0; i<numFrames; ++i )
+		{
+			float noise = stmlib::Random::GetFloat() * 2.0f - 1.0f;
+			float excite = noise * noiseBurstEnv;
+			noiseBurstEnv *= noiseDecayCoeff;
+
+			float sample = 0.0f;
+			for ( int m=0; m<kNumModes; ++m )
+			{
+				float modeOut = modes[m].Process<stmlib::FILTER_MODE_BAND_PASS>( excite );
+				sample += modeOut * modeEnv[m];
+				modeEnv[m] *= modeDecayCoeff[m];
+			}
+			out[i] = sample;
+		}
+	}
+};
+// Out-of-line definitions for the static constexpr array members above -
+// required under C++11 (this project's standard) once they're actually
+// indexed at runtime (kRatios[m]/kModeGain[i] with a loop variable) rather
+// than just used as compile-time constants; the in-class declaration alone
+// isn't a definition until C++17's inline variables. Same pattern as
+// plaits::kSampleRate etc. near the top of this file.
+constexpr int ModalHatVoice::kNumModes;
+constexpr float ModalHatVoice::kRatios[];
+constexpr float ModalHatVoice::kModeGain[];
+
+// Clap (BD/SD shared slot - added as an SD model) - classic 808/909-style
+// handclap: band-passed noise (~0.9-2.1kHz, Q=3 - the well-established
+// "clap sweet spot" per multiple independent sources) fired as 4 staggered
+// short bursts followed by a longer sustained tail, inspired by Punck's
+// (github.com/dchwebb/Punck, an STM32H7-based Eurorack drum machine - the
+// same embedded-ARM constraint class as this platform) clap design and
+// confirmed as the standard technique independently.
+struct ClapVoice
+{
+	static constexpr int kNumBursts = 4;
+	static constexpr float kBurstOffsetS[kNumBursts] = { 0.0f, 0.011f, 0.022f, 0.033f };
+	static constexpr float kBurstWidthS = 0.006f;
+
+	stmlib::Svf bandpass;
+	int sampleCounter;
+	bool active;
+	float tailTotalS;
+
+	void Init()
+	{
+		bandpass.Init();
+		sampleCounter = 0;
+		active = false;
+		tailTotalS = 0.2f;
+	}
+
+	// tone01: 0..1, bandpass Q (previously fixed at Q=3 - this model had no
+	// Tone control at all) - lower is broader/noisier, higher is more
+	// resonant/tonal. fmPush: block-level knock push (see
+	// ComputeExternalFmPush()), briefly raising the bandpass centre for a
+	// sharper attack chirp on the first burst.
+	void Render( bool trig, float accent, float decay, float character01, float tone01, float fmPush, float* out, int numFrames )
+	{
+		if ( trig )
+		{
+			sampleCounter = 0;
+			active = true;
+			tailTotalS = 0.05f + decay * 0.35f;
+		}
+
+		float centreHz = ( 900.0f + character01 * 1200.0f ) * ( 1.0f + fmPush );
+		float norm = centreHz / plaits::kSampleRate;
+		CONSTRAIN( norm, 0.001f, 0.49f );
+		float q = 1.5f + tone01 * 7.0f;
+		bandpass.set_f_q<stmlib::FREQUENCY_FAST>( norm, q );
+
+		float lastBurstEndS = kBurstOffsetS[kNumBursts - 1] + kBurstWidthS;
+
+		for ( int i=0; i<numFrames; ++i )
+		{
+			float noise = stmlib::Random::GetFloat() * 2.0f - 1.0f;
+			float gain = 0.0f;
+			if ( active )
+			{
+				float t = sampleCounter / plaits::kSampleRate;
+				for ( int b=0; b<kNumBursts; ++b )
+				{
+					float dt = t - kBurstOffsetS[b];
+					if ( dt >= 0.0f && dt < kBurstWidthS ) gain = 1.0f;
+				}
+				if ( t >= lastBurstEndS )
+				{
+					float tailT = ( t - lastBurstEndS ) / tailTotalS;
+					float tailGain = 1.0f - tailT;
+					if ( tailGain <= 0.0f ) { tailGain = 0.0f; active = false; }
+					if ( tailGain > gain ) gain = tailGain;
+				}
+				++sampleCounter;
+			}
+			out[i] = bandpass.Process<stmlib::FILTER_MODE_BAND_PASS>( noise * gain * accent );
+		}
+	}
+};
+constexpr int ClapVoice::kNumBursts;
+constexpr float ClapVoice::kBurstOffsetS[];
+constexpr float ClapVoice::kBurstWidthS;
+
+// Shaker (CH/OH model) - inspired by Perry Cook's PhISEM (Physically
+// Informed Stochastic Event Modeling, as published in his percussion
+// synthesis papers): many small collision events at pseudo-random
+// (jittered) intervals, each a short decaying noise burst, all under an
+// overall envelope, through one resonant filter. Not a literal port of
+// Cook's exact multi-object statistics - a single-resonator simplification
+// that keeps the same core idea (stochastic bursts, not a fixed periodic
+// or continuous texture) that makes every hit sound slightly different,
+// unlike this project's other, deterministic hat models.
+struct ShakerVoice
+{
+	stmlib::Svf resonantFilter;
+	float overallEnv;
+	float grainEnv;
+	int samplesUntilNextGrain;
+
+	void Init()
+	{
+		resonantFilter.Init();
+		overallEnv = 0.0f;
+		grainEnv = 0.0f;
+		samplesUntilNextGrain = 0;
+	}
+
+	// f0: resonant filter centre, already including any external FM push
+	// the caller applied (same convention as RenderElements()/
+	// ModalHatVoice - previously this model had no FM control at all).
+	// decay: overall envelope length. tone01: filter sharpness (Q).
+	// character01: grain density (higher = faster, rattlier).
+	void Render( bool trig, float accent, float f0, float decay, float tone01, float character01, float* out, int numFrames )
+	{
+		if ( trig )
+		{
+			overallEnv = accent;
+			samplesUntilNextGrain = 0;
+		}
+
+		float norm = f0;
+		CONSTRAIN( norm, 0.001f, 0.49f );
+		float q = 2.0f + tone01 * 10.0f;
+		resonantFilter.set_f_q<stmlib::FREQUENCY_FAST>( norm, q );
+
+		float overallDecayCoeff = 1.0f - 1.0f / ( ( 0.08f + decay * 1.2f ) * plaits::kSampleRate );
+		int meanGrainSamples = (int)( ( 0.002f + ( 1.0f - character01 ) * 0.015f ) * plaits::kSampleRate );
+		if ( meanGrainSamples < 8 ) meanGrainSamples = 8;
+		float grainDecayCoeff = 1.0f - 1.0f / ( 0.006f * plaits::kSampleRate );
+
+		for ( int i=0; i<numFrames; ++i )
+		{
+			if ( samplesUntilNextGrain <= 0 && overallEnv > 0.002f )
+			{
+				grainEnv = 1.0f;
+				samplesUntilNextGrain = meanGrainSamples / 2 + (int)( stmlib::Random::GetFloat() * meanGrainSamples );
+			}
+			else
+			{
+				--samplesUntilNextGrain;
+				grainEnv *= grainDecayCoeff;
+			}
+			float noise = stmlib::Random::GetFloat() * 2.0f - 1.0f;
+			float excite = noise * grainEnv * overallEnv;
+			overallEnv *= overallDecayCoeff;
+			out[i] = resonantFilter.Process<stmlib::FILTER_MODE_BAND_PASS>( excite );
+		}
+	}
+};
+
+// 808 Decel Kick (BD model) - inspired by Punck's "five phase" TR-808-style
+// kick: a click (short noise burst), then a sine whose frequency starts
+// well above the tuned pitch and decelerates down to it. This project's
+// deceleration is a one-pole approach to the target frequency rather than
+// Punck's own two-stage fixed-then-ramping design - one-pole decay is
+// itself already decelerating in absolute Hz/sec terms (the closer it
+// gets, the slower it changes), which is a simpler way to get the same
+// perceptual "pitch sweep that eases into the target" character.
+struct Decel808Voice
+{
+	float phase;
+	float freqCurrent;
+	float clickEnv;
+	float ampEnv;
+	float outputLp;
+
+	void Init()
+	{
+		phase = 0.0f;
+		freqCurrent = 0.0f;
+		clickEnv = 0.0f;
+		ampEnv = 0.0f;
+		outputLp = 0.0f;
+	}
+
+	// tone01: output lowpass brightness (previously a no-op - this model had
+	// no Tone control at all). fmKnock: 0..1, scales how high above the
+	// target pitch the deceleration starts (bigger knock), same "knock" idea
+	// as Analog/Synthetic/808's own FM input, applied at trigger since this
+	// model's sweep is already a one-shot event, not an ongoing per-sample
+	// modulation.
+	void Render( bool trig, float f0, float decay, float character01, float tone01, float fmKnock, float* out, int numFrames )
+	{
+		if ( trig )
+		{
+			phase = 0.0f;
+			freqCurrent = f0 * ( 6.0f + fmKnock * 10.0f );
+			clickEnv = 1.0f;
+			ampEnv = 1.0f;
+		}
+
+		float freqApproachCoeff = 1.0f / ( 0.09f * plaits::kSampleRate );	// fraction approached per sample
+		float ampDecayCoeff = 1.0f - 1.0f / ( ( 0.15f + decay * 1.2f ) * plaits::kSampleRate );
+		float clickDecayCoeff = 1.0f - 1.0f / ( 0.0015f * plaits::kSampleRate );
+		float drive = 1.0f + character01 * 8.0f;
+		bool saturate = character01 > 0.001f;
+		// Same makeup-gain fix as ChowKickVoice - normalizing by tanhf(drive)
+		// instead of raw drive keeps the level from collapsing as Character
+		// increases.
+		float driveNorm = saturate ? tanhf( drive ) : 1.0f;
+
+		// Same corrected one-pole coefficient as ChowKickVoice's Tone fix
+		// (needs the 2*pi factor to land near the intended cutoff).
+		float toneHz = 400.0f + tone01 * tone01 * ( 9000.0f - 400.0f );
+		float toneCoeff = 6.2831853f * toneHz / plaits::kSampleRate;
+		CONSTRAIN( toneCoeff, 0.001f, 0.95f );
+
+		for ( int i=0; i<numFrames; ++i )
+		{
+			freqCurrent += ( f0 - freqCurrent ) * freqApproachCoeff;
+			phase += freqCurrent;
+			if ( phase >= 1.0f ) phase -= 1.0f;
+
+			float sine = plaits::Sine( phase );
+			float click = ( stmlib::Random::GetFloat() * 2.0f - 1.0f ) * clickEnv;
+			clickEnv *= clickDecayCoeff;
+
+			float mixed = sine * ampEnv + click * 2.0f;
+			ampEnv *= ampDecayCoeff;
+
+			float driven = saturate ? ( tanhf( mixed * drive ) / driveNorm ) : mixed;
+			outputLp += ( driven - outputLp ) * toneCoeff;
+			out[i] = outputLp;
+		}
+	}
+};
+
+// Sweep Hat (CH/OH model) - inspired by Punck's hi-hat: several detuned
+// square-ish oscillators, through a highpass/lowpass pair that sweep
+// *toward* each other over the note's sustain (HP rises, LP falls),
+// progressively narrowing the passband - a distinct time-varying-filter
+// character none of this project's other hat models have. Simplified from
+// Punck's own 6-oscillator cross-FM design to 4 detuned (not cross-
+// modulated) oscillators, to keep this addition's scope reasonable.
+struct SweepHatVoice
+{
+	static constexpr int kNumOsc = 4;
+	static constexpr float kRatios[kNumOsc] = { 1.0f, 1.34f, 1.78f, 2.53f };
+
+	float phase[kNumOsc];
+	stmlib::Svf hp, lp;
+	float elapsedS;
+	float totalS;
+	bool active;
+
+	void Init()
+	{
+		for ( int i=0; i<kNumOsc; ++i ) phase[i] = 0.0f;
+		hp.Init();
+		lp.Init();
+		elapsedS = 0.0f;
+		totalS = 1.0f;
+		active = false;
+	}
+
+	// character01: 0..1, HP/LP resonance (previously a no-op - this model had
+	// no Character control at all) - higher makes the narrowing sweep more
+	// pronounced/whistly rather than just a plain filter narrowing.
+	// fmKnock: 0..1, pushes the sweep's starting HP frequency higher for a
+	// sharper opening transient (this model already has its own built-in
+	// sweep/envelope, so FM extends its existing knock rather than adding a
+	// separate mechanism, same idea as Decel808Voice).
+	void Render( bool trig, float accent, float f0, float decay, float tone01, float character01, float fmKnock, float* out, int numFrames, float blockSeconds )
+	{
+		if ( trig )
+		{
+			elapsedS = 0.0f;
+			totalS = 0.05f + decay * 0.6f;
+			active = true;
+			for ( int i=0; i<kNumOsc; ++i ) phase[i] = 0.0f;
+		}
+
+		float sweepT = 0.0f;
+		float ampEnv = 0.0f;
+		if ( active )
+		{
+			sweepT = elapsedS / totalS;
+			CONSTRAIN( sweepT, 0.0f, 1.0f );
+			ampEnv = 1.0f - sweepT;
+			if ( ampEnv <= 0.0f ) { ampEnv = 0.0f; active = false; }
+		}
+
+		float hpHz = ( 400.0f + fmKnock * 3000.0f ) + sweepT * 6000.0f;
+		float lpHz = 12000.0f - sweepT * ( 12000.0f - ( 2000.0f + tone01 * 6000.0f ) );
+		float hpNorm = hpHz / plaits::kSampleRate; CONSTRAIN( hpNorm, 0.001f, 0.49f );
+		float lpNorm = lpHz / plaits::kSampleRate; CONSTRAIN( lpNorm, 0.001f, 0.49f );
+		float q = 0.55f + character01 * 3.0f;
+		hp.set_f_q<stmlib::FREQUENCY_FAST>( hpNorm, q );
+		lp.set_f_q<stmlib::FREQUENCY_FAST>( lpNorm, q );
+
+		float gain = ampEnv * accent;
+		for ( int i=0; i<numFrames; ++i )
+		{
+			float sample = 0.0f;
+			for ( int o=0; o<kNumOsc; ++o )
+			{
+				phase[o] += f0 * kRatios[o];
+				if ( phase[o] >= 1.0f ) phase[o] -= 1.0f;
+				sample += ( plaits::Sine( phase[o] ) >= 0.0f ? 1.0f : -1.0f ) * 0.25f;
+			}
+			float hpOut = hp.Process<stmlib::FILTER_MODE_HIGH_PASS>( sample );
+			float lpOut = lp.Process<stmlib::FILTER_MODE_LOW_PASS>( hpOut );
+			out[i] = lpOut * gain;
+		}
+
+		elapsedS += blockSeconds;
+	}
+};
+constexpr int SweepHatVoice::kNumOsc;
+constexpr float SweepHatVoice::kRatios[];
+
+// Comb Body (BD/SD model) - a from-scratch addition, not ported from any
+// reference: a short noise burst excites a feedback delay line (Karplus-
+// Strong-adjacent) with a one-pole damping filter inside the loop, tuned
+// to the target pitch via the delay length. None of this project's other
+// models are delay-based (all are filter-resonator or oscillator based),
+// so this is a genuinely different DSP primitive - gives a "plucked
+// tube/woodblock" character. Needs a real delay buffer, unlike every other
+// model here - allocated from DRAM (see calculateRequirements()/
+// construct()), not embedded in the DTC voice struct, to keep DTC (this
+// project's tight, performance-critical memory budget) lean.
+struct CombBodyVoice
+{
+	static constexpr int kMaxDelaySamples = 1024;	// supports pitches down to ~47Hz at 48kHz
+
+	float* delayLine;	// [kMaxDelaySamples], points into DRAM
+	int writePos;
+	float exciteEnv;
+	float exciteLpState;
+	float dampState;
+
+	void Init( float* buffer )
+	{
+		delayLine = buffer;
+		for ( int i=0; i<kMaxDelaySamples; ++i ) delayLine[i] = 0.0f;
+		writePos = 0;
+		exciteEnv = 0.0f;
+		exciteLpState = 0.0f;
+		dampState = 0.0f;
+	}
+
+	// f0: normalized frequency (cycles/sample, same convention as
+	// everywhere else in this file, already including any external FM
+	// pitch-bend push the caller applied - same convention as
+	// RenderElements()/ModalHatVoice, giving a natural "bend down into
+	// pitch" knock for free since a temporarily-shorter delay length IS a
+	// temporarily-higher pitch) - period in samples is 1/f0. character01:
+	// 0 = heavily damped/dull, 1 = bright/ringing (in-loop damping). tone01:
+	// 0..1, excitation brightness (previously a no-op - this model had no
+	// Tone control at all) - a dark, thuddy pluck vs. a bright, clicky one,
+	// independent of the loop's own damping.
+	void Render( bool trig, float f0, float decay, float character01, float tone01, float* out, int numFrames )
+	{
+		if ( trig )
+			exciteEnv = 8.0f;
+
+		int delaySamples = (int)( 1.0f / f0 );
+		CONSTRAIN( delaySamples, 4, kMaxDelaySamples - 1 );
+
+		float feedback = 0.985f + decay * 0.0149f;
+		float damping = 0.1f + ( 1.0f - character01 ) * 0.5f;
+		float exciteDecayCoeff = 1.0f - 1.0f / ( 0.003f * plaits::kSampleRate );
+		// Same corrected one-pole coefficient shape as ChowKickVoice's Tone
+		// fix (needs the 2*pi factor).
+		float exciteBrightCoeff = 6.2831853f * ( 200.0f + tone01 * tone01 * 7800.0f ) / plaits::kSampleRate;
+		CONSTRAIN( exciteBrightCoeff, 0.001f, 0.95f );
+
+		for ( int i=0; i<numFrames; ++i )
+		{
+			float rawNoise = ( stmlib::Random::GetFloat() * 2.0f - 1.0f ) * exciteEnv;
+			exciteEnv *= exciteDecayCoeff;
+			exciteLpState += ( rawNoise - exciteLpState ) * exciteBrightCoeff;
+
+			int readPos = writePos - delaySamples;
+			if ( readPos < 0 ) readPos += kMaxDelaySamples;
+			float delayed = delayLine[readPos];
+
+			dampState += ( delayed - dampState ) * damping;
+			float newSample = exciteLpState + dampState * feedback;
+
+			delayLine[writePos] = newSample;
+			writePos = writePos + 1;
+			if ( writePos >= kMaxDelaySamples ) writePos = 0;
+
+			out[i] = newSample;
+		}
+	}
+};
+constexpr int CombBodyVoice::kMaxDelaySamples;
+
+// Ring-Mod Metal (CH/OH model) - a from-scratch addition: two detuned
+// sine oscillators multiplied together (not summed), through a fixed
+// highpass. Ring modulation between two tones is a classic, cheap way to
+// get bell-like/robotic inharmonic partials (the product of two sines
+// generates sum and difference frequencies, neither of which is generally
+// harmonic with either input) - distinct from ModalHatVoice's fixed-ratio
+// resonator-bank approach.
+struct RingModMetalVoice
+{
+	float phase1, phase2;
+	float ampEnv;
+	stmlib::Svf hp;
+
+	void Init()
+	{
+		phase1 = 0.0f;
+		phase2 = 0.0f;
+		ampEnv = 0.0f;
+		hp.Init();
+	}
+
+	// f0: already including any external FM push the caller applied (same
+	// convention as RenderElements()/ModalHatVoice - previously this model
+	// had no FM control at all). tone01: 0..1, highpass cutoff (previously
+	// fixed at 300Hz - this model had no Tone control at all).
+	void Render( bool trig, float accent, float f0, float decay, float character01, float tone01, float* out, int numFrames )
+	{
+		if ( trig )
+		{
+			ampEnv = accent;
+			phase1 = 0.0f;
+			phase2 = 0.0f;
+		}
+
+		float ratio = 1.4f + character01 * 2.3f;
+		float ampDecayCoeff = 1.0f - 1.0f / ( ( 0.05f + decay * 1.0f ) * plaits::kSampleRate );
+
+		float hpNorm = ( 100.0f + tone01 * tone01 * 1900.0f ) / plaits::kSampleRate;
+		CONSTRAIN( hpNorm, 0.001f, 0.49f );
+		hp.set_f_q<stmlib::FREQUENCY_FAST>( hpNorm, 0.6f );
+
+		for ( int i=0; i<numFrames; ++i )
+		{
+			phase1 += f0;
+			if ( phase1 >= 1.0f ) phase1 -= 1.0f;
+			phase2 += f0 * ratio;
+			if ( phase2 >= 1.0f ) phase2 -= 1.0f;
+
+			float ring = plaits::Sine( phase1 ) * plaits::Sine( phase2 );
+			float hpOut = hp.Process<stmlib::FILTER_MODE_HIGH_PASS>( ring * ampEnv );
+			ampEnv *= ampDecayCoeff;
+			out[i] = hpOut;
+		}
+	}
+};
+
+// Chaos FM (BD/SD model) - a from-scratch addition: a 2-operator FM pair
+// where the modulator's own frequency is nudged, every sample, by the
+// (rectified) carrier's output from the previous sample - a genuine
+// self-referential feedback loop rather than a fixed modulation ratio, so
+// it can evolve unpredictably as Character increases instead of settling
+// into a fixed, repeating waveform. At Character = 0 the feedback term is
+// zero, so it reduces to a plain, stable 2:1 FM pair.
+struct ChaosFmVoice
+{
+	float carrierPhase;
+	float modPhase;
+	float modFreqState;
+	float ampEnv;
+	// Extra modulation-index boost right at the attack, decaying quickly -
+	// previously this model had no attack transient distinct from its
+	// ongoing chaos/feedback character at all (the "no knock" complaint),
+	// since modFreqState's steady-state formula only ever adds energy
+	// proportional to the *already-decaying* carrier output. This is a
+	// separate, dedicated one-pole envelope so the knock is always present
+	// (scaled by FM) regardless of how Character/chaos is set.
+	float knockEnv;
+
+	void Init()
+	{
+		carrierPhase = 0.0f;
+		modPhase = 0.0f;
+		modFreqState = 0.0f;
+		ampEnv = 0.0f;
+		knockEnv = 0.0f;
+	}
+
+	// tone01: 0..1, base carrier:modulator ratio (1x..4x, previously fixed
+	// at a flat 2x - this model had no Tone control at all). fmKnock: 0..1,
+	// attack modulation-index boost amount (see knockEnv above).
+	void Render( bool trig, float f0, float decay, float character01, float tone01, float fmKnock, float* out, int numFrames )
+	{
+		float baseRatio = 1.0f + tone01 * 3.0f;
+		if ( trig )
+		{
+			ampEnv = 1.0f;
+			carrierPhase = 0.0f;
+			modPhase = 0.0f;
+			modFreqState = f0 * baseRatio;
+			knockEnv = fmKnock * 10.0f;
+		}
+
+		float chaosAmount = character01 * 6.0f;
+		float ampDecayCoeff = 1.0f - 1.0f / ( ( 0.08f + decay * 1.2f ) * plaits::kSampleRate );
+		float knockDecayCoeff = 1.0f - 1.0f / ( 0.012f * plaits::kSampleRate );	// ~12ms knock
+
+		for ( int i=0; i<numFrames; ++i )
+		{
+			modPhase += modFreqState;
+			if ( modPhase >= 1.0f ) modPhase -= 1.0f;
+			if ( modPhase < 0.0f ) modPhase += 1.0f;
+			float modOut = plaits::Sine( modPhase );
+
+			carrierPhase += f0 * ( 1.0f + modOut * ( 3.0f + knockEnv ) );
+			knockEnv *= knockDecayCoeff;
+			if ( carrierPhase >= 1.0f ) carrierPhase -= 1.0f;
+			if ( carrierPhase < 0.0f ) carrierPhase += 1.0f;
+			float carrierOut = plaits::Sine( carrierPhase );
+
+			modFreqState = f0 * baseRatio + fabsf( carrierOut ) * chaosAmount * f0;
+
+			out[i] = carrierOut * ampEnv;
+			ampEnv *= ampDecayCoeff;
 		}
 	}
 };
@@ -907,8 +1753,12 @@ struct _kickVoice : _drumVoicePost
 	elements::Resonator elementsResonator;
 	peaks::BassDrum peaksBass;
 	peaks::FmDrum peaksFm;
+	ChowKickVoice chowKick;
+	Decel808Voice decel808;
+	CombBodyVoice combBody;
+	ChaosFmVoice chaosFm;
 
-	void Init()
+	void Init( float* combBodyDelayBuf )
 	{
 		_drumVoicePost::Init();
 		analog.Init();
@@ -917,6 +1767,10 @@ struct _kickVoice : _drumVoicePost
 		elementsResonator.Init();
 		peaksBass.Init();
 		peaksFm.Init();
+		chowKick.Init();
+		decel808.Init();
+		combBody.Init( combBodyDelayBuf );
+		chaosFm.Init();
 	}
 };
 
@@ -928,8 +1782,12 @@ struct _snareVoice : _drumVoicePost
 	elements::Resonator elementsResonator;
 	peaks::SnareDrum peaksSnare;
 	peaks::FmDrum peaksFm;
+	ChowKickVoice chowKick;
+	ClapVoice clap;
+	CombBodyVoice combBody;
+	ChaosFmVoice chaosFm;
 
-	void Init()
+	void Init( float* combBodyDelayBuf )
 	{
 		_drumVoicePost::Init();
 		analog.Init();
@@ -938,6 +1796,10 @@ struct _snareVoice : _drumVoicePost
 		elementsResonator.Init();
 		peaksSnare.Init();
 		peaksFm.Init();
+		chowKick.Init();
+		clap.Init();
+		combBody.Init( combBodyDelayBuf );
+		chaosFm.Init();
 	}
 };
 
@@ -947,6 +1809,10 @@ struct _hatVoice : _drumVoicePost
 	elements::Exciter elementsExciter;
 	elements::Resonator elementsResonator;
 	braids::Cymbal braidsCymbal;
+	ModalHatVoice modal;
+	ShakerVoice shaker;
+	SweepHatVoice sweepHat;
+	RingModMetalVoice ringModMetal;
 	float* scratch1;	// [maxFramesPerStep], points into dram
 	float* scratch2;	// [maxFramesPerStep], points into dram
 
@@ -966,6 +1832,10 @@ struct _hatVoice : _drumVoicePost
 		elementsExciter.Init();
 		elementsResonator.Init();
 		braidsCymbal.Init();
+		modal.Init();
+		shaker.Init();
+		sweepHat.Init();
+		ringModMetal.Init();
 		cymbalElapsed = 0.0f;
 		cymbalTotalS = 1.0f;
 		cymbalActive = false;
@@ -1107,6 +1977,25 @@ struct _drumMachineAlgorithm : public _NT_algorithm
 	// instead of the concept's base value - see FindOrAllocRoute()/
 	// customUi(). Reset to Normal (0) on every page change.
 	int barPageMode;
+
+	// EQ Sculpt page state (see kPageEqSculpt/DrawEqSculptPage()) - which
+	// slot (kSlotBD..kSlotOH) Pot L has selected for editing, and which of
+	// that slot's 2 EQ points (0 or 1) Encoder R currently edits the gain
+	// of - tracks whichever of Pot C (point 1's frequency) / Pot R (point
+	// 2's frequency) was most recently actually turned, so one encoder can
+	// cover both points' gain. Both reset (slot to BD, point to 0) whenever
+	// this page is entered fresh - see customUi().
+	int eqSculptSelectedSlot;
+	int eqSculptLastPoint;
+	// Delete-point confirm dialog (Pot L's click, see customUi()) - a
+	// dedicated Yes/No dialog for clearing the (eqSculptSelectedSlot,
+	// eqSculptLastPoint) point's Freq and Gain back to 0, separate from the
+	// existing deleteConfirmOpen (which is wired specifically to Mod Matrix
+	// route deletion on bar pages, a different target/action entirely).
+	// Defaults to No so a stray click can never delete anything by itself,
+	// same convention as deleteConfirmChoice/presetMenuAction.
+	bool eqDeleteConfirmOpen;
+	int eqDeleteConfirmChoice;	// 0 = No, 1 = Yes
 
 	// Relative/incremental mode for the 3 bar-page pots (potL/potC/potR),
 	// replacing an earlier "wait until the pot crosses the current value"
@@ -1487,9 +2376,12 @@ void	calculateRequirements( _NT_algorithmRequirements& req, const int32_t* speci
 	// MixSampleLayer()). No more full-file per-slot buffers - an earlier
 	// bulk-load version of this feature froze the device when all 4 slots
 	// loaded a fresh preset's samples at once.
+	// Plus 2x CombBodyVoice delay lines (kick + snare - the only model here
+	// that needs an actual delay buffer rather than fixed-size DTC state).
 	req.dram = 7 * NT_globals.maxFramesPerStep * sizeof(float)
 		+ AnalysisMaxFrames() * sizeof(float)
-		+ kNumSlots * NT_globals.streamBufferSizeBytes;
+		+ kNumSlots * NT_globals.streamBufferSizeBytes
+		+ 2 * CombBodyVoice::kMaxDelaySamples * sizeof(float);
 	req.itc = 0;
 }
 
@@ -1514,6 +2406,8 @@ _NT_algorithm*	construct( const _NT_algorithmMemoryPtrs& ptrs, const _NT_algorit
 	alg->dtc->openHat.scratch1 = dram; dram += maxFrames;
 	alg->dtc->openHat.scratch2 = dram; dram += maxFrames;
 	alg->elementsExciteScratch = dram; dram += maxFrames;
+	float* kickCombBodyDelay = dram; dram += CombBodyVoice::kMaxDelaySamples;
+	float* snareCombBodyDelay = dram; dram += CombBodyVoice::kMaxDelaySamples;
 
 	alg->analysisMaxFrames = AnalysisMaxFrames();
 	alg->analysisBuffer = dram; dram += alg->analysisMaxFrames;
@@ -1547,8 +2441,8 @@ _NT_algorithm*	construct( const _NT_algorithmMemoryPtrs& ptrs, const _NT_algorit
 	alg->sdCardWasMounted = false;
 	alg->sampleSystemGraceSamples = 0;
 
-	alg->dtc->kick.Init();
-	alg->dtc->snare.Init();
+	alg->dtc->kick.Init( kickCombBodyDelay );
+	alg->dtc->snare.Init( snareCombBodyDelay );
 	alg->dtc->closedHat.Init();
 	alg->dtc->openHat.Init();
 
@@ -1556,6 +2450,10 @@ _NT_algorithm*	construct( const _NT_algorithmMemoryPtrs& ptrs, const _NT_algorit
 	alg->setupSelectedItem = 0;
 	alg->setupEditMode = false;
 	alg->barPageMode = kModSrcNone;
+	alg->eqSculptSelectedSlot = kSlotBD;
+	alg->eqSculptLastPoint = 0;
+	alg->eqDeleteConfirmOpen = false;
+	alg->eqDeleteConfirmChoice = 0;
 	alg->potHasLastPos[0] = alg->potHasLastPos[1] = alg->potHasLastPos[2] = false;
 	alg->potAccum[0] = alg->potAccum[1] = alg->potAccum[2] = 0.0f;
 	alg->smoothersInitialized = false;
@@ -2535,44 +3433,237 @@ static void ApplyWavefolder( float* buf, int numFrames, float amount, int type )
 	}
 }
 
-// Cheap 3-band EQ (see kParamEqLowBD's comment): each band is just its own
-// LP/BP/HP "tap" of the dry signal, scaled by the gain knob and added back
-// on - a classic, cheap shelf/bell-EQ-via-mix trick that needs no true
-// shelf/peak filter topology, and (since all 3 bands sit at fixed
-// frequencies - see _drumVoicePost::Init()) never recomputes filter
-// coefficients per block, only per-block Process() calls. `tapBuf` is
-// scratch space (reused sequentially for each of the up-to-3 bands) - safe
-// to be the same buffer ApplyPost()'s Waveshaper stage used moments ago,
-// since that stage has already finished by the time this runs.
-static void ApplyEq( _drumVoicePost& v, float* buf, float* tapBuf, int numFrames, int lowParam, int midParam, int highParam )
+// Maps an EQ Sculpt Freq1/Freq2 knob value (0..100) to a centre frequency
+// in Hz - quadratic taper from ~60Hz to ~12kHz. Shared by the DSP
+// (ApplyEqSculpt()) and the visualization (DrawEqSculptPage()) so a point's
+// on-screen position always matches what it's actually doing. Callers
+// handle value <= 0 ("point off") separately - this always returns a real
+// (if unused in that case) Hz figure.
+static float EqSculptFreqHz( int value )
 {
-	if ( lowParam != 0 )
+	float t = value * 0.01f;
+	float tt = t * t;
+	return 60.0f + tt * ( 12000.0f - 60.0f );
+}
+
+// Q now varies with frequency instead of a flat 4.0 - a bit wider (lower Q,
+// broader bump) down at the low end, narrowing to a smaller, more surgical
+// width up top - matches how EQ is normally used (broad warmth/mud control
+// low, precise de-harshing/presence work high) and gives the redesigned
+// curve visualization (see DrawEqSculptPage()) a shape that actually
+// varies across the frequency axis instead of a uniform width everywhere.
+// Shares EqSculptFreqHz()'s own taper so a point's drawn width always
+// matches what it's actually doing.
+static float EqSculptQ( int value )
+{
+	float t = value * 0.01f;
+	return 1.5f + t * t * 4.5f;	// ~1.5 (wide) at the low end -> ~6.0 (narrow) at the high end
+}
+
+// EQ Sculpt - 2 user-swept parametric points per voice, each just a
+// bandpass "tap" of the dry signal added back on, scaled by its gain knob
+// (the same additive-EQ trick the earlier fixed-frequency 3-band EQ used -
+// mathematically what a true RBJ peaking filter reduces to for a
+// linear-gain tap; chowdsp_utils' EQBand takes the same state-variable-
+// filter-based approach). freqN <= 0 OR gainN == 0 skips that point's DSP
+// entirely (no Process() call at all) - see kParamEqFreq1BD's "0 = off"
+// spec. The gain==0 half of that check is new: a point can be left with a
+// frequency dialed in but no gain (e.g. mid-experimentation, or after only
+// partially clearing it), which previously still paid the full memcpy +
+// bandpass Process() cost for zero audible effect - "EQ only costs CPU
+// when it's actually doing something" now holds for that case too.
+// Frequency *is* swept live here (unlike the old fixed-band EQ), so -
+// like ApplyPost()'s user-adjustable Filter page - coefficients only
+// recompute when the value actually changes (cachedEqFreq1/2).
+static void ApplyEqSculpt( _drumVoicePost& v, float* buf, float* tapBuf, int numFrames, int freq1, int gain1, int freq2, int gain2 )
+{
+	if ( freq1 > 0 && gain1 != 0 )
 	{
+		if ( freq1 != v.cachedEqFreq1 )
+		{
+			float norm = EqSculptFreqHz( freq1 ) / plaits::kSampleRate;
+			CONSTRAIN( norm, 0.001f, 0.49f );
+			v.eqPoint1Tap.set_f_q<stmlib::FREQUENCY_FAST>( norm, EqSculptQ( freq1 ) );
+			v.cachedEqFreq1 = freq1;
+		}
 		memcpy( tapBuf, buf, numFrames * sizeof(float) );
-		v.eqLowTap.Process<stmlib::FILTER_MODE_LOW_PASS>( tapBuf, tapBuf, numFrames );
-		float t = lowParam * 0.01f;
+		v.eqPoint1Tap.Process<stmlib::FILTER_MODE_BAND_PASS>( tapBuf, tapBuf, numFrames );
+		float t = gain1 * 0.015f;	// -100..100 -> up to +-1.5x tap contribution
 		for ( int i=0; i<numFrames; ++i )
 			buf[i] += t * tapBuf[i];
 	}
-	if ( midParam != 0 )
+	if ( freq2 > 0 && gain2 != 0 )
 	{
+		if ( freq2 != v.cachedEqFreq2 )
+		{
+			float norm = EqSculptFreqHz( freq2 ) / plaits::kSampleRate;
+			CONSTRAIN( norm, 0.001f, 0.49f );
+			v.eqPoint2Tap.set_f_q<stmlib::FREQUENCY_FAST>( norm, EqSculptQ( freq2 ) );
+			v.cachedEqFreq2 = freq2;
+		}
 		memcpy( tapBuf, buf, numFrames * sizeof(float) );
-		v.eqMidTap.Process<stmlib::FILTER_MODE_BAND_PASS>( tapBuf, tapBuf, numFrames );
-		float t = midParam * 0.01f;
-		for ( int i=0; i<numFrames; ++i )
-			buf[i] += t * tapBuf[i];
-	}
-	if ( highParam != 0 )
-	{
-		memcpy( tapBuf, buf, numFrames * sizeof(float) );
-		v.eqHighTap.Process<stmlib::FILTER_MODE_HIGH_PASS>( tapBuf, tapBuf, numFrames );
-		float t = highParam * 0.01f;
+		v.eqPoint2Tap.Process<stmlib::FILTER_MODE_BAND_PASS>( tapBuf, tapBuf, numFrames );
+		float t = gain2 * 0.015f;
 		for ( int i=0; i<numFrames; ++i )
 			buf[i] += t * tapBuf[i];
 	}
 }
 
-static void ApplyPost( _drumVoicePost& v, float* buf, float* dryBuf, int numFrames, int filterParam, int foldParam, int foldType, int eqLowParam, int eqMidParam, int eqHighParam, int compParam, int driveParam, int volParam )
+// Transient shaper - runs in ApplyPost() between EQ Sculpt and Volume
+// (shape the hit's attack/sustain balance once tone-shaping is done, then
+// trim level and compress - the same order real drum-bus channel strips
+// use). `amount` is -100..100, 0 = bypass (matching Filter/Fold/Drive's
+// "0 = no-op" convention); negative softens/de-emphasizes the attack,
+// positive punches it up. `type` selects one of 4 algorithms, each
+// inspired by a different open-source transient shaper, adapted to this
+// project's single bipolar knob-per-voice convention (none of the
+// references exposed just one control) - see kTransientXxx's comment for
+// the source of each.
+static void ApplyTransient( _drumVoicePost& v, float* buf, int numFrames, int amount, int type )
+{
+	if ( amount == 0 )
+		return;
+
+	float depth = amount * 0.01f;	// -1..1
+
+	if ( type == kTransientClassic )
+	{
+		// "Classic" - inspired by johannes-mueller/envolvigo (itself
+		// modeled on hardware transient designers like the SPL Transient
+		// Designer): a fast envelope (quick attack, short release) tracks
+		// momentary peaks, a slow envelope (slow attack+release) tracks
+		// the trailing average; their ratio is >1 right at a transient and
+		// ~1 during sustain. Raising that ratio to a depth-scaled power
+		// (powf() is confirmed to resolve on this firmware - see
+		// distingnt_libm_symbol_constraints project memory) gives a
+		// multiplicative gain that's boosted at transients and neutral
+		// during sustain (or the reverse, for negative depth).
+		constexpr float kFastAttack = 0.6f;
+		constexpr float kFastRelease = 0.05f;
+		constexpr float kSlowCoeff = 0.003f;
+		float exponent = depth * 2.5f;
+		float fastEnv = v.transFastEnv;
+		float slowEnv = v.transSlowEnv;
+		for ( int i=0; i<numFrames; ++i )
+		{
+			float absIn = fabsf( buf[i] );
+			float fastCoeff = absIn > fastEnv ? kFastAttack : kFastRelease;
+			fastEnv += ( absIn - fastEnv ) * fastCoeff;
+			slowEnv += ( absIn - slowEnv ) * kSlowCoeff;
+			float ratio = fastEnv / ( slowEnv + 0.001f );
+			CONSTRAIN( ratio, 0.05f, 8.0f );
+			float gain = powf( ratio, exponent );
+			CONSTRAIN( gain, 0.1f, 4.0f );
+			buf[i] *= gain;
+		}
+		v.transFastEnv = fastEnv;
+		v.transSlowEnv = slowEnv;
+	}
+	else if ( type == kTransientSnap )
+	{
+		// "Snap" - inspired by lowwavestudios/DrumSnapper: rather than
+		// multiplying the whole signal by a gain, this adds an exponential
+		// enhancement term *on top of* the untouched dry signal
+		// (out = dry + (ratio^depth - 1)*dry*2), so sustained/steady
+		// portions (ratio~1) are left essentially untouched while
+		// transients get an emphasized boost (or, for negative depth, a
+		// dip) layered in - a more surgical character than Classic's
+		// straight multiply.
+		constexpr float kFastAttack = 0.8f;
+		constexpr float kFastRelease = 0.08f;
+		constexpr float kSlowCoeff = 0.004f;
+		float exponent = depth * 2.0f;
+		float fastEnv = v.transFastEnv;
+		float slowEnv = v.transSlowEnv;
+		for ( int i=0; i<numFrames; ++i )
+		{
+			float absIn = fabsf( buf[i] );
+			float fastCoeff = absIn > fastEnv ? kFastAttack : kFastRelease;
+			fastEnv += ( absIn - fastEnv ) * fastCoeff;
+			slowEnv += ( absIn - slowEnv ) * kSlowCoeff;
+			float ratio = fastEnv / ( slowEnv + 0.001f );
+			CONSTRAIN( ratio, 0.05f, 8.0f );
+			float enhance = ( powf( ratio, exponent ) - 1.0f ) * 2.0f;
+			CONSTRAIN( enhance, -3.0f, 3.0f );
+			buf[i] += enhance * buf[i];
+		}
+		v.transFastEnv = fastEnv;
+		v.transSlowEnv = slowEnv;
+	}
+	else if ( type == kTransientGate )
+	{
+		// "Gate" - inspired by ylmrx/transdes: a slope/derivative threshold
+		// detector (not a continuous envelope ratio) - when the sample-to-
+		// sample level jump exceeds a fixed sensitivity, a hold window
+		// opens for a fixed ~12ms, during which depth's gain applies at
+		// full strength; outside it, gain relaxes back to unity over a
+		// fixed release. Gives a distinctly on/off, "snappy trigger"
+		// character rather than the other models' continuous shaping.
+		constexpr float kThreshold = 0.02f;
+		constexpr int kHoldSamples = 576;	// ~12ms @ 48kHz
+		constexpr float kReleaseCoeff = 0.01f;
+		float targetGain = 1.0f + depth * 3.0f;
+		CONSTRAIN( targetGain, 0.05f, 4.0f );
+		float prevAbs = v.transGatePrevAbs;
+		float gain = 1.0f;
+		int holdSamples = v.transGateHoldSamples;
+		for ( int i=0; i<numFrames; ++i )
+		{
+			float absIn = fabsf( buf[i] );
+			if ( absIn - prevAbs > kThreshold )
+				holdSamples = kHoldSamples;
+			prevAbs = absIn;
+
+			if ( holdSamples > 0 )
+			{
+				gain = targetGain;
+				--holdSamples;
+			}
+			else
+			{
+				gain += ( 1.0f - gain ) * kReleaseCoeff;
+			}
+			buf[i] *= gain;
+		}
+		v.transGatePrevAbs = prevAbs;
+		v.transGateHoldSamples = holdSamples;
+	}
+	else
+	{
+		// "Band" - inspired by unicornsasfuel/whetstone: split into a fixed
+		// "active" band (a bandpass tap covering the ~150Hz-2.5kHz range
+		// most drum transient "knock" energy sits in, see
+		// transBandFilter's Init()) and everything else (the untouched
+		// remainder, buf - active); a fast/slow envelope comparison picks
+		// attack (rising) vs sustain (falling) within just that band,
+		// applies depth as attack boost/sustain cut (or the reverse), then
+		// the shaped active band is added back to the untouched remainder -
+		// content outside the band is never touched at all, unlike the
+		// other 3 (broadband) models.
+		constexpr float kFastCoeff = 0.5f;
+		constexpr float kSlowCoeff = 0.02f;
+		float attackGain = 1.0f + depth * 2.0f;
+		float sustainGain = 1.0f - depth * 2.0f;
+		CONSTRAIN( attackGain, 0.1f, 4.0f );
+		CONSTRAIN( sustainGain, 0.1f, 4.0f );
+		float fastEnv = v.transBandFastEnv;
+		float slowEnv = v.transBandSlowEnv;
+		for ( int i=0; i<numFrames; ++i )
+		{
+			float active = v.transBandFilter.Process<stmlib::FILTER_MODE_BAND_PASS>( buf[i] );
+			float passive = buf[i] - active;
+			float absIn = fabsf( active );
+			fastEnv += ( absIn - fastEnv ) * kFastCoeff;
+			slowEnv += ( fastEnv - slowEnv ) * kSlowCoeff;
+			float gain = ( fastEnv > slowEnv ) ? attackGain : sustainGain;
+			buf[i] = passive + active * gain;
+		}
+		v.transBandFastEnv = fastEnv;
+		v.transBandSlowEnv = slowEnv;
+	}
+}
+
+static void ApplyPost( _drumVoicePost& v, float* buf, float* dryBuf, int numFrames, int filterParam, int foldParam, int foldType, int eqFreq1, int eqGain1, int eqFreq2, int eqGain2, int transAmount, int transType, int compParam, int driveParam, int volParam )
 {
 	if ( filterParam < 0 )
 	{
@@ -2640,10 +3731,9 @@ static void ApplyPost( _drumVoicePost& v, float* buf, float* dryBuf, int numFram
 		}
 	}
 
-	// TEMPORARILY DISABLED for A/B testing whether the EQ or the fixed
-	// cleanup filter (below) is behind a reported sound-quality regression -
-	// re-enable by uncommenting once the culprit's confirmed.
-	// ApplyEq( v, buf, dryBuf, numFrames, eqLowParam, eqMidParam, eqHighParam );
+	ApplyEqSculpt( v, buf, dryBuf, numFrames, eqFreq1, eqGain1, eqFreq2, eqGain2 );
+
+	ApplyTransient( v, buf, numFrames, transAmount, transType );
 
 	float vol = volParam * 0.01f;
 	for ( int i=0; i<numFrames; ++i )
@@ -2651,11 +3741,10 @@ static void ApplyPost( _drumVoicePost& v, float* buf, float* dryBuf, int numFram
 
 	ApplyCompressor( v, buf, numFrames, compParam );
 
-	// TEMPORARILY DISABLED alongside ApplyEq() above, for A/B testing a
-	// reported sound-quality regression - re-enable both once the culprit's
-	// confirmed.
-	// v.cleanupHp.Process<stmlib::FILTER_MODE_HIGH_PASS>( buf, buf, numFrames );
-	// v.cleanupLp.Process<stmlib::FILTER_MODE_LOW_PASS>( buf, buf, numFrames );
+	// Fixed cleanup filter, always on, no user control - see
+	// _drumVoicePost::cleanupHp's comment. Runs last so it catches whatever
+	// the synth, sample layer, Wavefolder, and Waveshaper all fed into it.
+	v.cleanupHp.Process<stmlib::FILTER_MODE_HIGH_PASS>( buf, buf, numFrames );
 }
 
 // Writes a voice's rendered mono buffer to its output bus(es). In Stereo
@@ -2996,7 +4085,7 @@ static void ProcessKick( _drumMachineAlgorithm* pThis, float* busFrames, int num
 		v.peaksBass.Process( trig, accent, scratch, numFrames );
 		for ( int i=0; i<numFrames; ++i ) scratch[i] *= accent;
 	}
-	else
+	else if ( pThis->v[kParamModelBD] == 4 )
 	{
 		// Sine-FM drum (Peaks FmDrum, "similar to the BD/SD in Anushri") -
 		// FM knob finally drives a literal FM-amount parameter; Character
@@ -3007,6 +4096,48 @@ static void ProcessKick( _drumMachineAlgorithm* pThis, float* busFrames, int num
 		v.peaksFm.set_fm_amount( (uint16_t)( fm * 65535.0f ) );
 		v.peaksFm.set_noise( (uint16_t)( character * 65535.0f ) );
 		v.peaksFm.Process( trig, kMidiNoteFreq, plaits::kSampleRate, scratch, numFrames );
+		for ( int i=0; i<numFrames; ++i ) scratch[i] *= accent;
+	}
+	else if ( pThis->v[kParamModelBD] == 5 )
+	{
+		// ChowKick-style saturating resonant kick (see ChowKickVoice) -
+		// Character drives the resonant filter's saturation drive (0 =
+		// clean, higher = grittier); Tone drives the output lowpass; FM is
+		// a no-op here (this model's character comes from the resonant
+		// filter's own saturation, not a pitch-knock).
+		v.chowKick.Render( trig, f0, decay, character, tone, scratch, numFrames );
+		for ( int i=0; i<numFrames; ++i ) scratch[i] *= accent;
+	}
+	else if ( pThis->v[kParamModelBD] == 6 )
+	{
+		// 808 Decel Kick (see Decel808Voice) - Character drives click/drive
+		// saturation amount; Tone drives output brightness; FM makes the
+		// deceleration's starting pitch (the knock) bigger.
+		v.decel808.Render( trig, f0, decay, character, tone, fmKnock, scratch, numFrames );
+		for ( int i=0; i<numFrames; ++i ) scratch[i] *= accent;
+	}
+	else if ( pThis->v[kParamModelBD] == 7 )
+	{
+		// Comb Body (see CombBodyVoice) - a delay-line/Karplus-Strong-adjacent
+		// pluck rather than a filter-resonator model. Character drives the
+		// in-loop damping brightness; Tone drives excitation brightness; FM
+		// briefly shortens the delay (a pitch-bend-down knock, same external-
+		// push convention as Elements/Modal).
+		float fmPush = ComputeExternalFmPush( v, trig, accent, fmMode, blockSeconds );
+		float modulatedF0 = f0 * ( 1.0f + fmPush * fm * 1.5f );
+		CONSTRAIN( modulatedF0, 0.001f, 0.49f );
+		v.combBody.Render( trig, modulatedF0, decay, character, tone, scratch, numFrames );
+		for ( int i=0; i<numFrames; ++i ) scratch[i] *= accent;
+		UpdateFmFeedback( v, scratch, numFrames );
+	}
+	else
+	{
+		// Chaos FM (see ChaosFmVoice) - Character drives the self-referential
+		// feedback amount (0 = stable 2:1 FM pair, higher = increasingly
+		// evolving/unpredictable); Tone drives the base carrier:modulator
+		// ratio; FM adds a dedicated attack knock (previously this model had
+		// no distinct attack transient at all).
+		v.chaosFm.Render( trig, f0, decay, character, tone, fmKnock, scratch, numFrames );
 		for ( int i=0; i<numFrames; ++i ) scratch[i] *= accent;
 	}
 
@@ -3022,7 +4153,7 @@ static void ProcessKick( _drumMachineAlgorithm* pThis, float* busFrames, int num
 	CONSTRAIN( compParam, 0, 100 );
 	CONSTRAIN( driveParam, 0, 100 );
 	CONSTRAIN( volParam, 0, 200 );
-	ApplyPost( v, scratch, pThis->dryScratch, numFrames, filtParam, foldParam, pThis->v[kParamFoldTypeBD], pThis->v[kParamEqLowBD], pThis->v[kParamEqMidBD], pThis->v[kParamEqHighBD], compParam, driveParam, volParam );
+	ApplyPost( v, scratch, pThis->dryScratch, numFrames, filtParam, foldParam, pThis->v[kParamFoldTypeBD], pThis->v[kParamEqFreq1BD], pThis->v[kParamEqGain1BD], pThis->v[kParamEqFreq2BD], pThis->v[kParamEqGain2BD], pThis->v[kParamTransBD], pThis->v[kParamTransTypeBD], compParam, driveParam, volParam );
 
 	v.samplesUntilIdle -= numFrames;
 	if ( v.samplesUntilIdle < 0 ) v.samplesUntilIdle = 0;
@@ -3108,7 +4239,7 @@ static void ProcessSnare( _drumMachineAlgorithm* pThis, float* busFrames, int nu
 		v.peaksSnare.Process( trig, scratch, numFrames );
 		for ( int i=0; i<numFrames; ++i ) scratch[i] *= accent;
 	}
-	else
+	else if ( pThis->v[kParamModelSD] == 4 )
 	{
 		// Sine-FM drum (Peaks FmDrum) - same as the BD FM model, its own
 		// per-voice instance so BD/SD's self-FM sweeps never interact.
@@ -3117,6 +4248,45 @@ static void ProcessSnare( _drumMachineAlgorithm* pThis, float* busFrames, int nu
 		v.peaksFm.set_fm_amount( (uint16_t)( fm * 65535.0f ) );
 		v.peaksFm.set_noise( (uint16_t)( character * 65535.0f ) );
 		v.peaksFm.Process( trig, kMidiNoteFreq, plaits::kSampleRate, scratch, numFrames );
+		for ( int i=0; i<numFrames; ++i ) scratch[i] *= accent;
+	}
+	else if ( pThis->v[kParamModelSD] == 5 )
+	{
+		// ChowKick-style saturating resonant snare (see ChowKickVoice,
+		// shared with BD) - same mapping as the BD version: Character
+		// drives saturation drive, Tone drives output brightness.
+		v.chowKick.Render( trig, f0, decay, character, tone, scratch, numFrames );
+		for ( int i=0; i<numFrames; ++i ) scratch[i] *= accent;
+	}
+	else if ( pThis->v[kParamModelSD] == 6 )
+	{
+		// Clap (see ClapVoice) - Character drives the bandpass centre
+		// frequency (the classic ~0.9-2.1kHz clap sweet spot); Tone drives
+		// the bandpass Q; FM briefly pushes the centre frequency up for a
+		// sharper attack chirp; Pitch is a no-op (a clap has no meaningful
+		// fundamental pitch).
+		float fmPush = ComputeExternalFmPush( v, trig, accent, fmMode, blockSeconds );
+		v.clap.Render( trig, accent, decay, character, tone, fmPush * fm, scratch, numFrames );
+		UpdateFmFeedback( v, scratch, numFrames );
+	}
+	else if ( pThis->v[kParamModelSD] == 7 )
+	{
+		// Comb Body (see CombBodyVoice, shared design with BD) - Character
+		// drives in-loop damping brightness; Tone drives excitation
+		// brightness; FM briefly shortens the delay (pitch-bend knock).
+		float fmPush = ComputeExternalFmPush( v, trig, accent, fmMode, blockSeconds );
+		float modulatedF0 = f0 * ( 1.0f + fmPush * fm * 1.5f );
+		CONSTRAIN( modulatedF0, 0.001f, 0.49f );
+		v.combBody.Render( trig, modulatedF0, decay, character, tone, scratch, numFrames );
+		for ( int i=0; i<numFrames; ++i ) scratch[i] *= accent;
+		UpdateFmFeedback( v, scratch, numFrames );
+	}
+	else
+	{
+		// Chaos FM (see ChaosFmVoice, shared design with BD) - Character
+		// drives the self-referential feedback amount; Tone drives the base
+		// carrier:modulator ratio; FM adds a dedicated attack knock.
+		v.chaosFm.Render( trig, f0, decay, character, tone, fmKnock, scratch, numFrames );
 		for ( int i=0; i<numFrames; ++i ) scratch[i] *= accent;
 	}
 
@@ -3132,7 +4302,7 @@ static void ProcessSnare( _drumMachineAlgorithm* pThis, float* busFrames, int nu
 	CONSTRAIN( compParam, 0, 100 );
 	CONSTRAIN( driveParam, 0, 100 );
 	CONSTRAIN( volParam, 0, 200 );
-	ApplyPost( v, scratch, pThis->dryScratch, numFrames, filtParam, foldParam, pThis->v[kParamFoldTypeSD], pThis->v[kParamEqLowSD], pThis->v[kParamEqMidSD], pThis->v[kParamEqHighSD], compParam, driveParam, volParam );
+	ApplyPost( v, scratch, pThis->dryScratch, numFrames, filtParam, foldParam, pThis->v[kParamFoldTypeSD], pThis->v[kParamEqFreq1SD], pThis->v[kParamEqGain1SD], pThis->v[kParamEqFreq2SD], pThis->v[kParamEqGain2SD], pThis->v[kParamTransSD], pThis->v[kParamTransTypeSD], compParam, driveParam, volParam );
 
 	v.samplesUntilIdle -= numFrames;
 	if ( v.samplesUntilIdle < 0 ) v.samplesUntilIdle = 0;
@@ -3152,9 +4322,12 @@ static void ProcessHat( _drumMachineAlgorithm* pThis, float* busFrames, int numF
 	int filtParamIdx = isOpen ? kParamFiltOH : kParamFiltCH;
 	int foldParamIdx = isOpen ? kParamFoldOH : kParamFoldCH;
 	int foldTypeParamIdx = isOpen ? kParamFoldTypeOH : kParamFoldTypeCH;
-	int eqLowParamIdx = isOpen ? kParamEqLowOH : kParamEqLowCH;
-	int eqMidParamIdx = isOpen ? kParamEqMidOH : kParamEqMidCH;
-	int eqHighParamIdx = isOpen ? kParamEqHighOH : kParamEqHighCH;
+	int eqFreq1ParamIdx = isOpen ? kParamEqFreq1OH : kParamEqFreq1CH;
+	int eqGain1ParamIdx = isOpen ? kParamEqGain1OH : kParamEqGain1CH;
+	int eqFreq2ParamIdx = isOpen ? kParamEqFreq2OH : kParamEqFreq2CH;
+	int eqGain2ParamIdx = isOpen ? kParamEqGain2OH : kParamEqGain2CH;
+	int transParamIdx = isOpen ? kParamTransOH : kParamTransCH;
+	int transTypeParamIdx = isOpen ? kParamTransTypeOH : kParamTransTypeCH;
 	int compParamIdx = isOpen ? kParamCompOH : kParamCompCH;
 	int driveParamIdx = isOpen ? kParamDriveOH : kParamDriveCH;
 	int volParamIdx = isOpen ? kParamVolOH : kParamVolCH;
@@ -3224,7 +4397,7 @@ static void ProcessHat( _drumMachineAlgorithm* pThis, float* busFrames, int numF
 		RenderElements( v.elementsExciter, v.elementsResonator, pThis->elementsExciteScratch, trig, accent, modulatedF0, tone, decay, noisiness, scratch, numFrames );
 		UpdateFmFeedback( v, scratch, numFrames );
 	}
-	else
+	else if ( pThis->v[modelParamIdx] == 2 )
 	{
 		// Braids' cymbal/hi-hat model has no envelope of its own (a
 		// continuously-running metallic/noise texture - see
@@ -3258,6 +4431,51 @@ static void ProcessHat( _drumMachineAlgorithm* pThis, float* busFrames, int numF
 		for ( int i=0; i<numFrames; ++i ) scratch[i] *= amp;
 		UpdateFmFeedback( v, scratch, numFrames );
 	}
+	else if ( pThis->v[modelParamIdx] == 3 )
+	{
+		// Modal synthesis (see ModalHatVoice) - Tone controls how many of
+		// the higher inharmonic modes are engaged (brightness); Character
+		// controls each mode's Q/resonance sharpness (ringy vs damped).
+		float fmPush = ComputeExternalFmPush( v, trig, accent, fmMode, blockSeconds );
+		float modulatedF0 = f0 * ( 1.0f + fmPush * fm * 1.5f );
+		CONSTRAIN( modulatedF0, 0.001f, 0.49f );
+		v.modal.Render( trig, accent, modulatedF0, decay, tone, noisiness, scratch, numFrames );
+		UpdateFmFeedback( v, scratch, numFrames );
+	}
+	else if ( pThis->v[modelParamIdx] == 4 )
+	{
+		// Shaker (see ShakerVoice, PhISEM-inspired) - Tone drives the
+		// resonant filter's Q (sharper = more "rattly" tonal centre);
+		// Character drives grain density (higher = faster, busier); FM
+		// briefly pushes the resonant filter's centre frequency up.
+		float fmPush = ComputeExternalFmPush( v, trig, accent, fmMode, blockSeconds );
+		float modulatedF0 = f0 * ( 1.0f + fmPush * fm * 1.5f );
+		CONSTRAIN( modulatedF0, 0.001f, 0.49f );
+		v.shaker.Render( trig, accent, modulatedF0, decay, tone, noisiness, scratch, numFrames );
+		UpdateFmFeedback( v, scratch, numFrames );
+	}
+	else if ( pThis->v[modelParamIdx] == 5 )
+	{
+		// Sweep Hat (see SweepHatVoice) - Tone sets the narrowed filter
+		// band's resting point once the HP/LP sweep closes in; Character
+		// drives HP/LP resonance (sharper/whistlier sweep); FM pushes the
+		// sweep's starting HP frequency higher for a sharper opening
+		// transient.
+		float fmPush = ComputeExternalFmPush( v, trig, accent, fmMode, blockSeconds );
+		v.sweepHat.Render( trig, accent, f0, decay, tone, noisiness, fmPush * fm, scratch, numFrames, blockSeconds );
+		UpdateFmFeedback( v, scratch, numFrames );
+	}
+	else
+	{
+		// Ring-Mod Metal (see RingModMetalVoice) - Character drives the
+		// ring-mod ratio (higher = more inharmonic/clangy); Tone drives the
+		// highpass cutoff; FM briefly pushes pitch up for extra clang.
+		float fmPush = ComputeExternalFmPush( v, trig, accent, fmMode, blockSeconds );
+		float modulatedF0 = f0 * ( 1.0f + fmPush * fm * 1.5f );
+		CONSTRAIN( modulatedF0, 0.001f, 0.49f );
+		v.ringModMetal.Render( trig, accent, modulatedF0, decay, noisiness, tone, scratch, numFrames );
+		UpdateFmFeedback( v, scratch, numFrames );
+	}
 
 	MixSampleLayer( pThis, v, slot, trig, accent, decay, blockSeconds, scratch, numFrames );
 
@@ -3271,7 +4489,7 @@ static void ProcessHat( _drumMachineAlgorithm* pThis, float* busFrames, int numF
 	CONSTRAIN( compParam, 0, 100 );
 	CONSTRAIN( driveParam, 0, 100 );
 	CONSTRAIN( volParam, 0, 200 );
-	ApplyPost( v, scratch, pThis->dryScratch, numFrames, filtParam, foldParam, pThis->v[foldTypeParamIdx], pThis->v[eqLowParamIdx], pThis->v[eqMidParamIdx], pThis->v[eqHighParamIdx], compParam, driveParam, volParam );
+	ApplyPost( v, scratch, pThis->dryScratch, numFrames, filtParam, foldParam, pThis->v[foldTypeParamIdx], pThis->v[eqFreq1ParamIdx], pThis->v[eqGain1ParamIdx], pThis->v[eqFreq2ParamIdx], pThis->v[eqGain2ParamIdx], pThis->v[transParamIdx], pThis->v[transTypeParamIdx], compParam, driveParam, volParam );
 
 	v.samplesUntilIdle -= numFrames;
 	if ( v.samplesUntilIdle < 0 ) v.samplesUntilIdle = 0;
@@ -3675,6 +4893,36 @@ void	customUi( _NT_algorithm* self, const _NT_uiData& data )
 		return;	// delete-confirm dialog owns every claimed control while it's open
 	}
 
+	if ( pThis->eqDeleteConfirmOpen )
+	{
+		// Same interaction idiom as the generic deleteConfirmOpen dialog
+		// (Mod Matrix route deletion) - rotate Encoder R to switch the
+		// choice, push to confirm - but a separate dialog/flag since this
+		// one clears an EQ Sculpt point's Freq+Gain, not a Mod Matrix route.
+		if ( data.encoders[1] != 0 )
+			pThis->eqDeleteConfirmChoice = pThis->eqDeleteConfirmChoice == 0 ? 1 : 0;
+		if ( ( data.controls & kNT_encoderButtonR ) && !( data.lastButtons & kNT_encoderButtonR ) )
+		{
+			if ( pThis->eqDeleteConfirmChoice == 1 )
+			{
+				static const int kEqFreqParam[2][kNumSlots] = {
+					{ kParamEqFreq1BD, kParamEqFreq1SD, kParamEqFreq1CH, kParamEqFreq1OH },
+					{ kParamEqFreq2BD, kParamEqFreq2SD, kParamEqFreq2CH, kParamEqFreq2OH },
+				};
+				static const int kEqGainParam[2][kNumSlots] = {
+					{ kParamEqGain1BD, kParamEqGain1SD, kParamEqGain1CH, kParamEqGain1OH },
+					{ kParamEqGain2BD, kParamEqGain2SD, kParamEqGain2CH, kParamEqGain2OH },
+				};
+				int slot = pThis->eqSculptSelectedSlot;
+				int point = pThis->eqSculptLastPoint;
+				SetParam( pThis, kEqFreqParam[point][slot], 0 );
+				SetParam( pThis, kEqGainParam[point][slot], 0 );
+			}
+			pThis->eqDeleteConfirmOpen = false;
+		}
+		return;	// delete-confirm dialog owns every claimed control while it's open
+	}
+
 	if ( data.encoders[0] != 0 )
 	{
 		pThis->currentPage += data.encoders[0];
@@ -3683,11 +4931,72 @@ void	customUi( _NT_algorithm* self, const _NT_uiData& data )
 		pThis->setupSelectedItem = 0;
 		pThis->setupEditMode = false;
 		pThis->barPageMode = kModSrcNone;
+		pThis->eqSculptSelectedSlot = kSlotBD;
+		pThis->eqSculptLastPoint = 0;
 		pThis->potHasLastPos[0] = pThis->potHasLastPos[1] = pThis->potHasLastPos[2] = false;
 	pThis->potAccum[0] = pThis->potAccum[1] = pThis->potAccum[2] = 0.0f;
 	}
 
-	if ( kPageType[pThis->currentPage] == kPageTypeList )
+	if ( kPageType[pThis->currentPage] == kPageTypeEqSculpt )
+	{
+		// EQ Sculpt's control scheme is nothing like every other bar page's
+		// "4 controls, one per slot" layout - see kPageTypeEqSculpt's
+		// comment. Pot L selects which slot the other controls act on (and
+		// its click opens the delete-point confirm dialog above); Pot C/
+		// Pot R sweep that slot's point 1/point 2 frequency; Encoder R
+		// edits whichever point's frequency pot was most recently actually
+		// turned (eqSculptLastPoint), so one encoder can cover both points'
+		// gain within a 4-control budget.
+		static const int kEqFreq1Param[kNumSlots] = { kParamEqFreq1BD, kParamEqFreq1SD, kParamEqFreq1CH, kParamEqFreq1OH };
+		static const int kEqGain1Param[kNumSlots] = { kParamEqGain1BD, kParamEqGain1SD, kParamEqGain1CH, kParamEqGain1OH };
+		static const int kEqFreq2Param[kNumSlots] = { kParamEqFreq2BD, kParamEqFreq2SD, kParamEqFreq2CH, kParamEqFreq2OH };
+		static const int kEqGain2Param[kNumSlots] = { kParamEqGain2BD, kParamEqGain2SD, kParamEqGain2CH, kParamEqGain2OH };
+
+		if ( data.controls & kNT_potL )
+		{
+			int newSlot;
+			if ( PotRelativeUpdate( pThis, 0, data.pots[0], 0, kNumSlots - 1, pThis->eqSculptSelectedSlot, &newSlot ) )
+			{
+				CONSTRAIN( newSlot, 0, kNumSlots - 1 );
+				pThis->eqSculptSelectedSlot = newSlot;
+				pThis->eqSculptLastPoint = 0;
+			}
+		}
+		if ( ( data.controls & kNT_potButtonL ) && !( data.lastButtons & kNT_potButtonL ) )
+		{
+			pThis->eqDeleteConfirmOpen = true;
+			pThis->eqDeleteConfirmChoice = 0;	// default No - never accidentally delete
+		}
+
+		int slot = pThis->eqSculptSelectedSlot;
+
+		if ( data.controls & kNT_potC )
+		{
+			int newValue;
+			if ( PotRelativeUpdate( pThis, 1, data.pots[1], 0, 100, pThis->v[ kEqFreq1Param[slot] ], &newValue ) )
+			{
+				SetParam( pThis, kEqFreq1Param[slot], newValue );
+				pThis->eqSculptLastPoint = 0;
+			}
+		}
+		if ( data.controls & kNT_potR )
+		{
+			int newValue;
+			if ( PotRelativeUpdate( pThis, 2, data.pots[2], 0, 100, pThis->v[ kEqFreq2Param[slot] ], &newValue ) )
+			{
+				SetParam( pThis, kEqFreq2Param[slot], newValue );
+				pThis->eqSculptLastPoint = 1;
+			}
+		}
+		if ( data.encoders[1] != 0 )
+		{
+			int gainParam = ( pThis->eqSculptLastPoint == 0 ) ? kEqGain1Param[slot] : kEqGain2Param[slot];
+			int newValue = pThis->v[gainParam] + data.encoders[1];
+			CONSTRAIN( newValue, -100, 100 );
+			SetParam( pThis, gainParam, newValue );
+		}
+	}
+	else if ( kPageType[pThis->currentPage] == kPageTypeList )
 	{
 		// List-style page (Routing/MIDI/Mod Matrix): rotate Encoder R to
 		// scroll while browsing, push to enter edit mode (rotate now adjusts
@@ -4223,6 +5532,162 @@ static void DrawDeleteConfirm( _drumMachineAlgorithm* pThis )
 	NT_drawText( 128, 36, msg, 8, kNT_textCentre, kNT_textTiny );
 }
 
+// Same Yes/No confirm idiom as DrawDeleteConfirm() (Mod Matrix route
+// deletion), for eqDeleteConfirmOpen (EQ Sculpt point deletion) instead -
+// separate dialog since the two clear different things.
+static void DrawEqDeleteConfirm( _drumMachineAlgorithm* pThis )
+{
+	DrawHeader( "DELETE EQ POINT?", NULL );
+	NT_drawText( 100, 24, "NO", pThis->eqDeleteConfirmChoice == 0 ? 15 : 5, kNT_textCentre, kNT_textNormal );
+	NT_drawText( 156, 24, "YES", pThis->eqDeleteConfirmChoice == 1 ? 15 : 5, kNT_textCentre, kNT_textNormal );
+
+	char msg[16];
+	strcpy( msg, kSlotNames[ pThis->eqSculptSelectedSlot ] );
+	strcat( msg, pThis->eqSculptLastPoint == 0 ? " PT1" : " PT2" );
+	NT_drawText( 128, 36, msg, 8, kNT_textCentre, kNT_textTiny );
+}
+
+// EQ Sculpt: a band visualization shared by all 4 slots at once, rather
+// than one bar-page-per-slot like every other page - see kPageTypeEqSculpt
+// and customUi()'s matching control-handling branch for the full design.
+// BD/SD/CH/OH are printed in a row (selected slot bright, others dim -
+// same convention as the dots/labels elsewhere in this file), and every
+// slot's active EQ points are drawn simultaneously, layered on the same
+// flat reference line, so you can see how all 4 voices' carved-out
+// frequencies relate to each other - the whole point of doing this as one
+// shared visualization instead of 4 separate pages. Each slot's points are
+// now drawn as an actual curve (not just a marker dot) whose width reflects
+// EqSculptQ() - matches what ApplyEqSculpt() is actually doing far better
+// than a bare point ever could.
+static void DrawEqSculptPage( _drumMachineAlgorithm* pThis )
+{
+	DrawHeader( "EQ SCULPT" );
+
+	static const int kEqFreq1Param[kNumSlots] = { kParamEqFreq1BD, kParamEqFreq1SD, kParamEqFreq1CH, kParamEqFreq1OH };
+	static const int kEqGain1Param[kNumSlots] = { kParamEqGain1BD, kParamEqGain1SD, kParamEqGain1CH, kParamEqGain1OH };
+	static const int kEqFreq2Param[kNumSlots] = { kParamEqFreq2BD, kParamEqFreq2SD, kParamEqFreq2CH, kParamEqFreq2OH };
+	static const int kEqGain2Param[kNumSlots] = { kParamEqGain2BD, kParamEqGain2SD, kParamEqGain2CH, kParamEqGain2OH };
+
+	constexpr int kLabelY = kHeaderDividerY + 10;
+	constexpr int kLabelSpacing = 40;
+	for ( int slot=0; slot<kNumSlots; ++slot )
+	{
+		int colour = ( slot == pThis->eqSculptSelectedSlot ) ? 15 : 6;
+		NT_drawText( 8 + slot * kLabelSpacing, kLabelY, kSlotNames[slot], colour, kNT_textLeft, kNT_textTiny );
+	}
+
+	constexpr int x0 = 8;
+	constexpr int x1 = 248;
+	constexpr int midY = 32;
+	constexpr int kGainRangePx = 14;	// max +-14px marker offset at +-100 gain
+	NT_drawShapeI( kNT_line, x0, midY, x1, midY, 4 );
+
+	// Same quadratic taper as EqSculptFreqHz() (0..100 -> ~60Hz..~12kHz),
+	// just mapped to screen X instead of Hz - keeps a point's on-screen
+	// position consistent with what it's actually doing to the sound.
+	auto freqToX = [&]( int value )
+	{
+		float t = value * 0.01f;
+		float tt = t * t;
+		return x0 + (int)( tt * ( x1 - x0 ) );
+	};
+	auto gainToY = [&]( int gain )
+	{
+		float t = gain * 0.01f;
+		return midY - (int)( t * kGainRangePx );
+	};
+	// Inverse of freqToX/EqSculptFreqHz (Hz -> screen X), for the frequency
+	// axis labels below - sqrtf() is always safe on this firmware (FPU-
+	// inlined, never a real libm call - see distingnt_libm_symbol_constraints
+	// project memory), unlike the transcendental calls (exp/log) a true
+	// Gaussian shape would need, which is why bumpAt() below uses a
+	// rational falloff instead.
+	auto hzToX = [&]( float hz )
+	{
+		float t = sqrtf( ( hz - 60.0f ) / ( 12000.0f - 60.0f ) );
+		CONSTRAIN( t, 0.0f, 1.0f );
+		return x0 + (int)( t * ( x1 - x0 ) );
+	};
+	// Cheap, libm-free "bell" shape for one EQ point's contribution at
+	// screen column `px` - a rational (Cauchy/Lorentzian-like) falloff
+	// rather than a literal Gaussian (would need expf, unconfirmed on this
+	// firmware), but reads just as smoothly at this display's resolution;
+	// width scales inversely with Q, matching EqSculptQ()'s own low-Q-at-
+	// low-freq/high-Q-at-high-freq shape so wider dialed-in points really
+	// do draw wider. Returns 0 for an inactive point (freq<=0 or gain==0),
+	// same "off" gate as ApplyEqSculpt().
+	auto bumpAt = [&]( int freqValue, int gain, int px ) -> float
+	{
+		if ( freqValue <= 0 || gain == 0 )
+			return 0.0f;
+		float q = EqSculptQ( freqValue );
+		float centreX = (float)freqToX( freqValue );
+		float dx = (float)px - centreX;
+		float widthPx = ( x1 - x0 ) * 0.12f / q;
+		float n = dx / widthPx;
+		return gain * kGainRangePx * 0.01f / ( 1.0f + n * n );
+	};
+
+	for ( int slot=0; slot<kNumSlots; ++slot )
+	{
+		bool selected = ( slot == pThis->eqSculptSelectedSlot );
+		int colour = selected ? 15 : 6;
+		int dotR = selected ? 2 : 1;
+
+		int freq1 = pThis->v[ kEqFreq1Param[slot] ];
+		int gain1 = pThis->v[ kEqGain1Param[slot] ];
+		int freq2 = pThis->v[ kEqFreq2Param[slot] ];
+		int gain2 = pThis->v[ kEqGain2Param[slot] ];
+		if ( freq1 <= 0 && freq2 <= 0 )
+			continue;	// nothing dialed in for this slot at all - no curve to draw
+
+		constexpr int kStep = 3;	// coarse enough to keep the per-frame draw-call count sane on a 240px-wide curve
+		int prevX = x0;
+		int prevY = midY - (int)( bumpAt( freq1, gain1, x0 ) + bumpAt( freq2, gain2, x0 ) );
+		for ( int px=x0+kStep; px<=x1; px+=kStep )
+		{
+			int py = midY - (int)( bumpAt( freq1, gain1, px ) + bumpAt( freq2, gain2, px ) );
+			NT_drawShapeI( kNT_line, prevX, prevY, px, py, colour );
+			prevX = px;
+			prevY = py;
+		}
+
+		// Precise markers on top of the curve for each dialed-in point
+		// (still shown even at gain=0, sitting right on the baseline, so a
+		// frequency that's set but not yet given any gain is still visible
+		// and adjustable rather than looking like it doesn't exist).
+		if ( freq1 > 0 )
+		{
+			int px = freqToX( freq1 );
+			int py = gainToY( gain1 );
+			NT_drawShapeI( kNT_rectangle, px - dotR, py - dotR, px + dotR, py + dotR, colour );
+		}
+		if ( freq2 > 0 )
+		{
+			int px = freqToX( freq2 );
+			int py = gainToY( gain2 );
+			NT_drawShapeI( kNT_rectangle, px - dotR, py - dotR, px + dotR, py + dotR, colour );
+		}
+	}
+
+	// Frequency axis labels - a few clearly-marked reference points so the
+	// curve's horizontal axis actually means something at a glance, rather
+	// than a bare unlabelled line.
+	constexpr int kAxisLabelY = 48;
+	NT_drawText( hzToX( 100.0f ), kAxisLabelY, "100", 5, kNT_textCentre, kNT_textTiny );
+	NT_drawText( hzToX( 1000.0f ), kAxisLabelY, "1k", 5, kNT_textCentre, kNT_textTiny );
+	NT_drawText( hzToX( 10000.0f ), kAxisLabelY, "10k", 5, kNT_textCentre, kNT_textTiny );
+
+	// Footer: which slot + which point Encoder R currently edits the gain
+	// of (left), and the delete-point hint (right, above/around where
+	// Pot L's click - the control that opens it - and Encoder R both live).
+	char buff[24];
+	strcpy( buff, kSlotNames[ pThis->eqSculptSelectedSlot ] );
+	strcat( buff, pThis->eqSculptLastPoint == 0 ? " PT1 GAIN" : " PT2 GAIN" );
+	NT_drawText( 4, 59, buff, 8, kNT_textLeft, kNT_textTiny );
+	NT_drawText( 252, 59, "POT L: DELETE PT", 6, kNT_textRight, kNT_textTiny );
+}
+
 bool	draw( _NT_algorithm* self )
 {
 	_drumMachineAlgorithm* pThis = (_drumMachineAlgorithm*)self;
@@ -4237,6 +5702,8 @@ bool	draw( _NT_algorithm* self )
 		DrawEnvelopesPage( pThis );
 	else if ( pThis->currentPage == kPageLfos )
 		DrawLfosPage( pThis );
+	else if ( pThis->currentPage == kPageEqSculpt )
+		DrawEqSculptPage( pThis );
 	else
 		DrawBarPage( pThis );
 
