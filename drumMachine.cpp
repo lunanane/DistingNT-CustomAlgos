@@ -293,6 +293,24 @@ enum
 	kParamTransBD, kParamTransSD, kParamTransCH, kParamTransOH,
 	kParamTransTypeBD, kParamTransTypeSD, kParamTransTypeCH, kParamTransTypeOH,
 
+	// NOISE - a 4th additive layer (alongside the synth voice and the
+	// optional sample layer, mixed in right alongside MixSampleLayer() -
+	// see MixNoiseLayer()) that fades in a short noise burst on every
+	// trigger. Mix: 0..100, 0 = bypass (matching every other "0 = off"
+	// convention here). Type: which of 5 curated noise flavours (see
+	// kNoiseTypeXxx) - each bundles a colour (white/pink/click) AND a
+	// relative snap-vs-tail timing multiplier as one named choice, so a
+	// separate "envelope shape" control isn't needed to stay within a
+	// 2-page budget; the actual absolute decay length is still scaled by
+	// the slot's own Release knob, same as every other layer ("Release
+	// applies" - the explicit ask this was built for). Not modulatable (no
+	// Mod Matrix entry, like Model/FM Mode/Fold Type). Both appended at
+	// the very end, like every other non-smoothed control - never inserted
+	// mid-range (see kParamFoldBD's comment for why that matters for
+	// saved presets).
+	kParamNoiseBD, kParamNoiseSD, kParamNoiseCH, kParamNoiseOH,
+	kParamNoiseTypeBD, kParamNoiseTypeSD, kParamNoiseTypeCH, kParamNoiseTypeOH,
+
 	kNumParams,
 };
 
@@ -379,6 +397,14 @@ static_assert( ARRAY_SIZE(kEnumWavefolderType) == kNumWavefolderTypes, "" );
 enum { kTransientClassic, kTransientSnap, kTransientGate, kTransientBand, kNumTransientTypes };
 static char const * const kEnumTransientType[] = { "Classic", "Snap", "Gate", "Band" };
 static_assert( ARRAY_SIZE(kEnumTransientType) == kNumTransientTypes, "" );
+
+// Noise layer flavour - see kParamNoiseTypeBD's comment and
+// MixNoiseLayer(). Each bundles a colour (white/pink/click) with a
+// relative snap-vs-tail timing multiplier baked in, rather than exposing
+// colour and shape as separate controls (would need a 3rd page).
+enum { kNoiseTypeWhiteSnap, kNoiseTypeWhiteTail, kNoiseTypePinkSnap, kNoiseTypePinkTail, kNoiseTypeClick, kNumNoiseTypes };
+static char const * const kEnumNoiseType[] = { "WhiteSnap", "WhiteTail", "PinkSnap", "PinkTail", "Click" };
+static_assert( ARRAY_SIZE(kEnumNoiseType) == kNumNoiseTypes, "" );
 
 static char const * const kEnumMidiMode[] = { "Note per slot", "Channel per slot" };
 static char const * const kEnumStereo[] = { "Mono", "Stereo" };
@@ -563,6 +589,16 @@ static _NT_parameter parameters[] = {
 	{ .name = "SD transient type", .min = 0, .max = kNumTransientTypes - 1, .def = 0, .unit = kNT_unitEnum, .scaling = 0, .enumStrings = kEnumTransientType },
 	{ .name = "CH transient type", .min = 0, .max = kNumTransientTypes - 1, .def = 0, .unit = kNT_unitEnum, .scaling = 0, .enumStrings = kEnumTransientType },
 	{ .name = "OH transient type", .min = 0, .max = kNumTransientTypes - 1, .def = 0, .unit = kNT_unitEnum, .scaling = 0, .enumStrings = kEnumTransientType },
+
+	{ .name = "BD noise", .min = 0, .max = 100, .def = 0, .unit = kNT_unitPercent, .scaling = 0, .enumStrings = NULL },
+	{ .name = "SD noise", .min = 0, .max = 100, .def = 0, .unit = kNT_unitPercent, .scaling = 0, .enumStrings = NULL },
+	{ .name = "CH noise", .min = 0, .max = 100, .def = 0, .unit = kNT_unitPercent, .scaling = 0, .enumStrings = NULL },
+	{ .name = "OH noise", .min = 0, .max = 100, .def = 0, .unit = kNT_unitPercent, .scaling = 0, .enumStrings = NULL },
+
+	{ .name = "BD noise type", .min = 0, .max = kNumNoiseTypes - 1, .def = 0, .unit = kNT_unitEnum, .scaling = 0, .enumStrings = kEnumNoiseType },
+	{ .name = "SD noise type", .min = 0, .max = kNumNoiseTypes - 1, .def = 0, .unit = kNT_unitEnum, .scaling = 0, .enumStrings = kEnumNoiseType },
+	{ .name = "CH noise type", .min = 0, .max = kNumNoiseTypes - 1, .def = 0, .unit = kNT_unitEnum, .scaling = 0, .enumStrings = kEnumNoiseType },
+	{ .name = "OH noise type", .min = 0, .max = kNumNoiseTypes - 1, .def = 0, .unit = kNT_unitEnum, .scaling = 0, .enumStrings = kEnumNoiseType },
 };
 
 static const uint8_t pageRouting[]   = { kParamOutBD, kParamOutBDMode, kParamStereoBD, kParamPanBD, kParamOutSD, kParamOutSDMode, kParamStereoSD, kParamPanSD, kParamOutCH, kParamOutCHMode, kParamStereoCH, kParamPanCH, kParamOutOH, kParamOutOHMode, kParamStereoOH, kParamPanOH };
@@ -606,6 +642,8 @@ static const uint8_t pageEqSculptList[] = {
 
 static const uint8_t pageTrans[]      = { kParamTransBD, kParamTransSD, kParamTransCH, kParamTransOH };
 static const uint8_t pageTransType[]  = { kParamTransTypeBD, kParamTransTypeSD, kParamTransTypeCH, kParamTransTypeOH };
+static const uint8_t pageNoise[]      = { kParamNoiseBD, kParamNoiseSD, kParamNoiseCH, kParamNoiseOH };
+static const uint8_t pageNoiseType[]  = { kParamNoiseTypeBD, kParamNoiseTypeSD, kParamNoiseTypeCH, kParamNoiseTypeOH };
 
 // The Mod Matrix's 32 params are contiguous (kFirstModRouteParam..+31) in
 // exactly this sequential order already, so this is just that range restated
@@ -647,6 +685,8 @@ static const _NT_parameterPage pages[] = {
 	{ .name = "EQ Sculpt", .numParams = ARRAY_SIZE(pageEqSculptList), .params = pageEqSculptList },
 	{ .name = "Transient", .numParams = ARRAY_SIZE(pageTrans), .params = pageTrans },
 	{ .name = "Transient Type", .numParams = ARRAY_SIZE(pageTransType), .params = pageTransType },
+	{ .name = "Noise", .numParams = ARRAY_SIZE(pageNoise), .params = pageNoise },
+	{ .name = "Noise Type", .numParams = ARRAY_SIZE(pageNoiseType), .params = pageNoiseType },
 };
 
 static const _NT_parameterPages parameterPages = {
@@ -673,6 +713,7 @@ enum {
 	kPagePan,
 	kPageEqSculpt,
 	kPageTransient, kPageTransientType,
+	kPageNoise, kPageNoiseType,
 	kNumPages,
 };
 enum { kFirstCustomPage = kPageEnvelopes };
@@ -693,6 +734,7 @@ static const int kPageType[kNumPages] = {
 	kPageTypeBar,
 	kPageTypeEqSculpt,
 	kPageTypeBar, kPageTypeBar,
+	kPageTypeBar, kPageTypeBar,
 };
 // List pages (Routing/MIDI/Mod Matrix) use these via SetupPageParams()/
 // SetupPageItemCount(); graph/bar pages (Envelopes/LFOs/Model..Pan) use
@@ -711,6 +753,7 @@ static const uint8_t* const kPageParams[kNumPages] = {
 	pagePan,
 	pageEqSculptList,
 	pageTrans, pageTransType,
+	pageNoise, pageNoiseType,
 };
 static const int kPageItemCount[kNumPages] = {
 	(int)ARRAY_SIZE(pageRouting), (int)ARRAY_SIZE(pageMidi), 0, 0, (int)ARRAY_SIZE(pageModMatrix),
@@ -721,6 +764,7 @@ static const int kPageItemCount[kNumPages] = {
 	0, 0,
 	0,
 	0,
+	0, 0,
 	0, 0,
 };
 static const char* const kPageNames[kNumPages] = {
@@ -733,6 +777,7 @@ static const char* const kPageNames[kNumPages] = {
 	"PAN",
 	"EQ SCULPT",
 	"TRANSIENT", "TRANSIENT TYPE",
+	"NOISE", "NOISE TYPE",
 };
 static const bool kPageBipolar[kNumPages] = {
 	false, false, false, false, false,
@@ -744,6 +789,7 @@ static const bool kPageBipolar[kNumPages] = {
 	true,
 	false,
 	true, false,
+	false, false,
 };
 // kConceptXxx for each bar-style page, or -1 for non-bar pages and Model/FM
 // Mode/Fold Type/Sample/Mix Type/Pan/EQ Sculpt/Transient/Transient Type
@@ -761,6 +807,7 @@ static const int kPageConcept[kNumPages] = {
 	kConceptFold, -1,
 	-1,
 	-1,
+	-1, -1,
 	-1, -1,
 };
 
@@ -829,6 +876,8 @@ static const uint8_t kModParams[] = {
 	kParamEqGain2BD, kParamEqGain2SD, kParamEqGain2CH, kParamEqGain2OH,
 	kParamTransBD, kParamTransSD, kParamTransCH, kParamTransOH,
 	kParamTransTypeBD, kParamTransTypeSD, kParamTransTypeCH, kParamTransTypeOH,
+	kParamNoiseBD, kParamNoiseSD, kParamNoiseCH, kParamNoiseOH,
+	kParamNoiseTypeBD, kParamNoiseTypeSD, kParamNoiseTypeCH, kParamNoiseTypeOH,
 };
 enum { kNumModRouteParamsTotal = kNumModRoutes * kNumModRouteParams };
 enum { kNumModParams = ARRAY_SIZE(kModParams) + kNumModRouteParamsTotal };
@@ -950,6 +999,19 @@ struct _drumVoicePost
 	stmlib::Svf eqPoint2Tap;
 	int cachedEqFreq1;
 	int cachedEqFreq2;
+	// Block-level smoothed shadow of gain1/gain2 - the raw parameter is only
+	// used as the smoother's *target*; the tap's actual output multiply
+	// always reads the smoothed value instead. Needed once ApplyEqSculpt()
+	// started skipping a point's Process() call entirely at gain==0 (a real
+	// CPU win - see that function's comment) - without this, the very
+	// block a point crosses in/out of that bypass would otherwise jump the
+	// tap's contribution from/to exactly 0 instantly, which is audible as a
+	// click on a percussive, transient-heavy source like a drum hit.
+	// Ramping instead (see kEqGainSmoothCoeff) makes that transition
+	// inaudible while keeping the steady-state (gain truly at 0, ramp fully
+	// settled) still fully bypassed and free.
+	float eqGain1Smoothed;
+	float eqGain2Smoothed;
 
 	// Transient shaper state (see ApplyTransient()) - transFastEnv/
 	// transSlowEnv are shared by the Classic and Snap models (only one
@@ -966,6 +1028,32 @@ struct _drumVoicePost
 	stmlib::Svf transBandFilter;
 	float transBandFastEnv;
 	float transBandSlowEnv;
+	// Same click-prevention idea as eqGain1/2Smoothed - ApplyTransient()
+	// bypasses entirely at amount==0, so the raw `amount` parameter is only
+	// the smoother's target; the effect's actual depth always reads
+	// transAmountSmoothed instead, ramping through the on/off boundary
+	// rather than stepping.
+	float transAmountSmoothed;
+
+	// Noise layer state (see MixNoiseLayer()) - a simple attack+decay
+	// envelope (noiseEnvElapsed advances every block while noiseActive;
+	// noiseAttackTotalS/noiseDecayTotalS set fresh at trigger time from
+	// the slot's Release knob, same "Release applies" convention as the
+	// sample layer's own artificial envelope). noiseFilter is shared by
+	// the Pink (lowpass tilt) and Click (highpass) types - only one noise
+	// Type is ever active on a given voice at a time, same sharing
+	// precedent as transFastEnv/transSlowEnv above.
+	float noiseEnvElapsed;
+	float noiseAttackTotalS;
+	float noiseDecayTotalS;
+	bool noiseActive;
+	stmlib::Svf noiseFilter;
+	// Which fixed cutoff noiseFilter's coefficients are currently set for
+	// (0 = unset, 1 = Pink's lowpass tilt, 2 = Click's highpass) - both
+	// cutoffs are fixed/not user-adjustable, so (like cleanupHp/cachedEqFreq1)
+	// there's no reason to call set_f_q() more than once per actual mode
+	// change, rather than every block while the layer is active.
+	int cachedNoiseFilterMode;
 
 	void Init()
 	{
@@ -999,6 +1087,8 @@ struct _drumVoicePost
 		eqPoint2Tap.Init();
 		cachedEqFreq1 = -1;	// never a real Freq1/2 value (0..100), forces the first block to always compute
 		cachedEqFreq2 = -1;
+		eqGain1Smoothed = 0.0f;
+		eqGain2Smoothed = 0.0f;
 
 		transFastEnv = 0.0f;
 		transSlowEnv = 0.0f;
@@ -1007,7 +1097,15 @@ struct _drumVoicePost
 		transBandFilter.Init();
 		transBandFilter.set_f_q<stmlib::FREQUENCY_FAST>( 600.0f / plaits::kSampleRate, 0.7f );
 		transBandFastEnv = 0.0f;
+		transAmountSmoothed = 0.0f;
 		transBandSlowEnv = 0.0f;
+
+		noiseEnvElapsed = 0.0f;
+		noiseAttackTotalS = 0.01f;
+		noiseDecayTotalS = 1.0f;
+		noiseActive = false;
+		noiseFilter.Init();
+		cachedNoiseFilterMode = 0;
 	}
 };
 
@@ -2132,6 +2230,12 @@ struct _drumMachineAlgorithm : public _NT_algorithm
 	// most likely explanation, so this gate keeps triggered hits from
 	// touching the sample-streaming API at all until things have settled.
 	int sampleSystemGraceSamples;
+
+	// This algorithm instance's own CPU cost, as a smoothed percentage of
+	// its real-time budget - see MeasureCpuPercent()'s comment for how it's
+	// derived and its caveats. Purely a self-diagnostic display value (see
+	// DrawHeader()) - never read by any DSP or control-flow code.
+	float cpuPercent;
 };
 
 // ---------------------------------------------------------------------
@@ -2454,6 +2558,7 @@ _NT_algorithm*	construct( const _NT_algorithmMemoryPtrs& ptrs, const _NT_algorit
 	alg->eqSculptLastPoint = 0;
 	alg->eqDeleteConfirmOpen = false;
 	alg->eqDeleteConfirmChoice = 0;
+	alg->cpuPercent = 0.0f;
 	alg->potHasLastPos[0] = alg->potHasLastPos[1] = alg->potHasLastPos[2] = false;
 	alg->potAccum[0] = alg->potAccum[1] = alg->potAccum[2] = 0.0f;
 	alg->smoothersInitialized = false;
@@ -3477,35 +3582,62 @@ static float EqSculptQ( int value )
 // recompute when the value actually changes (cachedEqFreq1/2).
 static void ApplyEqSculpt( _drumVoicePost& v, float* buf, float* tapBuf, int numFrames, int freq1, int gain1, int freq2, int gain2 )
 {
-	if ( freq1 > 0 && gain1 != 0 )
+	// Block-level one-pole smoothing on the gain actually applied (target
+	// is the raw parameter; the output multiply always reads the smoothed
+	// value instead - see eqGain1Smoothed/eqGain2Smoothed's own comment).
+	// ~0.15 settles in roughly 6-7 blocks - fast enough that turning the
+	// knob still feels immediate, slow enough that a point's contribution
+	// ramps rather than steps through the gain==0 bypass boundary below,
+	// which is exactly where an instant jump would otherwise click.
+	constexpr float kGainSmoothCoeff = 0.15f;
+	constexpr float kSettledThreshold = 0.05f;
+
+	if ( freq1 > 0 )
 	{
-		if ( freq1 != v.cachedEqFreq1 )
+		v.eqGain1Smoothed += ( (float)gain1 - v.eqGain1Smoothed ) * kGainSmoothCoeff;
+		if ( gain1 != 0 || fabsf( v.eqGain1Smoothed ) > kSettledThreshold )
 		{
-			float norm = EqSculptFreqHz( freq1 ) / plaits::kSampleRate;
-			CONSTRAIN( norm, 0.001f, 0.49f );
-			v.eqPoint1Tap.set_f_q<stmlib::FREQUENCY_FAST>( norm, EqSculptQ( freq1 ) );
-			v.cachedEqFreq1 = freq1;
+			if ( freq1 != v.cachedEqFreq1 )
+			{
+				float norm = EqSculptFreqHz( freq1 ) / plaits::kSampleRate;
+				CONSTRAIN( norm, 0.001f, 0.49f );
+				v.eqPoint1Tap.set_f_q<stmlib::FREQUENCY_FAST>( norm, EqSculptQ( freq1 ) );
+				v.cachedEqFreq1 = freq1;
+			}
+			memcpy( tapBuf, buf, numFrames * sizeof(float) );
+			v.eqPoint1Tap.Process<stmlib::FILTER_MODE_BAND_PASS>( tapBuf, tapBuf, numFrames );
+			float t = v.eqGain1Smoothed * 0.015f;	// -100..100 -> up to +-1.5x tap contribution
+			for ( int i=0; i<numFrames; ++i )
+				buf[i] += t * tapBuf[i];
 		}
-		memcpy( tapBuf, buf, numFrames * sizeof(float) );
-		v.eqPoint1Tap.Process<stmlib::FILTER_MODE_BAND_PASS>( tapBuf, tapBuf, numFrames );
-		float t = gain1 * 0.015f;	// -100..100 -> up to +-1.5x tap contribution
-		for ( int i=0; i<numFrames; ++i )
-			buf[i] += t * tapBuf[i];
 	}
-	if ( freq2 > 0 && gain2 != 0 )
+	else
 	{
-		if ( freq2 != v.cachedEqFreq2 )
+		v.eqGain1Smoothed = 0.0f;
+	}
+
+	if ( freq2 > 0 )
+	{
+		v.eqGain2Smoothed += ( (float)gain2 - v.eqGain2Smoothed ) * kGainSmoothCoeff;
+		if ( gain2 != 0 || fabsf( v.eqGain2Smoothed ) > kSettledThreshold )
 		{
-			float norm = EqSculptFreqHz( freq2 ) / plaits::kSampleRate;
-			CONSTRAIN( norm, 0.001f, 0.49f );
-			v.eqPoint2Tap.set_f_q<stmlib::FREQUENCY_FAST>( norm, EqSculptQ( freq2 ) );
-			v.cachedEqFreq2 = freq2;
+			if ( freq2 != v.cachedEqFreq2 )
+			{
+				float norm = EqSculptFreqHz( freq2 ) / plaits::kSampleRate;
+				CONSTRAIN( norm, 0.001f, 0.49f );
+				v.eqPoint2Tap.set_f_q<stmlib::FREQUENCY_FAST>( norm, EqSculptQ( freq2 ) );
+				v.cachedEqFreq2 = freq2;
+			}
+			memcpy( tapBuf, buf, numFrames * sizeof(float) );
+			v.eqPoint2Tap.Process<stmlib::FILTER_MODE_BAND_PASS>( tapBuf, tapBuf, numFrames );
+			float t = v.eqGain2Smoothed * 0.015f;
+			for ( int i=0; i<numFrames; ++i )
+				buf[i] += t * tapBuf[i];
 		}
-		memcpy( tapBuf, buf, numFrames * sizeof(float) );
-		v.eqPoint2Tap.Process<stmlib::FILTER_MODE_BAND_PASS>( tapBuf, tapBuf, numFrames );
-		float t = gain2 * 0.015f;
-		for ( int i=0; i<numFrames; ++i )
-			buf[i] += t * tapBuf[i];
+	}
+	else
+	{
+		v.eqGain2Smoothed = 0.0f;
 	}
 }
 
@@ -3521,10 +3653,18 @@ static void ApplyEqSculpt( _drumVoicePost& v, float* buf, float* tapBuf, int num
 // the source of each.
 static void ApplyTransient( _drumVoicePost& v, float* buf, int numFrames, int amount, int type )
 {
-	if ( amount == 0 )
+	// Same click-prevention idea as ApplyEqSculpt()'s gain smoothing (see
+	// transAmountSmoothed's own comment) - the raw `amount` parameter is
+	// only the smoother's target; `depth` below always reads the smoothed
+	// value, so crossing the amount==0 bypass boundary ramps rather than
+	// steps. ~0.15 settles in roughly 6-7 blocks.
+	constexpr float kAmountSmoothCoeff = 0.15f;
+	constexpr float kSettledThreshold = 0.5f;	// in amount units (-100..100)
+	v.transAmountSmoothed += ( (float)amount - v.transAmountSmoothed ) * kAmountSmoothCoeff;
+	if ( amount == 0 && fabsf( v.transAmountSmoothed ) <= kSettledThreshold )
 		return;
 
-	float depth = amount * 0.01f;	// -1..1
+	float depth = v.transAmountSmoothed * 0.01f;	// -1..1
 
 	if ( type == kTransientClassic )
 	{
@@ -3978,6 +4118,103 @@ static void MixSampleLayer( _drumMachineAlgorithm* pThis, _drumVoicePost& v, int
 	}
 }
 
+// Noise layer - a 4th additive layer (alongside the synth voice above and
+// the optional sample layer) that fades in a short burst of noise on
+// every trigger, mixed straight into `scratch` right alongside the sample
+// layer, before ApplyPost() shapes the combined signal. `mixAmount` is
+// 0..100, 0 = bypass (matching every other "0 = off" convention here).
+// `type` picks one of 5 curated flavours (see kNoiseTypeXxx) - each
+// bundles a colour (white/pink/click) with a relative snap-vs-tail timing
+// multiplier baked in, so a separate envelope-shape control isn't needed
+// to stay within a 2-page budget (Mix, Type); Release (`decay`) still
+// scales the actual absolute attack+decay length within whichever family
+// Type selects, same as every other layer - "Release applies", the
+// explicit ask this was built for. The attack phase (a real fade-IN, not
+// just an instant burst that decays) is a fixed fraction of the overall
+// length, so it's always present but still scales with Release like the
+// rest of the envelope.
+static void MixNoiseLayer( _drumVoicePost& v, int mixAmount, int type, float decay, bool trig, float blockSeconds, float* scratch, int numFrames )
+{
+	if ( mixAmount <= 0 )
+		return;
+
+	if ( trig )
+	{
+		// Tail types ring for the full Release-scaled range; Snap types are
+		// a fraction of that; Click is shorter still - "snappy noise or
+		// nice noise tail" directly from Type, both still scaled by Release.
+		float shapeScale = 0.35f;
+		if ( type == kNoiseTypeWhiteTail || type == kNoiseTypePinkTail ) shapeScale = 1.0f;
+		else if ( type == kNoiseTypeClick ) shapeScale = 0.12f;
+		v.noiseDecayTotalS = NormToSeconds( decay * decay, 0.02f, 1.5f ) * shapeScale;
+		v.noiseAttackTotalS = v.noiseDecayTotalS * 0.15f;
+		v.noiseEnvElapsed = 0.0f;
+		v.noiseActive = true;
+	}
+
+	if ( !v.noiseActive )
+		return;
+
+	float env;
+	if ( v.noiseEnvElapsed < v.noiseAttackTotalS )
+		env = v.noiseEnvElapsed / v.noiseAttackTotalS;
+	else
+		env = 1.0f - ( v.noiseEnvElapsed - v.noiseAttackTotalS ) / ( v.noiseDecayTotalS - v.noiseAttackTotalS );
+	CONSTRAIN( env, 0.0f, 1.0f );
+	if ( v.noiseEnvElapsed >= v.noiseDecayTotalS )
+	{
+		v.noiseActive = false;
+		return;
+	}
+
+	float mix = mixAmount * 0.01f * env;
+	bool needsLp = ( type == kNoiseTypePinkSnap || type == kNoiseTypePinkTail );
+	bool needsHp = ( type == kNoiseTypeClick );
+	if ( needsLp )
+	{
+		// Cheap one-pole "pinkish" tilt on white noise - not a true -3dB/
+		// octave pink filter, same "cheap approximation over exact
+		// fidelity" precedent as everywhere else in this file. Fixed
+		// cutoff, not user-adjustable - only recomputed when the mode
+		// actually changes (cachedNoiseFilterMode), not every block.
+		if ( v.cachedNoiseFilterMode != 1 )
+		{
+			v.noiseFilter.set_f_q<stmlib::FREQUENCY_FAST>( 2200.0f / plaits::kSampleRate, 0.6f );
+			v.cachedNoiseFilterMode = 1;
+		}
+		for ( int i=0; i<numFrames; ++i )
+		{
+			float n = stmlib::Random::GetFloat() * 2.0f - 1.0f;
+			n = v.noiseFilter.Process<stmlib::FILTER_MODE_LOW_PASS>( n );
+			scratch[i] += n * mix;
+		}
+	}
+	else if ( needsHp )
+	{
+		if ( v.cachedNoiseFilterMode != 2 )
+		{
+			v.noiseFilter.set_f_q<stmlib::FREQUENCY_FAST>( 4000.0f / plaits::kSampleRate, 0.6f );
+			v.cachedNoiseFilterMode = 2;
+		}
+		for ( int i=0; i<numFrames; ++i )
+		{
+			float n = stmlib::Random::GetFloat() * 2.0f - 1.0f;
+			n = v.noiseFilter.Process<stmlib::FILTER_MODE_HIGH_PASS>( n );
+			scratch[i] += n * mix;
+		}
+	}
+	else
+	{
+		for ( int i=0; i<numFrames; ++i )
+		{
+			float n = stmlib::Random::GetFloat() * 2.0f - 1.0f;
+			scratch[i] += n * mix;
+		}
+	}
+
+	v.noiseEnvElapsed += blockSeconds;
+}
+
 static void ProcessKick( _drumMachineAlgorithm* pThis, float* busFrames, int numFrames )
 {
 	_kickVoice& v = pThis->dtc->kick;
@@ -4142,6 +4379,7 @@ static void ProcessKick( _drumMachineAlgorithm* pThis, float* busFrames, int num
 	}
 
 	MixSampleLayer( pThis, v, kSlotBD, trig, accent, decay, blockSeconds, scratch, numFrames );
+	MixNoiseLayer( v, pThis->v[kParamNoiseBD], pThis->v[kParamNoiseTypeBD], decay, trig, blockSeconds, scratch, numFrames );
 
 	int filtParam = RoundToInt( ModulatedViaMatrix( pThis, kConceptFilter, kSlotBD, Smoothed( pThis, kParamFiltBD ), env1Level, env2Level ) );
 	int foldParam = RoundToInt( ModulatedViaMatrix( pThis, kConceptFold, kSlotBD, Smoothed( pThis, kParamFoldBD ), env1Level, env2Level ) );
@@ -4291,6 +4529,7 @@ static void ProcessSnare( _drumMachineAlgorithm* pThis, float* busFrames, int nu
 	}
 
 	MixSampleLayer( pThis, v, kSlotSD, trig, accent, decay, blockSeconds, scratch, numFrames );
+	MixNoiseLayer( v, pThis->v[kParamNoiseSD], pThis->v[kParamNoiseTypeSD], decay, trig, blockSeconds, scratch, numFrames );
 
 	int filtParam = RoundToInt( ModulatedViaMatrix( pThis, kConceptFilter, kSlotSD, Smoothed( pThis, kParamFiltSD ), env1Level, env2Level ) );
 	int foldParam = RoundToInt( ModulatedViaMatrix( pThis, kConceptFold, kSlotSD, Smoothed( pThis, kParamFoldSD ), env1Level, env2Level ) );
@@ -4328,6 +4567,8 @@ static void ProcessHat( _drumMachineAlgorithm* pThis, float* busFrames, int numF
 	int eqGain2ParamIdx = isOpen ? kParamEqGain2OH : kParamEqGain2CH;
 	int transParamIdx = isOpen ? kParamTransOH : kParamTransCH;
 	int transTypeParamIdx = isOpen ? kParamTransTypeOH : kParamTransTypeCH;
+	int noiseParamIdx = isOpen ? kParamNoiseOH : kParamNoiseCH;
+	int noiseTypeParamIdx = isOpen ? kParamNoiseTypeOH : kParamNoiseTypeCH;
 	int compParamIdx = isOpen ? kParamCompOH : kParamCompCH;
 	int driveParamIdx = isOpen ? kParamDriveOH : kParamDriveCH;
 	int volParamIdx = isOpen ? kParamVolOH : kParamVolCH;
@@ -4478,6 +4719,7 @@ static void ProcessHat( _drumMachineAlgorithm* pThis, float* busFrames, int numF
 	}
 
 	MixSampleLayer( pThis, v, slot, trig, accent, decay, blockSeconds, scratch, numFrames );
+	MixNoiseLayer( v, pThis->v[noiseParamIdx], pThis->v[noiseTypeParamIdx], decay, trig, blockSeconds, scratch, numFrames );
 
 	int filtParam = RoundToInt( ModulatedViaMatrix( pThis, kConceptFilter, slot, Smoothed( pThis, filtParamIdx ), env1Level, env2Level ) );
 	int foldParam = RoundToInt( ModulatedViaMatrix( pThis, kConceptFold, slot, Smoothed( pThis, foldParamIdx ), env1Level, env2Level ) );
@@ -4497,10 +4739,42 @@ static void ProcessHat( _drumMachineAlgorithm* pThis, float* busFrames, int numF
 	WriteVoiceOutput( busFrames, numFrames, scratch, pThis->v[outParamIdx], replace, stereo, pThis->v[panParamIdx] );
 }
 
+// Rough estimate of this algorithm instance's own CPU cost, as a % of the
+// real-time audio budget for one step() block - purely a self-diagnostic
+// display value (see cpuPercent's own comment/DrawHeader()), never read by
+// any DSP or control-flow code. NT_getCpuCycleCount() ("a utility function,
+// mainly for profiling" per its own doc comment) is the only cycle-timing
+// primitive this SDK exposes - there's no host-side CPU% getter and no
+// documented core-clock-speed constant anywhere in distingnt/api.h, so
+// converting a cycle count into a percentage needs an assumed clock rate.
+// kAssumedCoreClockHz below (480MHz) is that assumption - the Cortex-M7/
+// STM32H7 family's usual maximum clock, the performance class this
+// hardware's behavior matches, but NOT a value confirmed from Expert
+// Sleepers' own documentation. If this reading looks consistently off by
+// a roughly constant ratio from the module's own built-in overview CPU
+// meter, that ratio is almost certainly this assumed clock being wrong,
+// and correcting kAssumedCoreClockHz alone should fix it. Deliberately
+// does NOT attempt a whole-module total (every other algorithm slot's own
+// cost, if any are loaded) - the SDK exposes NT_algorithmCount() (how many
+// slots exist) but nothing that reports another slot's CPU cost, so that
+// number isn't accessible to a plugin at all, only what the host's own
+// standard overview screen already shows.
+constexpr float kAssumedCoreClockHz = 480000000.0f;
+static float MeasureCpuPercent( float previous, uint32_t cyclesStart, uint32_t cyclesEnd, int numFrames )
+{
+	uint32_t elapsed = cyclesEnd - cyclesStart;	// unsigned subtraction - correct even across a wraparound
+	float budget = kAssumedCoreClockHz * ( (float)numFrames / (float)NT_globals.sampleRate );
+	float instant = 100.0f * (float)elapsed / budget;
+	float smoothed = previous + ( instant - previous ) * 0.05f;	// gentle decaying average - readable, not jittery
+	CONSTRAIN( smoothed, 0.0f, 999.0f );
+	return smoothed;
+}
+
 void 	step( _NT_algorithm* self, float* busFrames, int numFramesBy4 )
 {
 	_drumMachineAlgorithm* pThis = (_drumMachineAlgorithm*)self;
 	int numFrames = numFramesBy4 * 4;
+	uint32_t cpuCycleStart = NT_getCpuCycleCount();
 
 	// Algorithms should defer SD-card activity until it's known to be
 	// mounted, which might be well after construct() - watch for the mount
@@ -4529,6 +4803,8 @@ void 	step( _NT_algorithm* self, float* busFrames, int numFramesBy4 )
 	ProcessSnare( pThis, busFrames, numFrames );
 	ProcessHat( pThis, busFrames, numFrames, false );
 	ProcessHat( pThis, busFrames, numFrames, true );
+
+	pThis->cpuPercent = MeasureCpuPercent( pThis->cpuPercent, cpuCycleStart, NT_getCpuCycleCount(), numFrames );
 }
 
 // ---------------------------------------------------------------------
@@ -4731,6 +5007,61 @@ static void LoadPreset( _drumMachineAlgorithm* pThis, int slot )
 	pThis->potAccum[0] = pThis->potAccum[1] = pThis->potAccum[2] = 0.0f;
 }
 
+// "New" - the preset menu's third option, alongside Load/Save. Resets
+// every kit + mod parameter to its own default value (the static
+// `parameters[]` table's `.def` field - the same values construct() itself
+// starts from) rather than reading from any saved preset slot, i.e. "as if
+// this were a freshly constructed instance." Filter/Pan (and every other
+// "0 = centred/bypassed" control) land back at centre for free this way,
+// since their own `.def` is already 0 - no special-casing needed. Routing/
+// MIDI are untouched, same "not part of the sound" reasoning Load/Save
+// already follow. Mirrors LoadPreset()'s exact structure (instant Model,
+// ~1.5s fade for the other kit params, instant snap for kModParams) so a
+// "New" patch fades in the same way loading a saved one does, rather than
+// jumping straight to silence/defaults.
+static void NewPreset( _drumMachineAlgorithm* pThis )
+{
+	ExtendSampleSystemGrace( pThis );
+
+	int algIdx = NT_algorithmIndex( pThis );
+	uint32_t off = NT_parameterOffset();
+
+	static const int kModelParams[kNumSlots] = { kParamModelBD, kParamModelSD, kParamModelCH, kParamModelOH };
+	for ( int i=0; i<kNumSlots; ++i )
+	{
+		int p = kModelParams[i];
+		NT_setParameterFromUi( algIdx, p + off, pThis->parameters[p].def );
+	}
+
+	pThis->loadingPreset++;
+	float rampSamples = 1.5f * plaits::kSampleRate;
+	for ( int i=0; i<kNumSmoothedParams; ++i )
+	{
+		int p = kFirstSmoothedParam + i;
+		int newValue = pThis->parameters[p].def;
+		_paramSmoother& s = pThis->smoother[i];
+		s.target = (float)newValue;
+		s.samplesRemaining = (int)rampSamples;
+		s.increment = ( s.target - s.current ) / rampSamples;
+		NT_setParameterFromUi( algIdx, p + off, newValue );
+	}
+	pThis->loadingPreset--;
+
+	for ( int i=0; i<kNumModParams; ++i )
+	{
+		int p = ModParamAt(i);
+		NT_setParameterFromUi( algIdx, p + off, pThis->parameters[p].def );
+	}
+
+	StartSampleLoad( pThis, kSlotBD );
+	StartSampleLoad( pThis, kSlotSD );
+	StartSampleLoad( pThis, kSlotCH );
+	StartSampleLoad( pThis, kSlotOH );
+
+	pThis->potHasLastPos[0] = pThis->potHasLastPos[1] = pThis->potHasLastPos[2] = false;
+	pThis->potAccum[0] = pThis->potAccum[1] = pThis->potAccum[2] = 0.0f;
+}
+
 // Resolves the route mapping `source` to (concept, slot) for quick-edit
 // (button 4) depth adjustment on a bar page - reuses an existing matching
 // route if one exists (via the read-only FindRoute()), otherwise claims a
@@ -4856,16 +5187,24 @@ void	customUi( _NT_algorithm* self, const _NT_uiData& data )
 			return;	// preset menu owns every claimed control while it's open
 		}
 
-		// Stage 1: choosing Load/Save for the highlighted slot - still all
-		// on Encoder R (rotate toggles the choice, push confirms).
+		// Stage 1: choosing Load/Save/New for the highlighted slot - still
+		// all on Encoder R (rotate cycles the choice, push confirms). Any
+		// nonzero delta advances by exactly one step (not proportional to
+		// turn speed), same idiom as the old binary Load/Save toggle this
+		// replaced.
 		if ( data.encoders[1] != 0 )
-			pThis->presetMenuAction = pThis->presetMenuAction == 0 ? 1 : 0;
+		{
+			int dir = data.encoders[1] > 0 ? 1 : -1;
+			pThis->presetMenuAction = ( pThis->presetMenuAction + dir + 3 ) % 3;
+		}
 		if ( ( data.controls & kNT_encoderButtonR ) && !( data.lastButtons & kNT_encoderButtonR ) )
 		{
 			if ( pThis->presetMenuAction == 0 )
 				LoadPreset( pThis, pThis->presetMenuIndex );
-			else
+			else if ( pThis->presetMenuAction == 1 )
 				SavePreset( pThis, pThis->presetMenuIndex );
+			else
+				NewPreset( pThis );
 			pThis->presetMenuOpen = false;
 		}
 		return;	// preset menu owns every claimed control while it's open
@@ -5117,17 +5456,35 @@ void	setupUi( _NT_algorithm* self, _NT_float3& pots )
 // content area below for no benefit (the page title doesn't need to be
 // any more prominent than the content it's labelling).
 constexpr int kHeaderDividerY = 10;
-static void DrawHeader( const char* title, const char* rightTag = "lnxdrum v5.0" )
+// `pThis` is only used for the CPU% readout tacked onto rightTag below -
+// see MeasureCpuPercent()'s comment for how it's derived and its caveats.
+// Sharing rightTag's existing single line (rather than a genuine second
+// line below it) is a deliberate space trade-off: the gap between this
+// row (y=7) and the divider (y=10) is only ~3px, and most pages' own
+// content already starts right at y=14 (kHeaderDividerY+4) or y=20 (EQ
+// Sculpt's slot row) - not enough headroom for a truly separate line
+// without pushing every page's content down, a much bigger layout change
+// than this warrants.
+static void DrawHeader( _drumMachineAlgorithm* pThis, const char* title, const char* rightTag = "lnxdrum v5.0" )
 {
 	NT_drawText( 4, 7, title, 15, kNT_textLeft, kNT_textTiny );
 	if ( rightTag )
-		NT_drawText( 252, 7, rightTag, 5, kNT_textRight, kNT_textTiny );
+	{
+		char tagBuff[32];
+		strcpy( tagBuff, rightTag );
+		strcat( tagBuff, "  " );
+		char cpuNum[8];
+		NT_intToString( cpuNum, (int)( pThis->cpuPercent + 0.5f ) );
+		strcat( tagBuff, cpuNum );
+		strcat( tagBuff, "%" );
+		NT_drawText( 252, 7, tagBuff, 5, kNT_textRight, kNT_textTiny );
+	}
 	NT_drawShapeI( kNT_line, 0, kHeaderDividerY, 255, kHeaderDividerY, 4 );
 }
 
 static void DrawSetupPage( _drumMachineAlgorithm* pThis, const char* title )
 {
-	DrawHeader( title, pThis->setupEditMode ? "EDIT" : "lnxdrum v5.0" );
+	DrawHeader( pThis, title, pThis->setupEditMode ? "EDIT" : "lnxdrum v5.0" );
 
 	int itemCount = SetupPageItemCount( pThis->currentPage );
 	const uint8_t* params = SetupPageParams( pThis->currentPage );
@@ -5201,7 +5558,7 @@ static void DrawGraphBoxOutline( int bx0, int bx1, int y0, int y1 )
 
 static void DrawEnvelopesPage( _drumMachineAlgorithm* pThis )
 {
-	DrawHeader( "ENVELOPES" );
+	DrawHeader( pThis, "ENVELOPES" );
 
 	constexpr int y0 = 14;
 	constexpr int y1 = 40;
@@ -5255,7 +5612,7 @@ static void DrawEnvelopesPage( _drumMachineAlgorithm* pThis )
 
 static void DrawLfosPage( _drumMachineAlgorithm* pThis )
 {
-	DrawHeader( "LFOS" );
+	DrawHeader( pThis, "LFOS" );
 
 	constexpr int y0 = 14;
 	constexpr int y1 = 40;
@@ -5304,11 +5661,11 @@ static void DrawBarPage( _drumMachineAlgorithm* pThis )
 		strcpy( titleBuff, kPageNames[page] );
 		strcat( titleBuff, " - " );
 		strcat( titleBuff, kQuickModeNames[pThis->barPageMode] );
-		DrawHeader( titleBuff );
+		DrawHeader( pThis, titleBuff );
 	}
 	else
 	{
-		DrawHeader( kPageNames[page] );
+		DrawHeader( pThis, kPageNames[page] );
 	}
 
 	const uint8_t* params = kPageParams[page];
@@ -5479,8 +5836,9 @@ static void DrawPresetMenu( _drumMachineAlgorithm* pThis )
 		NT_drawText( 251, 7, "PRESS", 8, kNT_textRight, kNT_textTiny );
 	else
 	{
-		NT_drawText( 197, 7, "LOAD", pThis->presetMenuAction == 0 ? 15 : 5, kNT_textLeft, kNT_textTiny );
-		NT_drawText( 232, 7, "SAVE", pThis->presetMenuAction == 1 ? 15 : 5, kNT_textLeft, kNT_textTiny );
+		NT_drawText( 178, 7, "LOAD", pThis->presetMenuAction == 0 ? 15 : 5, kNT_textLeft, kNT_textTiny );
+		NT_drawText( 208, 7, "SAVE", pThis->presetMenuAction == 1 ? 15 : 5, kNT_textLeft, kNT_textTiny );
+		NT_drawText( 238, 7, "NEW", pThis->presetMenuAction == 2 ? 15 : 5, kNT_textLeft, kNT_textTiny );
 	}
 	NT_drawShapeI( kNT_line, 0, kHeaderDividerY, 255, kHeaderDividerY, 4 );
 
@@ -5511,7 +5869,7 @@ static void DrawPresetMenu( _drumMachineAlgorithm* pThis )
 
 static void DrawDeleteConfirm( _drumMachineAlgorithm* pThis )
 {
-	DrawHeader( "DELETE MODIFIER?", NULL );
+	DrawHeader( pThis, "DELETE MODIFIER?", NULL );
 	NT_drawText( 100, 24, "NO", pThis->deleteConfirmChoice == 0 ? 15 : 5, kNT_textCentre, kNT_textNormal );
 	NT_drawText( 156, 24, "YES", pThis->deleteConfirmChoice == 1 ? 15 : 5, kNT_textCentre, kNT_textNormal );
 
@@ -5537,7 +5895,7 @@ static void DrawDeleteConfirm( _drumMachineAlgorithm* pThis )
 // separate dialog since the two clear different things.
 static void DrawEqDeleteConfirm( _drumMachineAlgorithm* pThis )
 {
-	DrawHeader( "DELETE EQ POINT?", NULL );
+	DrawHeader( pThis, "DELETE EQ POINT?", NULL );
 	NT_drawText( 100, 24, "NO", pThis->eqDeleteConfirmChoice == 0 ? 15 : 5, kNT_textCentre, kNT_textNormal );
 	NT_drawText( 156, 24, "YES", pThis->eqDeleteConfirmChoice == 1 ? 15 : 5, kNT_textCentre, kNT_textNormal );
 
@@ -5561,7 +5919,7 @@ static void DrawEqDeleteConfirm( _drumMachineAlgorithm* pThis )
 // than a bare point ever could.
 static void DrawEqSculptPage( _drumMachineAlgorithm* pThis )
 {
-	DrawHeader( "EQ SCULPT" );
+	DrawHeader( pThis, "EQ SCULPT" );
 
 	static const int kEqFreq1Param[kNumSlots] = { kParamEqFreq1BD, kParamEqFreq1SD, kParamEqFreq1CH, kParamEqFreq1OH };
 	static const int kEqGain1Param[kNumSlots] = { kParamEqGain1BD, kParamEqGain1SD, kParamEqGain1CH, kParamEqGain1OH };
@@ -5696,6 +6054,8 @@ bool	draw( _NT_algorithm* self )
 		DrawPresetMenu( pThis );
 	else if ( pThis->deleteConfirmOpen )
 		DrawDeleteConfirm( pThis );
+	else if ( pThis->eqDeleteConfirmOpen )
+		DrawEqDeleteConfirm( pThis );
 	else if ( kPageType[pThis->currentPage] == kPageTypeList )
 		DrawSetupPage( pThis, kPageNames[pThis->currentPage] );
 	else if ( pThis->currentPage == kPageEnvelopes )
