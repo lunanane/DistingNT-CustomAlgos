@@ -107,6 +107,46 @@ enum
 };
 static const char* const kSlotNames[kNumSlots] = { "BD", "SD", "CH", "OH" };
 
+// ApplyPost()'s post-chain segments, in actual signal-chain order - shared by
+// three things: the per-block bypass toggle (Encoder R press on that stage's
+// bar page - see kPageToFxBypassBit), the CPU profiler (Encoder R press on
+// the Signal Chain page - see fxProfiling), and DrawChainOverviewPage()'s
+// little boxes. kFxStageRender (synth Render()+sample+noise layers, steps
+// 4-6 of the pipeline) is profiled for the overview page but deliberately has
+// no bypass bit - there's nothing sensible to "disable" there short of
+// silencing the voice outright (that's what Freeze/mute are for).
+enum
+{
+	kFxStageRender,
+	kFxStageFilter, kFxStageWavefolder, kFxStageWaveshaper, kFxStageEqSculpt,
+	kFxStageTransient, kFxStageCompressor, kFxStageBitCrush, kFxStageSampleCrush,
+	kNumFxStages,
+};
+static const char* const kFxStageShortName[kNumFxStages] = {
+	"REND", "FILT", "FOLD", "WVSH", "EQ", "TRAN", "COMP", "BITC", "SCRSH",
+};
+// Bit N corresponds to stage (kFxStageFilter + N) - kFxStageRender has no bit
+// (never bypassable). Fits comfortably in a uint16_t (8 real bits used).
+enum
+{
+	kFxBypassFilter      = 1 << ( kFxStageFilter      - kFxStageFilter ),
+	kFxBypassWavefolder  = 1 << ( kFxStageWavefolder  - kFxStageFilter ),
+	kFxBypassWaveshaper  = 1 << ( kFxStageWaveshaper  - kFxStageFilter ),
+	kFxBypassEqSculpt    = 1 << ( kFxStageEqSculpt    - kFxStageFilter ),
+	kFxBypassTransient   = 1 << ( kFxStageTransient   - kFxStageFilter ),
+	kFxBypassCompressor  = 1 << ( kFxStageCompressor  - kFxStageFilter ),
+	kFxBypassBitCrush    = 1 << ( kFxStageBitCrush    - kFxStageFilter ),
+	kFxBypassSampleCrush = 1 << ( kFxStageSampleCrush - kFxStageFilter ),
+};
+// kFxStageXxx -> its bypass bit, or 0 for kFxStageRender (never bypassable) -
+// indexed directly by stage, used by ApplyPost() to test "is this stage
+// bypassed" with one array lookup instead of a switch.
+static const uint16_t kFxStageBypassBit[kNumFxStages] = {
+	0,
+	kFxBypassFilter, kFxBypassWavefolder, kFxBypassWaveshaper, kFxBypassEqSculpt,
+	kFxBypassTransient, kFxBypassCompressor, kFxBypassBitCrush, kFxBypassSampleCrush,
+};
+
 // Modulation target concepts - all 10 smoothed parameters are modulatable via
 // the Mod Matrix below; no curation needed since the matrix is a sparse
 // "N assignable routes" system, not a dense per-concept grid (an earlier
@@ -311,6 +351,54 @@ enum
 	kParamNoiseBD, kParamNoiseSD, kParamNoiseCH, kParamNoiseOH,
 	kParamNoiseTypeBD, kParamNoiseTypeSD, kParamNoiseTypeCH, kParamNoiseTypeOH,
 
+	// BITCRUSH - the very last stage in ApplyPost(), after the fixed
+	// cleanup filter. Bit: 0..100, 0 = off (bypassed, matching every other
+	// "0 = off" convention), 100 = ~3 effective bits - quantizes to a
+	// power-of-two step count via a plain integer bit-shift (see
+	// ApplyBitCrush()), no pow()/exp2() needed. Sample: 0..100, 0 = off,
+	// 100 = heaviest sample-and-hold decimation (see ApplySrCrush()) - a
+	// classic lo-fi effect, NOT true internal resampling, so it does not
+	// reduce CPU (the full chain upstream still runs at the real sample
+	// rate every time) - purely a creative effect, as anticipated when
+	// this was requested. Not modulatable (no Mod Matrix entry). Appended
+	// at the very end, like every other non-smoothed control - never
+	// inserted mid-range (see kParamFoldBD's comment for why that matters
+	// for saved presets).
+	kParamBitCrushBD, kParamBitCrushSD, kParamBitCrushCH, kParamBitCrushOH,
+	kParamSrCrushBD, kParamSrCrushSD, kParamSrCrushCH, kParamSrCrushOH,
+
+	// ATTACK MODE - selects whether (and how) this slot's post-processing
+	// chain (Filter/Wavefolder/Waveshaper/EQ Sculpt/Transient/Bitcrush -
+	// see ApplyPost()) only runs during the hit's attack window, bypassing
+	// entirely for the rest of the tail once that window has elapsed - see
+	// kAttackModeXxx/ApplyPost()'s postFxElapsed gating. Default (0)
+	// applies no gating at all (full chain for the whole release, current/
+	// original behaviour) - every other option both frees CPU AND gives a
+	// distinct "processed attack, cleaner tail" character, the trade-off
+	// this was explicitly requested to expose as a deliberate choice, not
+	// just an invisible optimization. Not modulatable (no Mod Matrix
+	// entry). Appended at the very end, like every other non-smoothed
+	// control - never inserted mid-range (see kParamFoldBD's comment for
+	// why that matters for saved presets).
+	kParamAttackModeBD, kParamAttackModeSD, kParamAttackModeCH, kParamAttackModeOH,
+
+	// SAMPLE CRUSH MODE - see kSrCrushModeXxx's comment and ApplyPost().
+	// Post (default) is the original, simple end-of-chain decimator - a
+	// pure creative effect, no CPU change. Full instead decimates before
+	// Filter/Wavefolder/Waveshaper/EQ Sculpt run, so those stages actually
+	// process fewer samples - a genuine CPU win. Not modulatable (no Mod
+	// Matrix entry). Appended at the very end, like every other non-
+	// smoothed control - never inserted mid-range (see kParamFoldBD's
+	// comment for why that matters for saved presets).
+	kParamSrCrushModeBD, kParamSrCrushModeSD, kParamSrCrushModeCH, kParamSrCrushModeOH,
+
+	// WAVESHAPER TYPE - see kWaveshaperTypeXxx's comment and ApplyPost()'s
+	// Waveshaper stage. Not modulatable (no Mod Matrix entry). Appended at
+	// the very end, like every other non-smoothed control - never inserted
+	// mid-range (see kParamFoldBD's comment for why that matters for saved
+	// presets).
+	kParamDriveTypeBD, kParamDriveTypeSD, kParamDriveTypeCH, kParamDriveTypeOH,
+
 	kNumParams,
 };
 
@@ -388,14 +476,36 @@ enum { kWavefolderTypeSine, kWavefolderTypeTriangle, kWavefolderTypeBuchla, kNum
 static char const * const kEnumWavefolderType[] = { "Sine", "Triangle", "Buchla" };
 static_assert( ARRAY_SIZE(kEnumWavefolderType) == kNumWavefolderTypes, "" );
 
+// Waveshaper type - see kParamDriveTypeBD's comment and ApplyPost()'s
+// Waveshaper stage. Replaces the old fixed Gentle->Overdrive->HardClip
+// progression stacked across the Drive knob's 0-100% range (all three
+// always computed regardless of the knob position, so a low Drive setting
+// still paid for all three stages) with a single selectable algorithm -
+// Drive now only ever runs the one type actually chosen, at whatever
+// intensity Drive dials in, for a real (not just apparent) CPU reduction
+// whenever Drive is above 0.
+enum { kWaveshaperTypeGentle, kWaveshaperTypeOverdrive, kWaveshaperTypeHardClip, kNumWaveshaperTypes };
+static char const * const kEnumWaveshaperType[] = { "Gentle", "Overdrive", "HardClip" };
+static_assert( ARRAY_SIZE(kEnumWaveshaperType) == kNumWaveshaperTypes, "" );
+
 // Transient shaper model - see kParamTransTypeBD's comment and
 // ApplyTransient(). Each is inspired by a different open-source transient
 // shaper (Classic: johannes-mueller/envolvigo; Snap: lowwavestudios/
 // DrumSnapper; Gate: ylmrx/transdes; Band: unicornsasfuel/whetstone) -
 // adapted to this project's one-knob-per-voice convention rather than
 // literal ports (none of those exposed just a single bipolar control).
-enum { kTransientClassic, kTransientSnap, kTransientGate, kTransientBand, kNumTransientTypes };
-static char const * const kEnumTransientType[] = { "Classic", "Snap", "Gate", "Band" };
+// ClassicHQ/SnapHQ (appended at the end, like every other addition to
+// this enum - never inserted mid-range, see kParamFoldBD's comment for
+// why that matters for saved presets) are byte-for-byte the same Classic/
+// Snap math, but using a real powf() call instead of the cheap FastPow()
+// bit-trick approximation the plain Classic/Snap modes use - confirmed by
+// listening that some higher-end material genuinely benefits from the
+// exact curve, so both are kept available rather than picking one; HQ
+// costs meaningfully more CPU (a real transcendental call every sample,
+// same cost FastPow() was specifically added to avoid), so it's an
+// explicit opt-in rather than the default.
+enum { kTransientClassic, kTransientSnap, kTransientGate, kTransientBand, kTransientClassicHQ, kTransientSnapHQ, kNumTransientTypes };
+static char const * const kEnumTransientType[] = { "Classic", "Snap", "Gate", "Band", "ClassicHQ", "SnapHQ" };
 static_assert( ARRAY_SIZE(kEnumTransientType) == kNumTransientTypes, "" );
 
 // Noise layer flavour - see kParamNoiseTypeBD's comment and
@@ -405,6 +515,37 @@ static_assert( ARRAY_SIZE(kEnumTransientType) == kNumTransientTypes, "" );
 enum { kNoiseTypeWhiteSnap, kNoiseTypeWhiteTail, kNoiseTypePinkSnap, kNoiseTypePinkTail, kNoiseTypeClick, kNumNoiseTypes };
 static char const * const kEnumNoiseType[] = { "WhiteSnap", "WhiteTail", "PinkSnap", "PinkTail", "Click" };
 static_assert( ARRAY_SIZE(kEnumNoiseType) == kNumNoiseTypes, "" );
+
+// Attack Mode - see kParamAttackModeBD's comment and ApplyPost()'s
+// postFxElapsed gating. Full applies no gating at all (the original,
+// always-on behaviour). Punchy and Sculpted gate the *entire* post chain
+// (Filter/Wavefolder/Waveshaper/EQ Sculpt/Transient/Bitcrush) to a fixed
+// attack window (30ms/80ms) and bypass all of it for the rest of the
+// tail - the biggest CPU win, and the most dramatic "processed attack,
+// raw tail" character change. Light only gates the two heaviest, newest
+// additions (EQ Sculpt + Transient + Bitcrush), leaving Filter/
+// Wavefolder/Waveshaper always on for the full release (the more
+// traditional "always-shaped" tone), over a longer 200ms window - a
+// smaller CPU win, a subtler character change.
+enum { kAttackModeFull, kAttackModePunchy, kAttackModeSculpted, kAttackModeLight, kNumAttackModes };
+static char const * const kEnumAttackMode[] = { "Full", "Punchy", "Sculpted", "Light" };
+static_assert( ARRAY_SIZE(kEnumAttackMode) == kNumAttackModes, "" );
+
+// Sample Crush mode - see kParamSrCrushModeBD's comment and ApplyPost().
+// Post is the original, simple sample-and-hold decimator applied as the
+// very last stage (a pure creative effect - does not reduce CPU, since
+// everything upstream still rendered at full rate regardless). Full
+// instead decimates *before* Filter/Wavefolder/Waveshaper/EQ Sculpt run,
+// processing those stages on a genuinely smaller buffer (a real CPU win
+// proportional to the crush amount) before expanding back - Transient
+// Shaper is deliberately excluded (its envelope timing constants aren't
+// derived from the sample rate the way Filter/EQ's cutoffs are, so
+// running it at a scaled effective rate would shift its attack/release
+// speed rather than just its tone - a correctness problem, not just an
+// optimization detail).
+enum { kSrCrushModePost, kSrCrushModeFull, kNumSrCrushModes };
+static char const * const kEnumSrCrushMode[] = { "Post", "Full" };
+static_assert( ARRAY_SIZE(kEnumSrCrushMode) == kNumSrCrushModes, "" );
 
 static char const * const kEnumMidiMode[] = { "Note per slot", "Channel per slot" };
 static char const * const kEnumStereo[] = { "Mono", "Stereo" };
@@ -599,6 +740,31 @@ static _NT_parameter parameters[] = {
 	{ .name = "SD noise type", .min = 0, .max = kNumNoiseTypes - 1, .def = 0, .unit = kNT_unitEnum, .scaling = 0, .enumStrings = kEnumNoiseType },
 	{ .name = "CH noise type", .min = 0, .max = kNumNoiseTypes - 1, .def = 0, .unit = kNT_unitEnum, .scaling = 0, .enumStrings = kEnumNoiseType },
 	{ .name = "OH noise type", .min = 0, .max = kNumNoiseTypes - 1, .def = 0, .unit = kNT_unitEnum, .scaling = 0, .enumStrings = kEnumNoiseType },
+
+	{ .name = "BD bit crush", .min = 0, .max = 100, .def = 0, .unit = kNT_unitPercent, .scaling = 0, .enumStrings = NULL },
+	{ .name = "SD bit crush", .min = 0, .max = 100, .def = 0, .unit = kNT_unitPercent, .scaling = 0, .enumStrings = NULL },
+	{ .name = "CH bit crush", .min = 0, .max = 100, .def = 0, .unit = kNT_unitPercent, .scaling = 0, .enumStrings = NULL },
+	{ .name = "OH bit crush", .min = 0, .max = 100, .def = 0, .unit = kNT_unitPercent, .scaling = 0, .enumStrings = NULL },
+
+	{ .name = "BD sample crush", .min = 0, .max = 100, .def = 0, .unit = kNT_unitPercent, .scaling = 0, .enumStrings = NULL },
+	{ .name = "SD sample crush", .min = 0, .max = 100, .def = 0, .unit = kNT_unitPercent, .scaling = 0, .enumStrings = NULL },
+	{ .name = "CH sample crush", .min = 0, .max = 100, .def = 0, .unit = kNT_unitPercent, .scaling = 0, .enumStrings = NULL },
+	{ .name = "OH sample crush", .min = 0, .max = 100, .def = 0, .unit = kNT_unitPercent, .scaling = 0, .enumStrings = NULL },
+
+	{ .name = "BD attack mode", .min = 0, .max = kNumAttackModes - 1, .def = 0, .unit = kNT_unitEnum, .scaling = 0, .enumStrings = kEnumAttackMode },
+	{ .name = "SD attack mode", .min = 0, .max = kNumAttackModes - 1, .def = 0, .unit = kNT_unitEnum, .scaling = 0, .enumStrings = kEnumAttackMode },
+	{ .name = "CH attack mode", .min = 0, .max = kNumAttackModes - 1, .def = 0, .unit = kNT_unitEnum, .scaling = 0, .enumStrings = kEnumAttackMode },
+	{ .name = "OH attack mode", .min = 0, .max = kNumAttackModes - 1, .def = 0, .unit = kNT_unitEnum, .scaling = 0, .enumStrings = kEnumAttackMode },
+
+	{ .name = "BD sample crush mode", .min = 0, .max = kNumSrCrushModes - 1, .def = 0, .unit = kNT_unitEnum, .scaling = 0, .enumStrings = kEnumSrCrushMode },
+	{ .name = "SD sample crush mode", .min = 0, .max = kNumSrCrushModes - 1, .def = 0, .unit = kNT_unitEnum, .scaling = 0, .enumStrings = kEnumSrCrushMode },
+	{ .name = "CH sample crush mode", .min = 0, .max = kNumSrCrushModes - 1, .def = 0, .unit = kNT_unitEnum, .scaling = 0, .enumStrings = kEnumSrCrushMode },
+	{ .name = "OH sample crush mode", .min = 0, .max = kNumSrCrushModes - 1, .def = 0, .unit = kNT_unitEnum, .scaling = 0, .enumStrings = kEnumSrCrushMode },
+
+	{ .name = "BD waveshaper type", .min = 0, .max = kNumWaveshaperTypes - 1, .def = 0, .unit = kNT_unitEnum, .scaling = 0, .enumStrings = kEnumWaveshaperType },
+	{ .name = "SD waveshaper type", .min = 0, .max = kNumWaveshaperTypes - 1, .def = 0, .unit = kNT_unitEnum, .scaling = 0, .enumStrings = kEnumWaveshaperType },
+	{ .name = "CH waveshaper type", .min = 0, .max = kNumWaveshaperTypes - 1, .def = 0, .unit = kNT_unitEnum, .scaling = 0, .enumStrings = kEnumWaveshaperType },
+	{ .name = "OH waveshaper type", .min = 0, .max = kNumWaveshaperTypes - 1, .def = 0, .unit = kNT_unitEnum, .scaling = 0, .enumStrings = kEnumWaveshaperType },
 };
 
 static const uint8_t pageRouting[]   = { kParamOutBD, kParamOutBDMode, kParamStereoBD, kParamPanBD, kParamOutSD, kParamOutSDMode, kParamStereoSD, kParamPanSD, kParamOutCH, kParamOutCHMode, kParamStereoCH, kParamPanCH, kParamOutOH, kParamOutOHMode, kParamStereoOH, kParamPanOH };
@@ -610,6 +776,7 @@ static const uint8_t pageRelease[]   = { kParamRelBD, kParamRelSD, kParamRelCH, 
 static const uint8_t pageComp[]      = { kParamCompBD, kParamCompSD, kParamCompCH, kParamCompOH };
 static const uint8_t pageFilter[]    = { kParamFiltBD, kParamFiltSD, kParamFiltCH, kParamFiltOH };
 static const uint8_t pageDrive[]     = { kParamDriveBD, kParamDriveSD, kParamDriveCH, kParamDriveOH };
+static const uint8_t pageDriveType[] = { kParamDriveTypeBD, kParamDriveTypeSD, kParamDriveTypeCH, kParamDriveTypeOH };
 static const uint8_t pagePitch[]     = { kParamPitchBD, kParamPitchSD, kParamPitchCH, kParamPitchOH };
 static const uint8_t pageVolume[]    = { kParamVolBD, kParamVolSD, kParamVolCH, kParamVolOH };
 static const uint8_t pageTone[]      = { kParamToneBD, kParamToneSD, kParamToneCH, kParamToneOH };
@@ -644,6 +811,10 @@ static const uint8_t pageTrans[]      = { kParamTransBD, kParamTransSD, kParamTr
 static const uint8_t pageTransType[]  = { kParamTransTypeBD, kParamTransTypeSD, kParamTransTypeCH, kParamTransTypeOH };
 static const uint8_t pageNoise[]      = { kParamNoiseBD, kParamNoiseSD, kParamNoiseCH, kParamNoiseOH };
 static const uint8_t pageNoiseType[]  = { kParamNoiseTypeBD, kParamNoiseTypeSD, kParamNoiseTypeCH, kParamNoiseTypeOH };
+static const uint8_t pageBitCrush[]   = { kParamBitCrushBD, kParamBitCrushSD, kParamBitCrushCH, kParamBitCrushOH };
+static const uint8_t pageSrCrush[]    = { kParamSrCrushBD, kParamSrCrushSD, kParamSrCrushCH, kParamSrCrushOH };
+static const uint8_t pageAttackMode[] = { kParamAttackModeBD, kParamAttackModeSD, kParamAttackModeCH, kParamAttackModeOH };
+static const uint8_t pageSrCrushMode[] = { kParamSrCrushModeBD, kParamSrCrushModeSD, kParamSrCrushModeCH, kParamSrCrushModeOH };
 
 // The Mod Matrix's 32 params are contiguous (kFirstModRouteParam..+31) in
 // exactly this sequential order already, so this is just that range restated
@@ -669,6 +840,7 @@ static const _NT_parameterPage pages[] = {
 	{ .name = "Compressor", .numParams = ARRAY_SIZE(pageComp), .params = pageComp },
 	{ .name = "Filter", .numParams = ARRAY_SIZE(pageFilter), .params = pageFilter },
 	{ .name = "Waveshaper", .numParams = ARRAY_SIZE(pageDrive), .params = pageDrive },
+	{ .name = "Waveshaper Type", .numParams = ARRAY_SIZE(pageDriveType), .params = pageDriveType },
 	{ .name = "Pitch", .numParams = ARRAY_SIZE(pagePitch), .params = pagePitch },
 	{ .name = "Volume", .numParams = ARRAY_SIZE(pageVolume), .params = pageVolume },
 	{ .name = "Tone", .numParams = ARRAY_SIZE(pageTone), .params = pageTone },
@@ -687,6 +859,10 @@ static const _NT_parameterPage pages[] = {
 	{ .name = "Transient Type", .numParams = ARRAY_SIZE(pageTransType), .params = pageTransType },
 	{ .name = "Noise", .numParams = ARRAY_SIZE(pageNoise), .params = pageNoise },
 	{ .name = "Noise Type", .numParams = ARRAY_SIZE(pageNoiseType), .params = pageNoiseType },
+	{ .name = "Bit Crush", .numParams = ARRAY_SIZE(pageBitCrush), .params = pageBitCrush },
+	{ .name = "Sample Crush", .numParams = ARRAY_SIZE(pageSrCrush), .params = pageSrCrush },
+	{ .name = "Attack Mode", .numParams = ARRAY_SIZE(pageAttackMode), .params = pageAttackMode },
+	{ .name = "Sample Crush Mode", .numParams = ARRAY_SIZE(pageSrCrushMode), .params = pageSrCrushMode },
 };
 
 static const _NT_parameterPages parameterPages = {
@@ -704,9 +880,11 @@ static const _NT_parameterPages parameterPages = {
 // just not duplicated in this overlay (per user feedback: they're patching/
 // config, not sound-shaping, so don't need dedicated custom-UI real estate).
 enum {
-	kPageRouting, kPageMidi, kPageEnvelopes, kPageLfos, kPageModMatrix,
+	kPageRouting, kPageMidi,
+	kPageChainOverview,
+	kPageEnvelopes, kPageLfos, kPageModMatrix,
 	kPageModel, kPageRelease, kPageCompressor, kPageFilter,
-	kPageWaveshaper,
+	kPageWaveshaper, kPageWaveshaperType,
 	kPagePitch, kPageVolume, kPageTone, kPageCharacter, kPageFm, kPageFmMode,
 	kPageSample, kPageSampleMix, kPageKnockTail, kPageMixType,
 	kPageFold, kPageFoldType,
@@ -714,20 +892,26 @@ enum {
 	kPageEqSculpt,
 	kPageTransient, kPageTransientType,
 	kPageNoise, kPageNoiseType,
+	kPageBitCrush, kPageSrCrush, kPageAttackMode,
+	kPageSrCrushMode,
 	kNumPages,
 };
-enum { kFirstCustomPage = kPageEnvelopes };
+enum { kFirstCustomPage = kPageChainOverview };
 
 // kPageTypeEqSculpt is its own bespoke custom-UI page (band visualization,
 // slot-select + dual freq/gain points - see DrawEqSculptPage()) - not a
 // plain bar page, since its control scheme (1 control selects which slot,
 // 3 more edit that slot's 2 EQ points) is nothing like every other bar
-// page's "4 controls, one per slot" layout.
-enum { kPageTypeList, kPageTypeGraph, kPageTypeBar, kPageTypeEqSculpt };
+// page's "4 controls, one per slot" layout. kPageTypeChainOverview is
+// likewise bespoke (see DrawChainOverviewPage()) - it has no per-slot
+// values at all, just a static row of FX-block boxes plus the profiler.
+enum { kPageTypeList, kPageTypeGraph, kPageTypeBar, kPageTypeEqSculpt, kPageTypeChainOverview };
 static const int kPageType[kNumPages] = {
-	kPageTypeList, kPageTypeList, kPageTypeGraph, kPageTypeGraph, kPageTypeList,
+	kPageTypeList, kPageTypeList,
+	kPageTypeChainOverview,
+	kPageTypeGraph, kPageTypeGraph, kPageTypeList,
 	kPageTypeBar, kPageTypeBar, kPageTypeBar, kPageTypeBar,
-	kPageTypeBar,
+	kPageTypeBar, kPageTypeBar,
 	kPageTypeBar, kPageTypeBar, kPageTypeBar, kPageTypeBar, kPageTypeBar, kPageTypeBar,
 	kPageTypeBar, kPageTypeBar, kPageTypeBar, kPageTypeBar,
 	kPageTypeBar, kPageTypeBar,
@@ -735,18 +919,22 @@ static const int kPageType[kNumPages] = {
 	kPageTypeEqSculpt,
 	kPageTypeBar, kPageTypeBar,
 	kPageTypeBar, kPageTypeBar,
+	kPageTypeBar, kPageTypeBar, kPageTypeBar,
+	kPageTypeBar,
 };
 // List pages (Routing/MIDI/Mod Matrix) use these via SetupPageParams()/
 // SetupPageItemCount(); graph/bar pages (Envelopes/LFOs/Model..Pan) use
 // kPageParams directly since they always have exactly 4 params (one per
-// pot/encoder control - see customUi()). EQ Sculpt's entry here
-// (pageEqSculptList) is never actually read by its own customUi()/draw()
-// handling (both fully special-cased) - it's only here so this array has
+// pot/encoder control - see customUi()). EQ Sculpt's and Signal Chain's
+// entries here are never actually read by their own customUi()/draw()
+// handling (both fully special-cased) - only here so this array has
 // *something* valid at that index, same as every other page.
 static const uint8_t* const kPageParams[kNumPages] = {
-	pageRouting, pageMidi, pageEnvelopes, pageLfos, pageModMatrix,
+	pageRouting, pageMidi,
+	pageEqSculptList,
+	pageEnvelopes, pageLfos, pageModMatrix,
 	pageModel, pageRelease, pageComp, pageFilter,
-	pageDrive,
+	pageDrive, pageDriveType,
 	pagePitch, pageVolume, pageTone, pageChar, pageFm, pageFmMode,
 	pageSample, pageSampleMix, pageKnockTail, pageMixType,
 	pageFold, pageFoldType,
@@ -754,11 +942,15 @@ static const uint8_t* const kPageParams[kNumPages] = {
 	pageEqSculptList,
 	pageTrans, pageTransType,
 	pageNoise, pageNoiseType,
+	pageBitCrush, pageSrCrush, pageAttackMode,
+	pageSrCrushMode,
 };
 static const int kPageItemCount[kNumPages] = {
-	(int)ARRAY_SIZE(pageRouting), (int)ARRAY_SIZE(pageMidi), 0, 0, (int)ARRAY_SIZE(pageModMatrix),
-	0, 0, 0, 0,
+	(int)ARRAY_SIZE(pageRouting), (int)ARRAY_SIZE(pageMidi),
 	0,
+	0, 0, (int)ARRAY_SIZE(pageModMatrix),
+	0, 0, 0, 0,
+	0, 0,
 	0, 0, 0, 0, 0, 0,
 	0, 0, 0, 0,
 	0, 0,
@@ -766,11 +958,15 @@ static const int kPageItemCount[kNumPages] = {
 	0,
 	0, 0,
 	0, 0,
+	0, 0, 0,
+	0,
 };
 static const char* const kPageNames[kNumPages] = {
-	"ROUTING", "MIDI", "ENVELOPES", "LFOS", "MOD MATRIX",
+	"ROUTING", "MIDI",
+	"SIGNAL CHAIN",
+	"ENVELOPES", "LFOS", "MOD MATRIX",
 	"MODEL", "RELEASE", "COMPRESSOR", "FILTER",
-	"WAVESHAPE",
+	"WAVESHAPE", "WAVESHAPE TYPE",
 	"PITCH", "VOLUME", "TONE", "CHARACTER", "FM", "FM MODE",
 	"SAMPLE", "SAMPLE MIX", "KNOCK/TAIL", "MIX TYPE",
 	"WAVEFOLDER", "FOLD TYPE",
@@ -778,11 +974,15 @@ static const char* const kPageNames[kNumPages] = {
 	"EQ SCULPT",
 	"TRANSIENT", "TRANSIENT TYPE",
 	"NOISE", "NOISE TYPE",
+	"BIT CRUSH", "SAMPLE CRUSH", "ATTACK MODE",
+	"SAMPLE CRUSH MODE",
 };
 static const bool kPageBipolar[kNumPages] = {
-	false, false, false, false, false,
-	false, false, false, true,
+	false, false,
 	false,
+	false, false, false,
+	false, false, false, true,
+	false, false,
 	false, false, false, false, false, false,
 	false, false, false, false,
 	false, false,
@@ -790,6 +990,8 @@ static const bool kPageBipolar[kNumPages] = {
 	false,
 	true, false,
 	false, false,
+	false, false, false,
+	false,
 };
 // kConceptXxx for each bar-style page, or -1 for non-bar pages and Model/FM
 // Mode/Fold Type/Sample/Mix Type/Pan/EQ Sculpt/Transient/Transient Type
@@ -799,9 +1001,11 @@ static const bool kPageBipolar[kNumPages] = {
 // touching the Mod Matrix's own append-only kConceptXxx enum for this
 // round).
 static const int kPageConcept[kNumPages] = {
-	-1, -1, -1, -1, -1,
+	-1, -1,
+	-1,
+	-1, -1, -1,
 	-1, kConceptRelease, kConceptCompressor, kConceptFilter,
-	kConceptDrive,
+	kConceptDrive, -1,
 	kConceptPitch, kConceptVolume, kConceptTone, kConceptCharacter, kConceptFm, -1,
 	-1, -1, -1, -1,
 	kConceptFold, -1,
@@ -809,6 +1013,27 @@ static const int kPageConcept[kNumPages] = {
 	-1,
 	-1, -1,
 	-1, -1,
+	-1, -1, -1,
+	-1,
+};
+// kFxStageXxx (bypassable ones only) for each bar-style page, or -1 for
+// pages that aren't a real ApplyPost() stage - see kPageToFxStage's use in
+// customUi() (Encoder R press toggles that stage's bypass bit).
+static const int kPageToFxStage[kNumPages] = {
+	-1, -1,
+	-1,
+	-1, -1, -1,
+	-1, -1, kFxStageCompressor, kFxStageFilter,
+	kFxStageWaveshaper, -1,
+	-1, -1, -1, -1, -1, -1,
+	-1, -1, -1, -1,
+	kFxStageWavefolder, -1,
+	-1,
+	kFxStageEqSculpt,
+	kFxStageTransient, -1,
+	-1, -1,
+	kFxStageBitCrush, kFxStageSampleCrush, -1,
+	-1,
 };
 
 // The 10 concepts below Model get smoothed for the preset-load fade (Model
@@ -878,6 +1103,11 @@ static const uint8_t kModParams[] = {
 	kParamTransTypeBD, kParamTransTypeSD, kParamTransTypeCH, kParamTransTypeOH,
 	kParamNoiseBD, kParamNoiseSD, kParamNoiseCH, kParamNoiseOH,
 	kParamNoiseTypeBD, kParamNoiseTypeSD, kParamNoiseTypeCH, kParamNoiseTypeOH,
+	kParamBitCrushBD, kParamBitCrushSD, kParamBitCrushCH, kParamBitCrushOH,
+	kParamSrCrushBD, kParamSrCrushSD, kParamSrCrushCH, kParamSrCrushOH,
+	kParamAttackModeBD, kParamAttackModeSD, kParamAttackModeCH, kParamAttackModeOH,
+	kParamSrCrushModeBD, kParamSrCrushModeSD, kParamSrCrushModeCH, kParamSrCrushModeOH,
+	kParamDriveTypeBD, kParamDriveTypeSD, kParamDriveTypeCH, kParamDriveTypeOH,
 };
 enum { kNumModRouteParamsTotal = kNumModRoutes * kNumModRouteParams };
 enum { kNumModParams = ARRAY_SIZE(kModParams) + kNumModRouteParamsTotal };
@@ -1055,8 +1285,105 @@ struct _drumVoicePost
 	// change, rather than every block while the layer is active.
 	int cachedNoiseFilterMode;
 
-	void Init()
+	// Sample-and-hold decimator state for ApplySrCrush() - held is the
+	// last "sampled" value, reused for however many real samples the
+	// current Sample Crush amount says to hold it.
+	float srHoldValue;
+	int srHoldCounter;
+
+	// Attack Mode gating (see ApplyPost()'s postFxElapsed comment) - time
+	// elapsed since this voice's last trigger, reset to 0 on trig, advanced
+	// by blockSeconds once per ApplyPost() call (block-level granularity,
+	// same convention as every other envelope in this file). Full mode
+	// never reads this at all; the other modes compare it against a fixed
+	// attack-window length to decide whether the gated stages still run.
+	float postFxElapsed;
+
+	// Sample Crush Full mode (see ApplyPost()'s reduced-buffer path) -
+	// Filter/EQ Sculpt's own coefficient caches (cachedFilterParam/
+	// cachedEqFreq1/2) are keyed only on the knob value, unaware that
+	// plaits::kSampleRate gets temporarily rescaled while Full mode is
+	// active - so a knob that hasn't moved would otherwise wrongly reuse
+	// coefficients computed for a *different* effective sample rate the
+	// moment the crush amount (hence the rescale factor) changes, or the
+	// moment Full mode is entered/left. This tracks the holdSamples value
+	// those caches were last computed under (-1 = "real, unscaled rate")
+	// so ApplyPost() can force a recompute exactly when that changes, in
+	// either direction.
+	int cachedCrushHoldSamples;
+
+	// Freeze - frozenBuf points into the DRAM block construct() allocates
+	// (FreezeMaxFrames() samples). Arming (freezeArmed = true, set by the
+	// preset-menu Freeze action) does NOT itself render anything - that
+	// would mean doing up to a full second of Render()/MixSampleLayer()/
+	// MixNoiseLayer() work synchronously in one go, far more than a single
+	// block's real-time budget, exactly the kind of stutter risk already
+	// known from sample loading on this project. Instead, arming just
+	// flags "capture the next real trigger's output as it renders" -
+	// ProcessKick/Snare/Hat append each active block's already-being-
+	// computed `scratch` (steps 4-6, pre-ApplyPost) into frozenBuf while
+	// actually capturing, piggy-backing on however many blocks that hit
+	// naturally takes (the same pacing a live hit already uses - no extra
+	// synchronous work, so no new stutter risk), and finalize (frozen =
+	// true, freezeArmed = false, freezeCapturing = false, frozenParamHash
+	// snapshotted) the moment that voice's own existing idle-detection says
+	// the hit is over. Deliberately does NOT finalize on a buffer-full
+	// safety net anymore - a mid-hit forced finalize would switch the very
+	// next block from live (still audibly decaying) to frozen playback
+	// starting over at frame 0, an audible restart/jump. Instead a too-long
+	// hit just stops accumulating once frozenBuf is full and waits for the
+	// real idle point, same as any other hit.
+	//
+	// freezeArmed alone means "waiting for the next trigger to start
+	// capturing" - actual appending only begins once freezeCapturing also
+	// goes true (set on the first `trig` seen while armed). This matters
+	// because arming can catch a voice mid-decay from a hit that started
+	// *before* arming - without gating on freezeCapturing, that leftover
+	// tail would get appended first, burying the next real hit's attack in
+	// the middle of frozenBuf instead of at frame 0.
+	//
+	// Every trigger is still let through live (TriggerSlot() never drops
+	// one - a performance shouldn't audibly lose a beat just because
+	// Freeze is arming in the background) - a retrigger that lands while
+	// already capturing just restarts frozenNumFrames back to 0 and begins
+	// recording this newer hit's attack instead, since frame 0 must always
+	// be a real attack. Finalizing (the switch to frozen playback) only
+	// ever happens at the voice's natural idle point, so this can only
+	// complete once the pattern actually gives this slot a gap - if it
+	// never does, the voice simply never freezes and keeps playing live
+	// indefinitely, which costs nothing extra and is inaudible (still
+	// exactly the live sound), rather than dropping any hits to force it.
+	//
+	// frozenNumFrames is how much of frozenBuf is actually valid captured
+	// audio. While frozen (and not re-armed), triggering this voice plays
+	// frozenBuf back directly (frozenPlayPos tracks position) instead of
+	// calling into the live model/sample/noise layers at all - ApplyPost()
+	// runs unchanged either way, live, regardless of which source fed
+	// `scratch`. frozenParamHash is a cheap combined snapshot of every
+	// parameter that fed the frozen render (Model/Pitch/Release/Tone/
+	// Character/FM/Sample selection+mix/Noise selection+type) taken at
+	// freeze-finalize time - any live edit to any of those no longer
+	// matches the hash, and un-freezes automatically (the frozen buffer is
+	// stale the instant any of them change - a correctness requirement,
+	// not just a nicety - see ProcessKick/Snare/Hat's un-freeze check).
+	float* frozenBuf;
+	int frozenNumFrames;
+	bool frozen;
+	bool freezeArmed;
+	bool freezeCapturing;
+	int frozenPlayPos;
+	int frozenParamHash;
+
+	void Init( float* freezeBuf )
 	{
+		frozenBuf = freezeBuf;
+		frozenNumFrames = 0;
+		frozen = false;
+		freezeArmed = false;
+		freezeCapturing = false;
+		frozenPlayPos = 0;
+		frozenParamHash = 0;
+
 		lpFilter.Init();
 		hpFilter.Init();
 		drive.Init();
@@ -1106,6 +1433,11 @@ struct _drumVoicePost
 		noiseActive = false;
 		noiseFilter.Init();
 		cachedNoiseFilterMode = 0;
+
+		srHoldValue = 0.0f;
+		srHoldCounter = 0;
+		postFxElapsed = 0.0f;
+		cachedCrushHoldSamples = -1;
 	}
 };
 
@@ -1856,9 +2188,9 @@ struct _kickVoice : _drumVoicePost
 	CombBodyVoice combBody;
 	ChaosFmVoice chaosFm;
 
-	void Init( float* combBodyDelayBuf )
+	void Init( float* combBodyDelayBuf, float* freezeBuf )
 	{
-		_drumVoicePost::Init();
+		_drumVoicePost::Init( freezeBuf );
 		analog.Init();
 		synthetic.Init();
 		elementsExciter.Init();
@@ -1885,9 +2217,9 @@ struct _snareVoice : _drumVoicePost
 	CombBodyVoice combBody;
 	ChaosFmVoice chaosFm;
 
-	void Init( float* combBodyDelayBuf )
+	void Init( float* combBodyDelayBuf, float* freezeBuf )
 	{
-		_drumVoicePost::Init();
+		_drumVoicePost::Init( freezeBuf );
 		analog.Init();
 		synthetic.Init();
 		elementsExciter.Init();
@@ -1923,9 +2255,9 @@ struct _hatVoice : _drumVoicePost
 	float cymbalTotalS;
 	bool cymbalActive;
 
-	void Init()
+	void Init( float* freezeBuf )
 	{
-		_drumVoicePost::Init();
+		_drumVoicePost::Init( freezeBuf );
 		hihat.Init();
 		elementsExciter.Init();
 		elementsResonator.Init();
@@ -2049,6 +2381,18 @@ struct _drumMachineAlgorithm : public _NT_algorithm
 
 	_paramSmoother smoother[kNumSmoothedParams];
 	bool smoothersInitialized;
+
+	// Recomputed fresh every block, before any voice processing (see
+	// step()) - true if at least one of the kNumModRoutes routes has a
+	// real Source (not None). Lets ModulatedViaMatrix() skip its own
+	// per-call route scan entirely on a preset with nothing patched into
+	// the Mod Matrix at all (a fresh/default preset, or simply one that
+	// doesn't use it), rather than looping all 12 routes and finding
+	// nothing on every one of the ~30 calls per block that make - always
+	// recomputed from pThis->v[] directly (never incrementally maintained),
+	// so it can never desync regardless of how a route's Source got
+	// changed (UI, host automation, preset load, MIDI-mapped CC, etc).
+	bool anyModRouteActive;
 	// Non-zero while a preset Load's NT_setParameterFromUi() calls are in
 	// flight, so parameterChanged() knows to leave the ramp we just set up
 	// alone instead of snapping it (see LoadPreset()).
@@ -2130,6 +2474,13 @@ struct _drumMachineAlgorithm : public _NT_algorithm
 	int presetMenuStage;	// 0 = browsing slots, 1 = choosing Load/Save
 	int presetMenuAction;	// 0 = Load, 1 = Save
 	int presetMenuIndex;	// which of kNumPresets slots is selected
+
+	// Freeze sequencing (see ArmFreeze()'s comment) - captures one slot at a
+	// time (BD, then SD, then CH, then OH) rather than all 4 at once, so a
+	// fast pattern only ever has to drop hits for one voice's capture window
+	// at a time. -1 = no freeze sequence in progress; otherwise the slot
+	// (kSlotBD..kSlotOH) currently armed/capturing.
+	int freezeSeqSlot;
 
 	// Delete-modifier confirm dialog - opened by clicking the pot/encoder
 	// for a given slot while in quick-edit depth mode on a bar page (see
@@ -2236,6 +2587,26 @@ struct _drumMachineAlgorithm : public _NT_algorithm
 	// derived and its caveats. Purely a self-diagnostic display value (see
 	// DrawHeader()) - never read by any DSP or control-flow code.
 	float cpuPercent;
+
+	// Per-stage FX bypass - see kFxBypassXxx's comment. One flag set for all
+	// 4 slots at once (a quick, blanket "save CPU right now" toggle rather
+	// than a per-slot mixing decision), toggled by pressing Encoder R while
+	// on that stage's own bar page (see kPageToFxBypassBit). Session-local,
+	// like Freeze - deliberately not reset by LoadPreset()/NewPreset(), so a
+	// bypass chosen mid-performance survives switching presets until
+	// explicitly toggled back.
+	uint16_t fxBypassMask;
+
+	// CPU profiler - see kFxStageXxx's comment and DrawChainOverviewPage().
+	// Toggled by pressing Encoder R on the Signal Chain overview page.
+	// fxStageCycles accumulates raw cycles for the block currently being
+	// measured (zeroed at the top of step(), summed across all 4 voices'
+	// ApplyPost() calls, then converted into fxStagePercent and re-zeroed) -
+	// only ever touched while fxProfiling is true, so profiling costs
+	// nothing (not even the cycle-counter reads) while switched off.
+	bool fxProfiling;
+	uint32_t fxStageCycles[kNumFxStages];
+	float fxStagePercent[kNumFxStages];
 };
 
 // ---------------------------------------------------------------------
@@ -2258,6 +2629,19 @@ struct _drumMachineAlgorithm : public _NT_algorithm
 static int AnalysisMaxFrames()
 {
 	return (int)( 0.25f * NT_globals.sampleRate );
+}
+
+// Per-slot Freeze buffer capacity (see the Freeze plan/kParamXxx around
+// _drumVoicePost::frozenBuf) - deliberately capped well short of
+// IdleSamples()'s 2.0s kMaxTailSeconds ceiling for this first version: 4
+// slots x 2.0s x float32 would be a real jump from this plugin's existing
+// (well under 100KB) DRAM footprint with no way to know the platform's
+// actual budget in advance (no datasheet figure, no runtime query - see
+// the Freeze plan's DRAM sizing notes), so this starts at a smaller,
+// still-useful 1.0s and can be raised once confirmed safe on hardware.
+static int FreezeMaxFrames()
+{
+	return (int)( 1.0f * NT_globals.sampleRate );
 }
 
 // (Re)starts the sample-system "settle" window - see
@@ -2482,12 +2866,29 @@ void	calculateRequirements( _NT_algorithmRequirements& req, const int32_t* speci
 	// loaded a fresh preset's samples at once.
 	// Plus 2x CombBodyVoice delay lines (kick + snare - the only model here
 	// that needs an actual delay buffer rather than fixed-size DTC state).
+	// Plus kNumSlots' worth of Freeze buffers (see FreezeMaxFrames()'s
+	// comment) - a first, deliberately modest test of how much extra DRAM
+	// this platform will actually grant a single algorithm; if this fails
+	// to load on real hardware, that's the answer to how much headroom
+	// exists, with no other way to have found out in advance.
 	req.dram = 7 * NT_globals.maxFramesPerStep * sizeof(float)
 		+ AnalysisMaxFrames() * sizeof(float)
 		+ kNumSlots * NT_globals.streamBufferSizeBytes
-		+ 2 * CombBodyVoice::kMaxDelaySamples * sizeof(float);
+		+ 2 * CombBodyVoice::kMaxDelaySamples * sizeof(float)
+		+ kNumSlots * FreezeMaxFrames() * sizeof(float);
 	req.itc = 0;
 }
+
+// REVERTED: this project briefly enabled the Cortex-M7 FPU's flush-to-zero
+// mode (FPSCR FZ bit) here, on the theory that denormal floats in
+// recursive filter/envelope state were behind some CPU-cost oddities
+// (notably Waveshaper appearing to cost more at high settings). Confirmed
+// by listening: it made the Waveshaper noticeably noisier at high
+// settings, a real regression, so it's been removed entirely rather than
+// left in "just in case" - the denormal-cost theory may still be correct
+// for the CPU side, but not at the expense of sound quality, and this is a
+// shared, device-wide FPU mode bit (not scoped to this plugin alone) so
+// there's extra reason not to leave it flipped without a clear win.
 
 _NT_algorithm*	construct( const _NT_algorithmMemoryPtrs& ptrs, const _NT_algorithmRequirements& req, const int32_t* specifications )
 {
@@ -2512,6 +2913,13 @@ _NT_algorithm*	construct( const _NT_algorithmMemoryPtrs& ptrs, const _NT_algorit
 	alg->elementsExciteScratch = dram; dram += maxFrames;
 	float* kickCombBodyDelay = dram; dram += CombBodyVoice::kMaxDelaySamples;
 	float* snareCombBodyDelay = dram; dram += CombBodyVoice::kMaxDelaySamples;
+
+	// Freeze buffers (see FreezeMaxFrames()'s comment) - one per slot.
+	int freezeMaxFrames = FreezeMaxFrames();
+	float* kickFreezeBuf = dram; dram += freezeMaxFrames;
+	float* snareFreezeBuf = dram; dram += freezeMaxFrames;
+	float* closedHatFreezeBuf = dram; dram += freezeMaxFrames;
+	float* openHatFreezeBuf = dram; dram += freezeMaxFrames;
 
 	alg->analysisMaxFrames = AnalysisMaxFrames();
 	alg->analysisBuffer = dram; dram += alg->analysisMaxFrames;
@@ -2545,10 +2953,10 @@ _NT_algorithm*	construct( const _NT_algorithmMemoryPtrs& ptrs, const _NT_algorit
 	alg->sdCardWasMounted = false;
 	alg->sampleSystemGraceSamples = 0;
 
-	alg->dtc->kick.Init( kickCombBodyDelay );
-	alg->dtc->snare.Init( snareCombBodyDelay );
-	alg->dtc->closedHat.Init();
-	alg->dtc->openHat.Init();
+	alg->dtc->kick.Init( kickCombBodyDelay, kickFreezeBuf );
+	alg->dtc->snare.Init( snareCombBodyDelay, snareFreezeBuf );
+	alg->dtc->closedHat.Init( closedHatFreezeBuf );
+	alg->dtc->openHat.Init( openHatFreezeBuf );
 
 	alg->currentPage = kFirstCustomPage;
 	alg->setupSelectedItem = 0;
@@ -2559,14 +2967,23 @@ _NT_algorithm*	construct( const _NT_algorithmMemoryPtrs& ptrs, const _NT_algorit
 	alg->eqDeleteConfirmOpen = false;
 	alg->eqDeleteConfirmChoice = 0;
 	alg->cpuPercent = 0.0f;
+	alg->fxBypassMask = 0;
+	alg->fxProfiling = false;
+	for ( int i=0; i<kNumFxStages; ++i )
+	{
+		alg->fxStageCycles[i] = 0;
+		alg->fxStagePercent[i] = 0.0f;
+	}
 	alg->potHasLastPos[0] = alg->potHasLastPos[1] = alg->potHasLastPos[2] = false;
 	alg->potAccum[0] = alg->potAccum[1] = alg->potAccum[2] = 0.0f;
 	alg->smoothersInitialized = false;
+	alg->anyModRouteActive = false;
 	alg->loadingPreset = 0;
 	alg->presetMenuOpen = false;
 	alg->presetMenuStage = 0;
 	alg->presetMenuAction = 0;
 	alg->presetMenuIndex = 0;
+	alg->freezeSeqSlot = -1;
 	alg->deleteConfirmOpen = false;
 	alg->deleteConfirmSlot = 0;
 	alg->deleteConfirmChoice = 0;
@@ -2989,6 +3406,13 @@ static const float kConceptRange[kNumConcepts] = {
 
 static float ModulatedViaMatrix( _drumMachineAlgorithm* pThis, int concept, int slot, float baseValue, float env1Level, float env2Level )
 {
+	// See anyModRouteActive's comment - skips the whole route scan below
+	// when nothing is patched into the Mod Matrix at all, which this
+	// function's ~30 call sites per block otherwise pay for unconditionally
+	// regardless of whether the result actually changes anything.
+	if ( !pThis->anyModRouteActive )
+		return baseValue;
+
 	float result = baseValue;
 	for ( int r=0; r<kNumModRoutes; ++r )
 	{
@@ -3315,6 +3739,9 @@ void	parameterChanged( _NT_algorithm* self, int p )
 
 static void TriggerSlot( _drumMachineAlgorithm* pThis, int slot, float accent )
 {
+	// Every trigger is always let through, live, regardless of Freeze state
+	// - see _drumVoicePost::freezeArmed's comment for how capture handles
+	// retriggering without ever dropping a beat from the performance.
 	switch ( slot )
 	{
 	case kSlotBD: pThis->dtc->kick.pendingTrigger = true; pThis->dtc->kick.pendingAccent = accent; break;
@@ -3403,6 +3830,63 @@ static int IdleSamples( float decay01 )
 	return (int)( plaits::kSampleRate * seconds );
 }
 
+// Caps how far Release can stretch out a few meaningfully more expensive
+// models' own decay time - Elements and Modal each run a whole bank of
+// stmlib::Svf resonators every sample (the cost scales with mode count,
+// not with how loud/quiet the signal currently is), CombBody reads/writes
+// its own delay line every sample, and SweepHat runs 4 oscillators through
+// 2 filters - all costlier per-sample than a single filter or oscillator.
+// Since a voice's total cost is (roughly) per-sample cost x how long it
+// stays active, and IdleSamples() is what actually gates whether that
+// per-sample work happens at all, shortening these models' own effective
+// decay directly bounds the worst case: a user cranking Release to
+// maximum on an Elements hi-hat no longer pays for a full 2s of resonator-
+// bank processing on every hit. Applied to the value passed to the
+// model's own Render() call AND to the IdleSamples() budget so the two
+// stay consistent (a shorter internal decay but an unshortened idle
+// window would just render near-silence for the difference, wasting the
+// exact CPU this is trying to save) - ExtendIdleForSample() still widens
+// the budget back if a real sample is loaded on top, so a loaded sample's
+// own tail is never truncated by this. Returns 1.0 (no cap) for every
+// other, cheaper model.
+static float BdSdModelDecayCap( int model )
+{
+	if ( model == 2 ) return 0.5f;	// Elements
+	if ( model == 7 ) return 0.6f;	// CombBody
+	return 1.0f;
+}
+static float HatModelDecayCap( int model )
+{
+	if ( model == 1 ) return 0.5f;	// Elements
+	if ( model == 3 ) return 0.5f;	// Modal
+	if ( model == 5 ) return 0.7f;	// SweepHat
+	return 1.0f;
+}
+
+// Cheap combined snapshot of every raw parameter that feeds a voice's
+// Freeze render (steps 4-6: synth model + sample layer + noise layer) -
+// see _drumVoicePost::frozenParamHash's comment. Any live edit to any of
+// these makes a currently-frozen voice's cached audio stale, so
+// ProcessKick/Snare/Hat recompute this every block and un-freeze on a
+// mismatch. A plain polynomial rolling hash is more than enough here -
+// this only ever needs to detect "changed at all", not produce a
+// well-distributed hash for lookups.
+static int ComputeFreezeHash( int model, int pitch, int release, int tone, int character, int fm, int sample, int sampleMix, int noise, int noiseType )
+{
+	int h = 0;
+	h = h * 31 + model;
+	h = h * 31 + pitch;
+	h = h * 31 + release;
+	h = h * 31 + tone;
+	h = h * 31 + character;
+	h = h * 31 + fm;
+	h = h * 31 + sample;
+	h = h * 31 + sampleMix;
+	h = h * 31 + noise;
+	h = h * 31 + noiseType;
+	return h;
+}
+
 // Volume page gives up to +6dB of headroom (max raised 100->200%) for slots
 // that need to go louder - applied only when the user actually turns that
 // knob up, not as an always-on multiplier (a flat always-on boost here
@@ -3457,6 +3941,16 @@ static void ApplyCompressor( _drumVoicePost& v, float* buf, int numFrames, int c
 static float HardClip( float x )
 {
 	x *= 4.0f;
+	CONSTRAIN( x, -1.0f, 1.0f );
+	return x;
+}
+
+// A gentler hard clip than HardClip() above - same cost class (one
+// multiply, one clamp), just a milder pre-gain, giving a genuinely
+// different (softer) character rather than a duplicate.
+static float GentleClip( float x )
+{
+	x *= 1.5f;
 	CONSTRAIN( x, -1.0f, 1.0f );
 	return x;
 }
@@ -3651,6 +4145,29 @@ static void ApplyEqSculpt( _drumVoicePost& v, float* buf, float* tapBuf, int num
 // project's single bipolar knob-per-voice convention (none of the
 // references exposed just one control) - see kTransientXxx's comment for
 // the source of each.
+// Fast, libm-free approximate pow(base, exponent) for base > 0 -
+// Schraudolph's classic bit-manipulation trick: reinterpret the float's
+// bit pattern as an integer, scale it by `exponent`, reinterpret back.
+// Accurate to within a few percent, which is plenty for a musical gain-
+// shaping curve (not appropriate anywhere exact precision matters).
+// Replaces a real powf() call in ApplyTransient()'s Classic/Snap models,
+// which was measured costing several percent CPU on its own when called
+// every single sample - besides being far cheaper (a handful of integer/
+// float ops vs. a real transcendental library routine), this also removes
+// a libm call from the object file entirely, one less symbol at risk of
+// the load-time resolution failure class documented in the
+// distingnt_libm_symbol_constraints project memory (moot here since powf
+// is already confirmed to resolve, but a free bonus regardless).
+static inline float FastPow( float base, float exponent )
+{
+	int32_t i;
+	memcpy( &i, &base, sizeof(float) );
+	i = (int32_t)( exponent * ( i - 1064866805 ) + 1064866805 );
+	float result;
+	memcpy( &result, &i, sizeof(float) );
+	return result;
+}
+
 static void ApplyTransient( _drumVoicePost& v, float* buf, int numFrames, int amount, int type )
 {
 	// Same click-prevention idea as ApplyEqSculpt()'s gain smoothing (see
@@ -3666,7 +4183,7 @@ static void ApplyTransient( _drumVoicePost& v, float* buf, int numFrames, int am
 
 	float depth = v.transAmountSmoothed * 0.01f;	// -1..1
 
-	if ( type == kTransientClassic )
+	if ( type == kTransientClassic || type == kTransientClassicHQ )
 	{
 		// "Classic" - inspired by johannes-mueller/envolvigo (itself
 		// modeled on hardware transient designers like the SPL Transient
@@ -3674,10 +4191,16 @@ static void ApplyTransient( _drumVoicePost& v, float* buf, int numFrames, int am
 		// momentary peaks, a slow envelope (slow attack+release) tracks
 		// the trailing average; their ratio is >1 right at a transient and
 		// ~1 during sustain. Raising that ratio to a depth-scaled power
-		// (powf() is confirmed to resolve on this firmware - see
-		// distingnt_libm_symbol_constraints project memory) gives a
-		// multiplicative gain that's boosted at transients and neutral
-		// during sustain (or the reverse, for negative depth).
+		// gives a multiplicative gain that's boosted at transients and
+		// neutral during sustain (or the reverse, for negative depth).
+		// Plain Classic uses FastPow() (cheap bit-trick approximation -
+		// see its own comment, this loop runs every sample); ClassicHQ uses
+		// a real powf() call instead - confirmed by listening that some
+		// higher-end material genuinely benefits from the exact curve, at
+		// the cost of meaningfully more CPU (the exact cost FastPow() was
+		// added to avoid), so it's an explicit opt-in alternative rather
+		// than a replacement.
+		bool hq = ( type == kTransientClassicHQ );
 		constexpr float kFastAttack = 0.6f;
 		constexpr float kFastRelease = 0.05f;
 		constexpr float kSlowCoeff = 0.003f;
@@ -3692,14 +4215,14 @@ static void ApplyTransient( _drumVoicePost& v, float* buf, int numFrames, int am
 			slowEnv += ( absIn - slowEnv ) * kSlowCoeff;
 			float ratio = fastEnv / ( slowEnv + 0.001f );
 			CONSTRAIN( ratio, 0.05f, 8.0f );
-			float gain = powf( ratio, exponent );
+			float gain = hq ? powf( ratio, exponent ) : FastPow( ratio, exponent );
 			CONSTRAIN( gain, 0.1f, 4.0f );
 			buf[i] *= gain;
 		}
 		v.transFastEnv = fastEnv;
 		v.transSlowEnv = slowEnv;
 	}
-	else if ( type == kTransientSnap )
+	else if ( type == kTransientSnap || type == kTransientSnapHQ )
 	{
 		// "Snap" - inspired by lowwavestudios/DrumSnapper: rather than
 		// multiplying the whole signal by a gain, this adds an exponential
@@ -3708,7 +4231,9 @@ static void ApplyTransient( _drumVoicePost& v, float* buf, int numFrames, int am
 		// portions (ratio~1) are left essentially untouched while
 		// transients get an emphasized boost (or, for negative depth, a
 		// dip) layered in - a more surgical character than Classic's
-		// straight multiply.
+		// straight multiply. SnapHQ uses a real powf() call instead of
+		// FastPow() - same trade-off as ClassicHQ above.
+		bool hq = ( type == kTransientSnapHQ );
 		constexpr float kFastAttack = 0.8f;
 		constexpr float kFastRelease = 0.08f;
 		constexpr float kSlowCoeff = 0.004f;
@@ -3723,7 +4248,8 @@ static void ApplyTransient( _drumVoicePost& v, float* buf, int numFrames, int am
 			slowEnv += ( absIn - slowEnv ) * kSlowCoeff;
 			float ratio = fastEnv / ( slowEnv + 0.001f );
 			CONSTRAIN( ratio, 0.05f, 8.0f );
-			float enhance = ( powf( ratio, exponent ) - 1.0f ) * 2.0f;
+			float powResult = hq ? powf( ratio, exponent ) : FastPow( ratio, exponent );
+			float enhance = ( powResult - 1.0f ) * 2.0f;
 			CONSTRAIN( enhance, -3.0f, 3.0f );
 			buf[i] += enhance * buf[i];
 		}
@@ -3803,88 +4329,315 @@ static void ApplyTransient( _drumVoicePost& v, float* buf, int numFrames, int am
 	}
 }
 
-static void ApplyPost( _drumVoicePost& v, float* buf, float* dryBuf, int numFrames, int filterParam, int foldParam, int foldType, int eqFreq1, int eqGain1, int eqFreq2, int eqGain2, int transAmount, int transType, int compParam, int driveParam, int volParam )
+// Bit reduction - the very last stage in ApplyPost(). 0 = off (bypassed,
+// matching every other "0 = off" convention). Quantizes to a power-of-two
+// step count via a plain integer bit-shift, not a pow()/exp2() call - exact,
+// and free of any transcendental-math cost or libm-symbol risk. roundf() is
+// FPU-hardware-inlined on this platform (see
+// distingnt_libm_symbol_constraints project memory), never a real libm
+// call, so this is as cheap as a plain floor/truncate would be.
+static void ApplyBitCrush( float* buf, int numFrames, int bitAmount )
 {
-	if ( filterParam < 0 )
+	if ( bitAmount <= 0 )
+		return;
+	float t = bitAmount * 0.01f;
+	int bits = 16 - (int)( t * 13.0f );	// 16 (transparent) down to 3 (crushed)
+	CONSTRAIN( bits, 2, 16 );
+	float levels = (float)( 1 << bits );
+	float invLevels = 1.0f / levels;
+	for ( int i=0; i<numFrames; ++i )
+		buf[i] = roundf( buf[i] * levels ) * invLevels;
+}
+
+// Shared by both Sample Crush modes (see kSrCrushModeXxx) - how many real
+// samples one "held" sample should cover, 1 (transparent) up to ~41
+// (heavily decimated).
+static int SrCrushHoldSamples( int rateAmount )
+{
+	float t = rateAmount * 0.01f;
+	return 1 + (int)( t * t * 40.0f );
+}
+
+// Sample-and-hold decimator - the classic cheap "sample rate reduction"
+// bitcrush effect (repeat/hold already-rendered samples rather than true
+// internal resampling). This is NOT a CPU optimization - everything
+// upstream in ApplyPost() (and the synth voice before it) still renders at
+// the real sample rate every time regardless of this setting - it's purely
+// a creative lo-fi/aliasing effect, same as a hardware sampler's sample-
+// rate knob. 0 = off (bypassed). This is Post mode's implementation only -
+// see ApplyPost()'s reduced-buffer path for Full mode, which achieves the
+// same held/stair-stepped effect as a side effect of actually saving CPU.
+static void ApplySrCrush( _drumVoicePost& v, float* buf, int numFrames, int rateAmount )
+{
+	if ( rateAmount <= 0 )
+		return;
+	int holdSamples = SrCrushHoldSamples( rateAmount );
+	int counter = v.srHoldCounter;
+	float held = v.srHoldValue;
+	for ( int i=0; i<numFrames; ++i )
 	{
-		if ( filterParam != v.cachedFilterParam )
+		if ( counter <= 0 )
 		{
-			float t = ( -filterParam ) * 0.01f;
-			float tt = t * t;	// quadratic taper - avoids needing a pow() call
-			float cutoffHz = 18000.0f + tt * ( 80.0f - 18000.0f );
-			float cutoffNorm = cutoffHz / plaits::kSampleRate;
-			CONSTRAIN( cutoffNorm, 0.001f, 0.49f );
-			v.lpFilter.set_f_q<stmlib::FREQUENCY_FAST>( cutoffNorm, 0.6f );
-			v.cachedFilterParam = filterParam;
+			held = buf[i];
+			counter = holdSamples;
 		}
-		v.lpFilter.Process<stmlib::FILTER_MODE_LOW_PASS>( buf, buf, numFrames );
+		buf[i] = held;
+		--counter;
 	}
-	else if ( filterParam > 0 )
+	v.srHoldCounter = counter;
+	v.srHoldValue = held;
+}
+
+static void ApplyPost( _drumVoicePost& v, float* buf, float* dryBuf, int numFrames, bool trig, float blockSeconds, int attackMode, int filterParam, int foldParam, int foldType, int eqFreq1, int eqGain1, int eqFreq2, int eqGain2, int transAmount, int transType, int bitCrushParam, int srCrushParam, int srCrushMode, int compParam, int driveParam, int driveType, int volParam, uint16_t bypassMask, bool profiling, uint32_t* stageCycles )
+{
+	if ( trig )
+		v.postFxElapsed = 0.0f;
+
+	// Attack Mode gating - see kAttackModeXxx's comment. Full (0) never
+	// gates anything (gateBasic/gateHeavy both stay false, identical to
+	// this function's original, always-on behaviour). Punchy/Sculpted gate
+	// the *entire* tone-shaping chain (Filter/Wavefolder/Waveshaper as well
+	// as EQ Sculpt/Transient/Bitcrush) once outside a short fixed attack
+	// window; Light only gates the newer, heavier EQ Sculpt/Transient/
+	// Bitcrush trio, leaving Filter/Wavefolder/Waveshaper always on for the
+	// full release. Volume/Compressor/the fixed cleanup filter are never
+	// gated - they're cheap, and Volume/Compressor need to see the signal
+	// at every stage of its life to behave sensibly.
+	bool gateBasic = false;
+	bool gateHeavy = false;
+	if ( attackMode != kAttackModeFull )
 	{
-		if ( filterParam != v.cachedFilterParam )
-		{
-			float t = filterParam * 0.01f;
-			float tt = t * t;
-			float cutoffHz = 20.0f + tt * ( 8000.0f - 20.0f );
-			float cutoffNorm = cutoffHz / plaits::kSampleRate;
-			CONSTRAIN( cutoffNorm, 0.001f, 0.49f );
-			v.hpFilter.set_f_q<stmlib::FREQUENCY_FAST>( cutoffNorm, 0.6f );
-			v.cachedFilterParam = filterParam;
-		}
-		v.hpFilter.Process<stmlib::FILTER_MODE_HIGH_PASS>( buf, buf, numFrames );
+		float windowS = ( attackMode == kAttackModePunchy ) ? 0.03f : ( attackMode == kAttackModeSculpted ? 0.08f : 0.2f );
+		bool pastWindow = v.postFxElapsed >= windowS;
+		gateHeavy = pastWindow;
+		gateBasic = pastWindow && ( attackMode == kAttackModePunchy || attackMode == kAttackModeSculpted );
 	}
 
-	ApplyWavefolder( buf, numFrames, foldParam * 0.01f, foldType );
+	// Sample Crush "Full" mode - see kSrCrushModeXxx's comment. Decimates
+	// buf down to a smaller working buffer *before* Filter/Wavefolder/
+	// Waveshaper/EQ Sculpt run (whichever of those are actually going to
+	// execute this call - see needsCoreChain below), so those stages
+	// genuinely process fewer samples, rather than computing everything at
+	// full rate and only throwing samples away at the very end (which is
+	// all Post mode's ApplySrCrush() can do). plaits::kSampleRate is
+	// temporarily rescaled to match the buffer's new effective rate so
+	// every Hz-based cutoff calculation in this reduced section (Filter's
+	// DJ-style HP/LP, EQ Sculpt's 2 taps) stays musically correct without
+	// needing to touch each one individually - Wavefolder/Waveshaper have
+	// no sample-rate-dependent math at all, so they're unaffected either
+	// way. Transient Shaper is deliberately excluded and always runs after
+	// this section, at the real rate and the real numFrames - its
+	// envelope-tracking coefficients are fixed per-sample ratios, not
+	// derived from plaits::kSampleRate, so running it inside the reduced
+	// section would shift its attack/release speed rather than just its
+	// tone (a correctness problem, not just an optimization detail).
+	// Per-stage bypass - see kFxBypassXxx's comment. Sample Crush's Full-mode
+	// reduced-buffer path is folded into bypassSampleCrush here too (rather
+	// than only guarding the explicit ApplySrCrush() call near the bottom)
+	// since Full mode's actual cost lives in running Filter/Wavefolder/
+	// Waveshaper/EQ Sculpt at a reduced rate, not in a decimator call of its
+	// own.
+	bool bypassFilter      = ( bypassMask & kFxBypassFilter ) != 0;
+	bool bypassWavefolder  = ( bypassMask & kFxBypassWavefolder ) != 0;
+	bool bypassWaveshaper  = ( bypassMask & kFxBypassWaveshaper ) != 0;
+	bool bypassEqSculpt    = ( bypassMask & kFxBypassEqSculpt ) != 0;
+	bool bypassTransient   = ( bypassMask & kFxBypassTransient ) != 0;
+	bool bypassCompressor  = ( bypassMask & kFxBypassCompressor ) != 0;
+	bool bypassBitCrush    = ( bypassMask & kFxBypassBitCrush ) != 0;
+	bool bypassSampleCrush = ( bypassMask & kFxBypassSampleCrush ) != 0;
 
-	if ( driveParam > 0 )
+	bool needsCoreChain = !gateBasic || !gateHeavy;
+	bool useCrushReduced = ( srCrushMode == kSrCrushModeFull ) && ( srCrushParam > 0 ) && needsCoreChain && !bypassSampleCrush;
+	int holdSamples = 1;
+	int workCount = numFrames;
+	float savedSampleRate = plaits::kSampleRate;
+
+	if ( useCrushReduced )
 	{
-		memcpy( dryBuf, buf, numFrames * sizeof(float) );
-
-		if ( driveParam <= 50 )
+		holdSamples = SrCrushHoldSamples( srCrushParam );
+		if ( holdSamples > 1 )
 		{
-			// 0-50%: crossfade dry->Overdrive, with Overdrive's own drive
-			// amount also ramping 0->1 across the same range. Using the
-			// same small fraction for both the crossfade mix AND
-			// Overdrive's drive input is what fixes the reported "volume
-			// dips as soon as it's switched on" bug: Overdrive's own gain
-			// compensation curve is quietest exactly when driveParam (and
-			// therefore the mix amount) is small, so the output stays
-			// close to full dry level at low settings instead of jumping
-			// to a quiet fully-wet signal.
-			float stage1 = driveParam * 0.02f;	// driveParam/50, 0..1
-			v.drive.Process( stage1, buf, numFrames );
-			for ( int i=0; i<numFrames; ++i )
-				buf[i] = dryBuf[i] + stage1 * ( buf[i] - dryBuf[i] );
+			workCount = ( numFrames + holdSamples - 1 ) / holdSamples;
+			for ( int i=0; i<workCount; ++i )
+				buf[i] = buf[i * holdSamples];	// safe in-place forward decimation - read index >= write index always
+			if ( holdSamples != v.cachedCrushHoldSamples )
+			{
+				v.cachedFilterParam = 9999;	// force Filter/EQ Sculpt to recompute coefficients for the new effective rate
+				v.cachedEqFreq1 = -1;
+				v.cachedEqFreq2 = -1;
+				v.cachedCrushHoldSamples = holdSamples;
+			}
+			plaits::kSampleRate = savedSampleRate / (float)holdSamples;
 		}
 		else
 		{
-			// 50-100%: model 1 (Overdrive) is held at max drive - "maxed
-			// out at 50%" - and crossfades into model 2 (HardClip, harsher).
-			float stage2 = ( driveParam - 50 ) * 0.02f;
-			v.drive.Process( 1.0f, buf, numFrames );
-			for ( int i=0; i<numFrames; ++i )
-			{
-				float model1 = buf[i];
-				float model2 = HardClip( dryBuf[i] );
-				buf[i] = model1 + stage2 * ( model2 - model1 );
-			}
+			useCrushReduced = false;	// crush amount rounds to "no reduction" - nothing to do
 		}
 	}
+	if ( !useCrushReduced && v.cachedCrushHoldSamples != -1 )
+	{
+		// Just left Full-mode reduction (mode/amount changed, or holdSamples
+		// collapsed to 1) - force one more recompute so Filter/EQ Sculpt's
+		// caches aren't left holding coefficients computed for a rescaled
+		// rate that no longer applies.
+		v.cachedFilterParam = 9999;
+		v.cachedEqFreq1 = -1;
+		v.cachedEqFreq2 = -1;
+		v.cachedCrushHoldSamples = -1;
+	}
 
-	ApplyEqSculpt( v, buf, dryBuf, numFrames, eqFreq1, eqGain1, eqFreq2, eqGain2 );
+	uint32_t tStamp;
 
-	ApplyTransient( v, buf, numFrames, transAmount, transType );
+	if ( !gateBasic && !bypassFilter )
+	{
+		tStamp = profiling ? NT_getCpuCycleCount() : 0;
+		if ( filterParam < 0 )
+		{
+			if ( filterParam != v.cachedFilterParam )
+			{
+				float t = ( -filterParam ) * 0.01f;
+				float tt = t * t;	// quadratic taper - avoids needing a pow() call
+				float cutoffHz = 18000.0f + tt * ( 80.0f - 18000.0f );
+				float cutoffNorm = cutoffHz / plaits::kSampleRate;
+				CONSTRAIN( cutoffNorm, 0.001f, 0.49f );
+				v.lpFilter.set_f_q<stmlib::FREQUENCY_FAST>( cutoffNorm, 0.6f );
+				v.cachedFilterParam = filterParam;
+			}
+			v.lpFilter.Process<stmlib::FILTER_MODE_LOW_PASS>( buf, buf, workCount );
+		}
+		else if ( filterParam > 0 )
+		{
+			if ( filterParam != v.cachedFilterParam )
+			{
+				float t = filterParam * 0.01f;
+				float tt = t * t;
+				float cutoffHz = 20.0f + tt * ( 8000.0f - 20.0f );
+				float cutoffNorm = cutoffHz / plaits::kSampleRate;
+				CONSTRAIN( cutoffNorm, 0.001f, 0.49f );
+				v.hpFilter.set_f_q<stmlib::FREQUENCY_FAST>( cutoffNorm, 0.6f );
+				v.cachedFilterParam = filterParam;
+			}
+			v.hpFilter.Process<stmlib::FILTER_MODE_HIGH_PASS>( buf, buf, workCount );
+		}
+		if ( profiling ) stageCycles[kFxStageFilter] += NT_getCpuCycleCount() - tStamp;
+	}
+
+	if ( !gateBasic && !bypassWavefolder )
+	{
+		tStamp = profiling ? NT_getCpuCycleCount() : 0;
+		ApplyWavefolder( buf, workCount, foldParam * 0.01f, foldType );
+		if ( profiling ) stageCycles[kFxStageWavefolder] += NT_getCpuCycleCount() - tStamp;
+	}
+
+	if ( !gateBasic && !bypassWaveshaper )
+	{
+		tStamp = profiling ? NT_getCpuCycleCount() : 0;
+
+		// One algorithm only - see kWaveshaperTypeXxx's comment for why this
+		// replaced the old fixed Gentle(pre-stage)->Overdrive->HardClip
+		// progression, which always ran all three regardless of Drive's
+		// position (a low Drive setting still paid for every stage). Now
+		// only the selected type's own per-sample pass runs, at whatever
+		// intensity Drive dials in.
+		if ( driveParam > 0 )
+		{
+			float amt = driveParam * 0.01f;
+			if ( driveType == kWaveshaperTypeOverdrive )
+			{
+				// Overdrive's own Process() already ramps smoothly from
+				// near-unity to fully driven across drive=0..1 (its own
+				// internal gain compensation curve), so no separate dry/wet
+				// crossfade is needed here - passing amt directly is both
+				// correct and the cheapest possible way to use it.
+				v.drive.Process( amt, buf, workCount );
+			}
+			else
+			{
+				// Gentle/HardClip: fixed pre-gain analytic clip (GentleClip()/
+				// HardClip()), crossfaded against the pre-clip signal so
+				// Drive still sweeps smoothly from dry to fully clipped -
+				// one clip call and one lerp per sample, the cheapest shape
+				// this can take.
+				bool gentle = ( driveType == kWaveshaperTypeGentle );
+				for ( int i=0; i<workCount; ++i )
+				{
+					float dry = buf[i];
+					float wet = gentle ? GentleClip( dry ) : HardClip( dry );
+					buf[i] = dry + amt * ( wet - dry );
+				}
+			}
+		}
+		if ( profiling ) stageCycles[kFxStageWaveshaper] += NT_getCpuCycleCount() - tStamp;
+	}
+
+	if ( !gateHeavy && !bypassEqSculpt )
+	{
+		tStamp = profiling ? NT_getCpuCycleCount() : 0;
+		ApplyEqSculpt( v, buf, dryBuf, workCount, eqFreq1, eqGain1, eqFreq2, eqGain2 );
+		if ( profiling ) stageCycles[kFxStageEqSculpt] += NT_getCpuCycleCount() - tStamp;
+	}
+
+	if ( useCrushReduced )
+	{
+		plaits::kSampleRate = savedSampleRate;	// restore before anything below, which must run at the real rate
+		// Expand back from workCount to numFrames - safe in-place backward
+		// loop (see ApplyPost()'s design notes): buf[j] = buf[j/holdSamples],
+		// walking j from high to low so every read happens before its
+		// source index could be overwritten by a later (lower j) iteration.
+		for ( int j=numFrames-1; j>=0; --j )
+			buf[j] = buf[j / holdSamples];
+	}
+
+	if ( !gateHeavy && !bypassTransient )
+	{
+		tStamp = profiling ? NT_getCpuCycleCount() : 0;
+		ApplyTransient( v, buf, numFrames, transAmount, transType );
+		if ( profiling ) stageCycles[kFxStageTransient] += NT_getCpuCycleCount() - tStamp;
+	}
 
 	float vol = volParam * 0.01f;
 	for ( int i=0; i<numFrames; ++i )
 		buf[i] *= vol;
 
-	ApplyCompressor( v, buf, numFrames, compParam );
+	if ( !bypassCompressor )
+	{
+		tStamp = profiling ? NT_getCpuCycleCount() : 0;
+		ApplyCompressor( v, buf, numFrames, compParam );
+		if ( profiling ) stageCycles[kFxStageCompressor] += NT_getCpuCycleCount() - tStamp;
+	}
 
 	// Fixed cleanup filter, always on, no user control - see
 	// _drumVoicePost::cleanupHp's comment. Runs last so it catches whatever
 	// the synth, sample layer, Wavefolder, and Waveshaper all fed into it.
 	v.cleanupHp.Process<stmlib::FILTER_MODE_HIGH_PASS>( buf, buf, numFrames );
+
+	// Bitcrush - the very last stage, per the explicit "very end of chain"
+	// request. Grouped with the "heavy"/newer-additions gate tier under
+	// Attack Mode (Punchy/Sculpted/Light all gate it, not just Full's own
+	// "never gate anything") since it's just as new/optional as EQ Sculpt/
+	// Transient, and "crunchy attack, clean tail" is a genuinely
+	// interesting character in its own right, not just a CPU-driven
+	// afterthought. Sample Crush's Post-mode decimator only runs in Post
+	// mode - Full mode already produced the same held/stair-stepped result
+	// as a side effect of the reduced-buffer expand above, so calling it
+	// again here would be redundant (and waste the CPU this was all for).
+	if ( !gateHeavy )
+	{
+		if ( !bypassBitCrush )
+		{
+			tStamp = profiling ? NT_getCpuCycleCount() : 0;
+			ApplyBitCrush( buf, numFrames, bitCrushParam );
+			if ( profiling ) stageCycles[kFxStageBitCrush] += NT_getCpuCycleCount() - tStamp;
+		}
+		if ( srCrushMode == kSrCrushModePost && !bypassSampleCrush )
+		{
+			tStamp = profiling ? NT_getCpuCycleCount() : 0;
+			ApplySrCrush( v, buf, numFrames, srCrushParam );
+			if ( profiling ) stageCycles[kFxStageSampleCrush] += NT_getCpuCycleCount() - tStamp;
+		}
+	}
+
+	v.postFxElapsed += blockSeconds;
 }
 
 // Writes a voice's rendered mono buffer to its output bus(es). In Stereo
@@ -4220,11 +4973,41 @@ static void ProcessKick( _drumMachineAlgorithm* pThis, float* busFrames, int num
 	_kickVoice& v = pThis->dtc->kick;
 	bool trig = v.pendingTrigger;
 	v.pendingTrigger = false;
-	float baseDecay = Smoothed( pThis, kParamRelBD ) * 0.01f;
+
+	// Un-freeze check - see frozenParamHash's comment. Every block, not
+	// just on trigger, so a knob edit takes effect immediately rather than
+	// waiting for the next hit to reveal the frozen audio is stale.
+	if ( v.frozen )
+	{
+		int liveHash = ComputeFreezeHash( pThis->v[kParamModelBD], pThis->v[kParamPitchBD], pThis->v[kParamRelBD], pThis->v[kParamToneBD], pThis->v[kParamCharBD], pThis->v[kParamFmBD], pThis->v[kParamSampleBD], pThis->v[kParamSampleMixBD], pThis->v[kParamNoiseBD], pThis->v[kParamNoiseTypeBD] );
+		if ( liveHash != v.frozenParamHash )
+			v.frozen = false;
+	}
+
+	float bdDecayCap = BdSdModelDecayCap( pThis->v[kParamModelBD] );
+	float baseDecay = Smoothed( pThis, kParamRelBD ) * 0.01f * bdDecayCap;
 	if ( trig )
 	{
-		v.samplesUntilIdle = IdleSamples( baseDecay );	// unmodulated - just needs to be safely long enough
+		// While frozen (and not being re-armed/re-captured), the idle
+		// window is the frozen clip's own actual captured length, not the
+		// generic Release-based estimate - keeps the idle-skip exactly in
+		// sync with how much real audio there is to play, no more no less.
+		if ( v.frozen && !v.freezeArmed )
+		{
+			v.samplesUntilIdle = v.frozenNumFrames;
+			v.frozenPlayPos = 0;	// restart playback from the top on every trigger, not just the first one after freezing
+		}
+		else
+			v.samplesUntilIdle = IdleSamples( baseDecay );	// unmodulated - just needs to be safely long enough
 		ExtendIdleForSample( pThis, v, kSlotBD );
+
+		// Every trigger while armed (re)starts the capture from this hit's
+		// attack, live and uninterrupted - see freezeCapturing's comment.
+		if ( v.freezeArmed )
+		{
+			v.freezeCapturing = true;
+			v.frozenNumFrames = 0;
+		}
 	}
 
 	// Envelopes advance every block regardless of the voice's own idle-skip
@@ -4242,6 +5025,20 @@ static void ProcessKick( _drumMachineAlgorithm* pThis, float* busFrames, int num
 
 	if ( v.samplesUntilIdle <= 0 && !trig )
 	{
+		if ( v.freezeArmed && v.frozenNumFrames > 0 )
+		{
+			// The armed hit has gone idle - capture is complete. Guarded on
+			// frozenNumFrames>0 - without it, a voice that's simply sitting
+			// idle (as most voices are, most of the time) at the moment it
+			// gets armed would finalize *immediately*, on the very next
+			// block, with nothing actually captured yet - "frozen" but
+			// silent, since there was never a real trigger to capture from.
+			v.freezeArmed = false;
+			v.freezeCapturing = false;
+			v.frozen = true;
+			v.frozenPlayPos = 0;
+			v.frozenParamHash = ComputeFreezeHash( pThis->v[kParamModelBD], pThis->v[kParamPitchBD], pThis->v[kParamRelBD], pThis->v[kParamToneBD], pThis->v[kParamCharBD], pThis->v[kParamFmBD], pThis->v[kParamSampleBD], pThis->v[kParamSampleMixBD], pThis->v[kParamNoiseBD], pThis->v[kParamNoiseTypeBD] );
+		}
 		WriteVoiceOutput( busFrames, numFrames, NULL, pThis->v[kParamOutBD], replace, stereo, pThis->v[kParamPanBD] );
 		return;
 	}
@@ -4277,6 +5074,12 @@ static void ProcessKick( _drumMachineAlgorithm* pThis, float* busFrames, int num
 	// header comment). FmDrum's own set_fm_amount is unaffected (uses fm).
 	float fmKnock = fm * 0.8f;
 
+	// Frozen playback bypasses the live model/sample/noise layers entirely
+	// (unless currently being (re)armed, in which case we need a genuine
+	// live render to capture from) - see _drumVoicePost::frozenBuf's
+	// comment for why arming doesn't render synchronously itself.
+	if ( !v.frozen || v.freezeArmed )
+	{
 	if ( pThis->v[kParamModelBD] == 0 )
 	{
 		// attack_fm_amount is Plaits' own name for exactly the "knock" the
@@ -4302,7 +5105,11 @@ static void ProcessKick( _drumMachineAlgorithm* pThis, float* busFrames, int num
 		float fmPush = ComputeExternalFmPush( v, trig, accent, fmMode, blockSeconds );
 		float modulatedF0 = f0 * ( 1.0f + fmPush * fm * 1.5f );
 		CONSTRAIN( modulatedF0, 0.001f, 0.49f );
-		RenderElements( v.elementsExciter, v.elementsResonator, pThis->elementsExciteScratch, trig, accent, modulatedF0, tone, decay, character, scratch, numFrames );
+		// bdDecayCap - see BdSdModelDecayCap()'s comment: Elements runs a
+		// whole resonator bank every sample, so its own decay (not the
+		// shared `decay` used by the sample/noise layers below) is capped
+		// to bound how long that bank stays active.
+		RenderElements( v.elementsExciter, v.elementsResonator, pThis->elementsExciteScratch, trig, accent, modulatedF0, tone, decay * bdDecayCap, character, scratch, numFrames );
 		UpdateFmFeedback( v, scratch, numFrames );
 	}
 	else if ( pThis->v[kParamModelBD] == 3 )
@@ -4363,7 +5170,10 @@ static void ProcessKick( _drumMachineAlgorithm* pThis, float* busFrames, int num
 		float fmPush = ComputeExternalFmPush( v, trig, accent, fmMode, blockSeconds );
 		float modulatedF0 = f0 * ( 1.0f + fmPush * fm * 1.5f );
 		CONSTRAIN( modulatedF0, 0.001f, 0.49f );
-		v.combBody.Render( trig, modulatedF0, decay, character, tone, scratch, numFrames );
+		// bdDecayCap - see BdSdModelDecayCap()'s comment: CombBody reads/
+		// writes its own delay line every sample, so its own decay is
+		// capped the same way as Elements above.
+		v.combBody.Render( trig, modulatedF0, decay * bdDecayCap, character, tone, scratch, numFrames );
 		for ( int i=0; i<numFrames; ++i ) scratch[i] *= accent;
 		UpdateFmFeedback( v, scratch, numFrames );
 	}
@@ -4381,6 +5191,41 @@ static void ProcessKick( _drumMachineAlgorithm* pThis, float* busFrames, int num
 	MixSampleLayer( pThis, v, kSlotBD, trig, accent, decay, blockSeconds, scratch, numFrames );
 	MixNoiseLayer( v, pThis->v[kParamNoiseBD], pThis->v[kParamNoiseTypeBD], decay, trig, blockSeconds, scratch, numFrames );
 
+	if ( v.freezeCapturing )
+	{
+		// Append this block's freshly-rendered output into the frozen
+		// buffer - spread across whatever blocks this hit naturally takes,
+		// same pacing as any live hit, so this never costs more than the
+		// live render already would have. Gated on freezeCapturing (not
+		// just freezeArmed) - see _drumVoicePost::freezeArmed's comment for
+		// why appending must wait for the actual capture-starting trigger.
+		// Just stops accumulating once frozenBuf is full rather than
+		// force-finalizing mid-hit - finalize only ever happens at the
+		// voice's real idle point (above), so switching to frozen playback
+		// on the next hit never interrupts a still-decaying live one.
+		int spaceLeft = FreezeMaxFrames() - v.frozenNumFrames;
+		int toCopy = numFrames < spaceLeft ? numFrames : spaceLeft;
+		if ( toCopy > 0 )
+		{
+			memcpy( v.frozenBuf + v.frozenNumFrames, scratch, toCopy * sizeof(float) );
+			v.frozenNumFrames += toCopy;
+		}
+	}
+	}
+	else
+	{
+		// Frozen playback - a plain one-shot read from frozenBuf, no
+		// NT_stream/model/sample/noise involvement at all.
+		int pos = v.frozenPlayPos;
+		int remaining = v.frozenNumFrames - pos;
+		int toCopy = numFrames < remaining ? numFrames : remaining;
+		if ( toCopy > 0 )
+			memcpy( scratch, v.frozenBuf + pos, toCopy * sizeof(float) );
+		for ( int i=toCopy; i<numFrames; ++i )
+			scratch[i] = 0.0f;
+		v.frozenPlayPos = pos + toCopy;
+	}
+
 	int filtParam = RoundToInt( ModulatedViaMatrix( pThis, kConceptFilter, kSlotBD, Smoothed( pThis, kParamFiltBD ), env1Level, env2Level ) );
 	int foldParam = RoundToInt( ModulatedViaMatrix( pThis, kConceptFold, kSlotBD, Smoothed( pThis, kParamFoldBD ), env1Level, env2Level ) );
 	int compParam = RoundToInt( ModulatedViaMatrix( pThis, kConceptCompressor, kSlotBD, Smoothed( pThis, kParamCompBD ), env1Level, env2Level ) );
@@ -4391,7 +5236,7 @@ static void ProcessKick( _drumMachineAlgorithm* pThis, float* busFrames, int num
 	CONSTRAIN( compParam, 0, 100 );
 	CONSTRAIN( driveParam, 0, 100 );
 	CONSTRAIN( volParam, 0, 200 );
-	ApplyPost( v, scratch, pThis->dryScratch, numFrames, filtParam, foldParam, pThis->v[kParamFoldTypeBD], pThis->v[kParamEqFreq1BD], pThis->v[kParamEqGain1BD], pThis->v[kParamEqFreq2BD], pThis->v[kParamEqGain2BD], pThis->v[kParamTransBD], pThis->v[kParamTransTypeBD], compParam, driveParam, volParam );
+	ApplyPost( v, scratch, pThis->dryScratch, numFrames, trig, blockSeconds, pThis->v[kParamAttackModeBD], filtParam, foldParam, pThis->v[kParamFoldTypeBD], pThis->v[kParamEqFreq1BD], pThis->v[kParamEqGain1BD], pThis->v[kParamEqFreq2BD], pThis->v[kParamEqGain2BD], pThis->v[kParamTransBD], pThis->v[kParamTransTypeBD], pThis->v[kParamBitCrushBD], pThis->v[kParamSrCrushBD], pThis->v[kParamSrCrushModeBD], compParam, driveParam, pThis->v[kParamDriveTypeBD], volParam, pThis->fxBypassMask, pThis->fxProfiling, pThis->fxStageCycles );
 
 	v.samplesUntilIdle -= numFrames;
 	if ( v.samplesUntilIdle < 0 ) v.samplesUntilIdle = 0;
@@ -4404,11 +5249,34 @@ static void ProcessSnare( _drumMachineAlgorithm* pThis, float* busFrames, int nu
 	_snareVoice& v = pThis->dtc->snare;
 	bool trig = v.pendingTrigger;
 	v.pendingTrigger = false;
-	float baseDecay = Smoothed( pThis, kParamRelSD ) * 0.01f;
+
+	if ( v.frozen )
+	{
+		int liveHash = ComputeFreezeHash( pThis->v[kParamModelSD], pThis->v[kParamPitchSD], pThis->v[kParamRelSD], pThis->v[kParamToneSD], pThis->v[kParamCharSD], pThis->v[kParamFmSD], pThis->v[kParamSampleSD], pThis->v[kParamSampleMixSD], pThis->v[kParamNoiseSD], pThis->v[kParamNoiseTypeSD] );
+		if ( liveHash != v.frozenParamHash )
+			v.frozen = false;
+	}
+
+	float sdDecayCap = BdSdModelDecayCap( pThis->v[kParamModelSD] );
+	float baseDecay = Smoothed( pThis, kParamRelSD ) * 0.01f * sdDecayCap;
 	if ( trig )
 	{
-		v.samplesUntilIdle = IdleSamples( baseDecay );
+		if ( v.frozen && !v.freezeArmed )
+		{
+			v.samplesUntilIdle = v.frozenNumFrames;
+			v.frozenPlayPos = 0;	// restart playback from the top on every trigger, not just the first one after freezing
+		}
+		else
+			v.samplesUntilIdle = IdleSamples( baseDecay );
 		ExtendIdleForSample( pThis, v, kSlotSD );
+
+		// Every trigger while armed (re)starts the capture from this hit's
+		// attack, live and uninterrupted - see freezeCapturing's comment.
+		if ( v.freezeArmed )
+		{
+			v.freezeCapturing = true;
+			v.frozenNumFrames = 0;
+		}
 	}
 
 	float blockSeconds = numFrames / plaits::kSampleRate;
@@ -4422,6 +5290,17 @@ static void ProcessSnare( _drumMachineAlgorithm* pThis, float* busFrames, int nu
 
 	if ( v.samplesUntilIdle <= 0 && !trig )
 	{
+		if ( v.freezeArmed && v.frozenNumFrames > 0 )
+		{
+			// See ProcessKick()'s matching comment - guarded on
+			// frozenNumFrames>0 so an armed-but-not-yet-triggered voice
+			// doesn't finalize empty on the very next idle block.
+			v.freezeArmed = false;
+			v.freezeCapturing = false;
+			v.frozen = true;
+			v.frozenPlayPos = 0;
+			v.frozenParamHash = ComputeFreezeHash( pThis->v[kParamModelSD], pThis->v[kParamPitchSD], pThis->v[kParamRelSD], pThis->v[kParamToneSD], pThis->v[kParamCharSD], pThis->v[kParamFmSD], pThis->v[kParamSampleSD], pThis->v[kParamSampleMixSD], pThis->v[kParamNoiseSD], pThis->v[kParamNoiseTypeSD] );
+		}
 		WriteVoiceOutput( busFrames, numFrames, NULL, pThis->v[kParamOutSD], replace, stereo, pThis->v[kParamPanSD] );
 		return;
 	}
@@ -4453,6 +5332,8 @@ static void ProcessSnare( _drumMachineAlgorithm* pThis, float* busFrames, int nu
 	// range.
 	float fmKnock = fm * 0.8f;
 
+	if ( !v.frozen || v.freezeArmed )
+	{
 	if ( pThis->v[kParamModelSD] == 0 )
 		v.analog.Render( trig, accent, f0, tone, decay, character, scratch, numFrames );
 	else if ( pThis->v[kParamModelSD] == 1 )
@@ -4462,7 +5343,8 @@ static void ProcessSnare( _drumMachineAlgorithm* pThis, float* busFrames, int nu
 		float fmPush = ComputeExternalFmPush( v, trig, accent, fmMode, blockSeconds );
 		float modulatedF0 = f0 * ( 1.0f + fmPush * fm * 1.5f );
 		CONSTRAIN( modulatedF0, 0.001f, 0.49f );
-		RenderElements( v.elementsExciter, v.elementsResonator, pThis->elementsExciteScratch, trig, accent, modulatedF0, tone, decay, character, scratch, numFrames );
+		// sdDecayCap - see BdSdModelDecayCap()'s comment.
+		RenderElements( v.elementsExciter, v.elementsResonator, pThis->elementsExciteScratch, trig, accent, modulatedF0, tone, decay * sdDecayCap, character, scratch, numFrames );
 		UpdateFmFeedback( v, scratch, numFrames );
 	}
 	else if ( pThis->v[kParamModelSD] == 3 )
@@ -4515,7 +5397,8 @@ static void ProcessSnare( _drumMachineAlgorithm* pThis, float* busFrames, int nu
 		float fmPush = ComputeExternalFmPush( v, trig, accent, fmMode, blockSeconds );
 		float modulatedF0 = f0 * ( 1.0f + fmPush * fm * 1.5f );
 		CONSTRAIN( modulatedF0, 0.001f, 0.49f );
-		v.combBody.Render( trig, modulatedF0, decay, character, tone, scratch, numFrames );
+		// sdDecayCap - see BdSdModelDecayCap()'s comment.
+		v.combBody.Render( trig, modulatedF0, decay * sdDecayCap, character, tone, scratch, numFrames );
 		for ( int i=0; i<numFrames; ++i ) scratch[i] *= accent;
 		UpdateFmFeedback( v, scratch, numFrames );
 	}
@@ -4531,6 +5414,29 @@ static void ProcessSnare( _drumMachineAlgorithm* pThis, float* busFrames, int nu
 	MixSampleLayer( pThis, v, kSlotSD, trig, accent, decay, blockSeconds, scratch, numFrames );
 	MixNoiseLayer( v, pThis->v[kParamNoiseSD], pThis->v[kParamNoiseTypeSD], decay, trig, blockSeconds, scratch, numFrames );
 
+	if ( v.freezeCapturing )
+	{
+		int spaceLeft = FreezeMaxFrames() - v.frozenNumFrames;
+		int toCopy = numFrames < spaceLeft ? numFrames : spaceLeft;
+		if ( toCopy > 0 )
+		{
+			memcpy( v.frozenBuf + v.frozenNumFrames, scratch, toCopy * sizeof(float) );
+			v.frozenNumFrames += toCopy;
+		}
+	}
+	}
+	else
+	{
+		int pos = v.frozenPlayPos;
+		int remaining = v.frozenNumFrames - pos;
+		int toCopy = numFrames < remaining ? numFrames : remaining;
+		if ( toCopy > 0 )
+			memcpy( scratch, v.frozenBuf + pos, toCopy * sizeof(float) );
+		for ( int i=toCopy; i<numFrames; ++i )
+			scratch[i] = 0.0f;
+		v.frozenPlayPos = pos + toCopy;
+	}
+
 	int filtParam = RoundToInt( ModulatedViaMatrix( pThis, kConceptFilter, kSlotSD, Smoothed( pThis, kParamFiltSD ), env1Level, env2Level ) );
 	int foldParam = RoundToInt( ModulatedViaMatrix( pThis, kConceptFold, kSlotSD, Smoothed( pThis, kParamFoldSD ), env1Level, env2Level ) );
 	int compParam = RoundToInt( ModulatedViaMatrix( pThis, kConceptCompressor, kSlotSD, Smoothed( pThis, kParamCompSD ), env1Level, env2Level ) );
@@ -4541,7 +5447,7 @@ static void ProcessSnare( _drumMachineAlgorithm* pThis, float* busFrames, int nu
 	CONSTRAIN( compParam, 0, 100 );
 	CONSTRAIN( driveParam, 0, 100 );
 	CONSTRAIN( volParam, 0, 200 );
-	ApplyPost( v, scratch, pThis->dryScratch, numFrames, filtParam, foldParam, pThis->v[kParamFoldTypeSD], pThis->v[kParamEqFreq1SD], pThis->v[kParamEqGain1SD], pThis->v[kParamEqFreq2SD], pThis->v[kParamEqGain2SD], pThis->v[kParamTransSD], pThis->v[kParamTransTypeSD], compParam, driveParam, volParam );
+	ApplyPost( v, scratch, pThis->dryScratch, numFrames, trig, blockSeconds, pThis->v[kParamAttackModeSD], filtParam, foldParam, pThis->v[kParamFoldTypeSD], pThis->v[kParamEqFreq1SD], pThis->v[kParamEqGain1SD], pThis->v[kParamEqFreq2SD], pThis->v[kParamEqGain2SD], pThis->v[kParamTransSD], pThis->v[kParamTransTypeSD], pThis->v[kParamBitCrushSD], pThis->v[kParamSrCrushSD], pThis->v[kParamSrCrushModeSD], compParam, driveParam, pThis->v[kParamDriveTypeSD], volParam, pThis->fxBypassMask, pThis->fxProfiling, pThis->fxStageCycles );
 
 	v.samplesUntilIdle -= numFrames;
 	if ( v.samplesUntilIdle < 0 ) v.samplesUntilIdle = 0;
@@ -4569,8 +5475,13 @@ static void ProcessHat( _drumMachineAlgorithm* pThis, float* busFrames, int numF
 	int transTypeParamIdx = isOpen ? kParamTransTypeOH : kParamTransTypeCH;
 	int noiseParamIdx = isOpen ? kParamNoiseOH : kParamNoiseCH;
 	int noiseTypeParamIdx = isOpen ? kParamNoiseTypeOH : kParamNoiseTypeCH;
+	int bitCrushParamIdx = isOpen ? kParamBitCrushOH : kParamBitCrushCH;
+	int srCrushParamIdx = isOpen ? kParamSrCrushOH : kParamSrCrushCH;
+	int srCrushModeParamIdx = isOpen ? kParamSrCrushModeOH : kParamSrCrushModeCH;
+	int attackModeParamIdx = isOpen ? kParamAttackModeOH : kParamAttackModeCH;
 	int compParamIdx = isOpen ? kParamCompOH : kParamCompCH;
 	int driveParamIdx = isOpen ? kParamDriveOH : kParamDriveCH;
+	int driveTypeParamIdx = isOpen ? kParamDriveTypeOH : kParamDriveTypeCH;
 	int volParamIdx = isOpen ? kParamVolOH : kParamVolCH;
 	int stereoParamIdx = isOpen ? kParamStereoOH : kParamStereoCH;
 	int panParamIdx = isOpen ? kParamPanOH : kParamPanCH;
@@ -4582,11 +5493,34 @@ static void ProcessHat( _drumMachineAlgorithm* pThis, float* busFrames, int numF
 
 	bool trig = v.pendingTrigger;
 	v.pendingTrigger = false;
-	float baseDecay = Smoothed( pThis, relParamIdx ) * 0.01f;
+
+	if ( v.frozen )
+	{
+		int liveHash = ComputeFreezeHash( pThis->v[modelParamIdx], pThis->v[pitchParamIdx], pThis->v[relParamIdx], pThis->v[toneParamIdx], pThis->v[charParamIdx], pThis->v[fmParamIdx], pThis->v[kSampleParam[slot]], pThis->v[kSampleMixParam[slot]], pThis->v[noiseParamIdx], pThis->v[noiseTypeParamIdx] );
+		if ( liveHash != v.frozenParamHash )
+			v.frozen = false;
+	}
+
+	float hatDecayCap = HatModelDecayCap( pThis->v[modelParamIdx] );
+	float baseDecay = Smoothed( pThis, relParamIdx ) * 0.01f * hatDecayCap;
 	if ( trig )
 	{
-		v.samplesUntilIdle = IdleSamples( baseDecay );
+		if ( v.frozen && !v.freezeArmed )
+		{
+			v.samplesUntilIdle = v.frozenNumFrames;
+			v.frozenPlayPos = 0;	// restart playback from the top on every trigger, not just the first one after freezing
+		}
+		else
+			v.samplesUntilIdle = IdleSamples( baseDecay );
 		ExtendIdleForSample( pThis, v, slot );
+
+		// Every trigger while armed (re)starts the capture from this hit's
+		// attack, live and uninterrupted - see freezeCapturing's comment.
+		if ( v.freezeArmed )
+		{
+			v.freezeCapturing = true;
+			v.frozenNumFrames = 0;
+		}
 	}
 
 	float blockSeconds = numFrames / plaits::kSampleRate;
@@ -4600,6 +5534,17 @@ static void ProcessHat( _drumMachineAlgorithm* pThis, float* busFrames, int numF
 
 	if ( v.samplesUntilIdle <= 0 && !trig )
 	{
+		if ( v.freezeArmed && v.frozenNumFrames > 0 )
+		{
+			// See ProcessKick()'s matching comment - guarded on
+			// frozenNumFrames>0 so an armed-but-not-yet-triggered voice
+			// doesn't finalize empty on the very next idle block.
+			v.freezeArmed = false;
+			v.freezeCapturing = false;
+			v.frozen = true;
+			v.frozenPlayPos = 0;
+			v.frozenParamHash = ComputeFreezeHash( pThis->v[modelParamIdx], pThis->v[pitchParamIdx], pThis->v[relParamIdx], pThis->v[toneParamIdx], pThis->v[charParamIdx], pThis->v[fmParamIdx], pThis->v[kSampleParam[slot]], pThis->v[kSampleMixParam[slot]], pThis->v[noiseParamIdx], pThis->v[noiseTypeParamIdx] );
+		}
 		WriteVoiceOutput( busFrames, numFrames, NULL, pThis->v[outParamIdx], replace, stereo, pThis->v[panParamIdx] );
 		return;
 	}
@@ -4622,6 +5567,8 @@ static void ProcessHat( _drumMachineAlgorithm* pThis, float* busFrames, int numF
 	float accent = v.pendingAccent;
 	int fmMode = ResolveFmMode( pThis->v[fmModeParamIdx] );
 
+	if ( !v.frozen || v.freezeArmed )
+	{
 	if ( pThis->v[modelParamIdx] == 0 )
 	{
 		float fmPush = ComputeExternalFmPush( v, trig, accent, fmMode, blockSeconds );
@@ -4635,7 +5582,8 @@ static void ProcessHat( _drumMachineAlgorithm* pThis, float* busFrames, int numF
 		float fmPush = ComputeExternalFmPush( v, trig, accent, fmMode, blockSeconds );
 		float modulatedF0 = f0 * ( 1.0f + fmPush * fm * 1.5f );
 		CONSTRAIN( modulatedF0, 0.001f, 0.49f );
-		RenderElements( v.elementsExciter, v.elementsResonator, pThis->elementsExciteScratch, trig, accent, modulatedF0, tone, decay, noisiness, scratch, numFrames );
+		// hatDecayCap - see HatModelDecayCap()'s comment.
+		RenderElements( v.elementsExciter, v.elementsResonator, pThis->elementsExciteScratch, trig, accent, modulatedF0, tone, decay * hatDecayCap, noisiness, scratch, numFrames );
 		UpdateFmFeedback( v, scratch, numFrames );
 	}
 	else if ( pThis->v[modelParamIdx] == 2 )
@@ -4680,7 +5628,8 @@ static void ProcessHat( _drumMachineAlgorithm* pThis, float* busFrames, int numF
 		float fmPush = ComputeExternalFmPush( v, trig, accent, fmMode, blockSeconds );
 		float modulatedF0 = f0 * ( 1.0f + fmPush * fm * 1.5f );
 		CONSTRAIN( modulatedF0, 0.001f, 0.49f );
-		v.modal.Render( trig, accent, modulatedF0, decay, tone, noisiness, scratch, numFrames );
+		// hatDecayCap - see HatModelDecayCap()'s comment.
+		v.modal.Render( trig, accent, modulatedF0, decay * hatDecayCap, tone, noisiness, scratch, numFrames );
 		UpdateFmFeedback( v, scratch, numFrames );
 	}
 	else if ( pThis->v[modelParamIdx] == 4 )
@@ -4703,7 +5652,8 @@ static void ProcessHat( _drumMachineAlgorithm* pThis, float* busFrames, int numF
 		// sweep's starting HP frequency higher for a sharper opening
 		// transient.
 		float fmPush = ComputeExternalFmPush( v, trig, accent, fmMode, blockSeconds );
-		v.sweepHat.Render( trig, accent, f0, decay, tone, noisiness, fmPush * fm, scratch, numFrames, blockSeconds );
+		// hatDecayCap - see HatModelDecayCap()'s comment.
+		v.sweepHat.Render( trig, accent, f0, decay * hatDecayCap, tone, noisiness, fmPush * fm, scratch, numFrames, blockSeconds );
 		UpdateFmFeedback( v, scratch, numFrames );
 	}
 	else
@@ -4721,6 +5671,29 @@ static void ProcessHat( _drumMachineAlgorithm* pThis, float* busFrames, int numF
 	MixSampleLayer( pThis, v, slot, trig, accent, decay, blockSeconds, scratch, numFrames );
 	MixNoiseLayer( v, pThis->v[noiseParamIdx], pThis->v[noiseTypeParamIdx], decay, trig, blockSeconds, scratch, numFrames );
 
+	if ( v.freezeCapturing )
+	{
+		int spaceLeft = FreezeMaxFrames() - v.frozenNumFrames;
+		int toCopy = numFrames < spaceLeft ? numFrames : spaceLeft;
+		if ( toCopy > 0 )
+		{
+			memcpy( v.frozenBuf + v.frozenNumFrames, scratch, toCopy * sizeof(float) );
+			v.frozenNumFrames += toCopy;
+		}
+	}
+	}
+	else
+	{
+		int pos = v.frozenPlayPos;
+		int remaining = v.frozenNumFrames - pos;
+		int toCopy = numFrames < remaining ? numFrames : remaining;
+		if ( toCopy > 0 )
+			memcpy( scratch, v.frozenBuf + pos, toCopy * sizeof(float) );
+		for ( int i=toCopy; i<numFrames; ++i )
+			scratch[i] = 0.0f;
+		v.frozenPlayPos = pos + toCopy;
+	}
+
 	int filtParam = RoundToInt( ModulatedViaMatrix( pThis, kConceptFilter, slot, Smoothed( pThis, filtParamIdx ), env1Level, env2Level ) );
 	int foldParam = RoundToInt( ModulatedViaMatrix( pThis, kConceptFold, slot, Smoothed( pThis, foldParamIdx ), env1Level, env2Level ) );
 	int compParam = RoundToInt( ModulatedViaMatrix( pThis, kConceptCompressor, slot, Smoothed( pThis, compParamIdx ), env1Level, env2Level ) );
@@ -4731,7 +5704,7 @@ static void ProcessHat( _drumMachineAlgorithm* pThis, float* busFrames, int numF
 	CONSTRAIN( compParam, 0, 100 );
 	CONSTRAIN( driveParam, 0, 100 );
 	CONSTRAIN( volParam, 0, 200 );
-	ApplyPost( v, scratch, pThis->dryScratch, numFrames, filtParam, foldParam, pThis->v[foldTypeParamIdx], pThis->v[eqFreq1ParamIdx], pThis->v[eqGain1ParamIdx], pThis->v[eqFreq2ParamIdx], pThis->v[eqGain2ParamIdx], pThis->v[transParamIdx], pThis->v[transTypeParamIdx], compParam, driveParam, volParam );
+	ApplyPost( v, scratch, pThis->dryScratch, numFrames, trig, blockSeconds, pThis->v[attackModeParamIdx], filtParam, foldParam, pThis->v[foldTypeParamIdx], pThis->v[eqFreq1ParamIdx], pThis->v[eqGain1ParamIdx], pThis->v[eqFreq2ParamIdx], pThis->v[eqGain2ParamIdx], pThis->v[transParamIdx], pThis->v[transTypeParamIdx], pThis->v[bitCrushParamIdx], pThis->v[srCrushParamIdx], pThis->v[srCrushModeParamIdx], compParam, driveParam, pThis->v[driveTypeParamIdx], volParam, pThis->fxBypassMask, pThis->fxProfiling, pThis->fxStageCycles );
 
 	v.samplesUntilIdle -= numFrames;
 	if ( v.samplesUntilIdle < 0 ) v.samplesUntilIdle = 0;
@@ -4770,11 +5743,31 @@ static float MeasureCpuPercent( float previous, uint32_t cyclesStart, uint32_t c
 	return smoothed;
 }
 
+static void AdvanceFreezeSequence( _drumMachineAlgorithm* pThis );
+
 void 	step( _NT_algorithm* self, float* busFrames, int numFramesBy4 )
 {
 	_drumMachineAlgorithm* pThis = (_drumMachineAlgorithm*)self;
 	int numFrames = numFramesBy4 * 4;
 	uint32_t cpuCycleStart = NT_getCpuCycleCount();
+
+	// Re-sync every block, not just once at construct() - previously these
+	// were only set from NT_globals.sampleRate in construct(), which is
+	// correct only if the host always fully reconstructs every loaded
+	// algorithm whenever the module's system sample rate changes (e.g.
+	// 48kHz -> 44.1kHz). Confirmed by the user that pitch actually shifts
+	// on a live sample-rate change (most audible on the bass drum) - every
+	// f0 = targetHz / plaits::kSampleRate calculation throughout this file
+	// silently goes wrong the moment the real clock and this cached value
+	// disagree (a stale 48000 while the real rate is now 44100 makes every
+	// oscillator run at 48000/44100 ~ 1.088x its intended real-time
+	// frequency once you account for the actual, now-slower, sample
+	// clock - close to the ~1.5-semitone shift that would be audible on a
+	// bass drum). Re-reading and reassigning these two floats every block
+	// costs nothing measurable and makes the whole file correct regardless
+	// of whether the host reconstructs on a sample-rate change or not.
+	plaits::kSampleRate = (float)NT_globals.sampleRate;
+	elements::kSampleRate = (float)NT_globals.sampleRate;
 
 	// Algorithms should defer SD-card activity until it's known to be
 	// mounted, which might be well after construct() - watch for the mount
@@ -4799,10 +5792,61 @@ void 	step( _NT_algorithm* self, float* busFrames, int numFramesBy4 )
 	AdvanceLfos( pThis, numFrames );
 	pThis->sampleCounter += numFrames;
 
+	// See anyModRouteActive's comment - one cheap 12-route scan here instead
+	// of paying for it again inside every one of ModulatedViaMatrix()'s ~30
+	// calls per block.
+	pThis->anyModRouteActive = false;
+	for ( int r=0; r<kNumModRoutes; ++r )
+	{
+		if ( pThis->v[ ModRouteParam( r, kModParamSource ) ] != kModSrcNone )
+		{
+			pThis->anyModRouteActive = true;
+			break;
+		}
+	}
+
+	// FX chain profiler (see fxProfiling's comment) - only actually times
+	// anything while switched on, so it costs nothing otherwise. Each
+	// ApplyPost() call (4 per block, one per slot) accumulates into
+	// fxStageCycles[kFxStageFilter..]; kFxStageRender is derived afterwards
+	// as "whatever the 4 whole-voice calls cost that ApplyPost() didn't
+	// already account for" - covers trigger handling, envelopes, the synth
+	// Render() call, and the sample/noise layers as one combined bucket,
+	// without needing to instrument every one of those separately.
+	if ( pThis->fxProfiling )
+		for ( int i=0; i<kNumFxStages; ++i )
+			pThis->fxStageCycles[i] = 0;
+
+	uint32_t voiceCyclesTotal = 0;
+	uint32_t vc0;
+
+	vc0 = pThis->fxProfiling ? NT_getCpuCycleCount() : 0;
 	ProcessKick( pThis, busFrames, numFrames );
+	if ( pThis->fxProfiling ) voiceCyclesTotal += NT_getCpuCycleCount() - vc0;
+
+	vc0 = pThis->fxProfiling ? NT_getCpuCycleCount() : 0;
 	ProcessSnare( pThis, busFrames, numFrames );
+	if ( pThis->fxProfiling ) voiceCyclesTotal += NT_getCpuCycleCount() - vc0;
+
+	vc0 = pThis->fxProfiling ? NT_getCpuCycleCount() : 0;
 	ProcessHat( pThis, busFrames, numFrames, false );
+	if ( pThis->fxProfiling ) voiceCyclesTotal += NT_getCpuCycleCount() - vc0;
+
+	vc0 = pThis->fxProfiling ? NT_getCpuCycleCount() : 0;
 	ProcessHat( pThis, busFrames, numFrames, true );
+	if ( pThis->fxProfiling ) voiceCyclesTotal += NT_getCpuCycleCount() - vc0;
+
+	AdvanceFreezeSequence( pThis );
+
+	if ( pThis->fxProfiling )
+	{
+		uint32_t stageSum = 0;
+		for ( int i=kFxStageFilter; i<kNumFxStages; ++i )
+			stageSum += pThis->fxStageCycles[i];
+		pThis->fxStageCycles[kFxStageRender] = ( voiceCyclesTotal > stageSum ) ? ( voiceCyclesTotal - stageSum ) : 0;
+		for ( int i=0; i<kNumFxStages; ++i )
+			pThis->fxStagePercent[i] = MeasureCpuPercent( pThis->fxStagePercent[i], 0, pThis->fxStageCycles[i], numFrames );
+	}
 
 	pThis->cpuPercent = MeasureCpuPercent( pThis->cpuPercent, cpuCycleStart, NT_getCpuCycleCount(), numFrames );
 }
@@ -5062,6 +6106,70 @@ static void NewPreset( _drumMachineAlgorithm* pThis )
 	pThis->potAccum[0] = pThis->potAccum[1] = pThis->potAccum[2] = 0.0f;
 }
 
+// Looks up a slot's _drumVoicePost base (frozen/freezeArmed live there,
+// common to _kickVoice/_snareVoice/_hatVoice) - used both for the bar
+// pages' FROZEN/ARMED tag and by ArmFreeze()/AdvanceFreezeSequence() below.
+static _drumVoicePost& VoiceForSlot( _drumMachineAlgorithm* pThis, int slot )
+{
+	if ( slot == kSlotBD ) return pThis->dtc->kick;
+	if ( slot == kSlotSD ) return pThis->dtc->snare;
+	if ( slot == kSlotCH ) return pThis->dtc->closedHat;
+	return pThis->dtc->openHat;
+}
+
+// "Freeze" - the preset menu's 4th option, alongside Load/Save/New. Captures
+// one slot at a time (BD, then SD, then CH, then OH - see freezeSeqSlot's
+// comment) rather than arming all 4 simultaneously, so a fast pattern only
+// ever has one voice dropping hits (see TriggerSlot()'s comment) at once
+// instead of all 4 at the same time. Operates on whatever kit is *currently
+// loaded*, not an arbitrary bank slot, since frozen audio is session-local
+// and was never part of presetBank/modBank in the first place. Clears any
+// existing frozen/captured state on all 4 immediately so arming always
+// means "about to capture fresh live hits", never "still showing stale
+// frozen audio while waiting".
+static void ArmFreeze( _drumMachineAlgorithm* pThis )
+{
+	pThis->dtc->kick.freezeArmed = false;
+	pThis->dtc->kick.freezeCapturing = false;
+	pThis->dtc->kick.frozen = false;
+	pThis->dtc->kick.frozenNumFrames = 0;
+	pThis->dtc->snare.freezeArmed = false;
+	pThis->dtc->snare.freezeCapturing = false;
+	pThis->dtc->snare.frozen = false;
+	pThis->dtc->snare.frozenNumFrames = 0;
+	pThis->dtc->closedHat.freezeArmed = false;
+	pThis->dtc->closedHat.freezeCapturing = false;
+	pThis->dtc->closedHat.frozen = false;
+	pThis->dtc->closedHat.frozenNumFrames = 0;
+	pThis->dtc->openHat.freezeArmed = false;
+	pThis->dtc->openHat.freezeCapturing = false;
+	pThis->dtc->openHat.frozen = false;
+	pThis->dtc->openHat.frozenNumFrames = 0;
+
+	pThis->freezeSeqSlot = kSlotBD;
+	VoiceForSlot( pThis, kSlotBD ).freezeArmed = true;
+}
+
+// Called once per audio block (see step()'s tail) - watches the slot
+// currently capturing (freezeSeqSlot) and, the moment it finalizes
+// (frozen flips true), arms the next slot in BD->SD->CH->OH order. -1 means
+// no sequence is in progress (either never armed, or OH has finished).
+static void AdvanceFreezeSequence( _drumMachineAlgorithm* pThis )
+{
+	if ( pThis->freezeSeqSlot < 0 )
+		return;
+	if ( !VoiceForSlot( pThis, pThis->freezeSeqSlot ).frozen )
+		return;
+	int nextSlot = pThis->freezeSeqSlot + 1;
+	if ( nextSlot > kSlotOH )
+	{
+		pThis->freezeSeqSlot = -1;
+		return;
+	}
+	pThis->freezeSeqSlot = nextSlot;
+	VoiceForSlot( pThis, nextSlot ).freezeArmed = true;
+}
+
 // Resolves the route mapping `source` to (concept, slot) for quick-edit
 // (button 4) depth adjustment on a bar page - reuses an existing matching
 // route if one exists (via the read-only FindRoute()), otherwise claims a
@@ -5187,15 +6295,15 @@ void	customUi( _NT_algorithm* self, const _NT_uiData& data )
 			return;	// preset menu owns every claimed control while it's open
 		}
 
-		// Stage 1: choosing Load/Save/New for the highlighted slot - still
-		// all on Encoder R (rotate cycles the choice, push confirms). Any
-		// nonzero delta advances by exactly one step (not proportional to
-		// turn speed), same idiom as the old binary Load/Save toggle this
-		// replaced.
+		// Stage 1: choosing Load/Save/New/Freeze for the highlighted slot -
+		// still all on Encoder R (rotate cycles the choice, push confirms).
+		// Any nonzero delta advances by exactly one step (not proportional
+		// to turn speed), same idiom as the old binary Load/Save toggle
+		// this replaced.
 		if ( data.encoders[1] != 0 )
 		{
 			int dir = data.encoders[1] > 0 ? 1 : -1;
-			pThis->presetMenuAction = ( pThis->presetMenuAction + dir + 3 ) % 3;
+			pThis->presetMenuAction = ( pThis->presetMenuAction + dir + 4 ) % 4;
 		}
 		if ( ( data.controls & kNT_encoderButtonR ) && !( data.lastButtons & kNT_encoderButtonR ) )
 		{
@@ -5203,8 +6311,10 @@ void	customUi( _NT_algorithm* self, const _NT_uiData& data )
 				LoadPreset( pThis, pThis->presetMenuIndex );
 			else if ( pThis->presetMenuAction == 1 )
 				SavePreset( pThis, pThis->presetMenuIndex );
-			else
+			else if ( pThis->presetMenuAction == 2 )
 				NewPreset( pThis );
+			else
+				ArmFreeze( pThis );	// operates on the currently-loaded kit, presetMenuIndex is irrelevant here
 			pThis->presetMenuOpen = false;
 		}
 		return;	// preset menu owns every claimed control while it's open
@@ -5334,6 +6444,21 @@ void	customUi( _NT_algorithm* self, const _NT_uiData& data )
 			CONSTRAIN( newValue, -100, 100 );
 			SetParam( pThis, gainParam, newValue );
 		}
+
+		// Encoder R's press (not its rotation, used above for gain) is free
+		// on this page - see kFxBypassXxx's comment - toggle EQ Sculpt's
+		// bypass for all 4 slots at once.
+		if ( ( data.controls & kNT_encoderButtonR ) && !( data.lastButtons & kNT_encoderButtonR ) )
+			pThis->fxBypassMask ^= kFxBypassEqSculpt;
+	}
+	else if ( kPageType[pThis->currentPage] == kPageTypeChainOverview )
+	{
+		// Signal Chain overview - see DrawChainOverviewPage(). Its only
+		// control is Encoder R's press, toggling the CPU profiler; there's
+		// nothing per-slot to edit here (per-stage bypass toggles live on
+		// each stage's own bar page instead - see the bar-page branch below).
+		if ( ( data.controls & kNT_encoderButtonR ) && !( data.lastButtons & kNT_encoderButtonR ) )
+			pThis->fxProfiling = !pThis->fxProfiling;
 	}
 	else if ( kPageType[pThis->currentPage] == kPageTypeList )
 	{
@@ -5390,6 +6515,17 @@ void	customUi( _NT_algorithm* self, const _NT_uiData& data )
 
 		bool editingDepth = isBarPage && concept != -1 && pThis->barPageMode != kModSrcNone;
 		const uint8_t* baseParams = kPageParams[ pThis->currentPage ];
+
+		// Encoder R's press is otherwise unclaimed on a plain bar page (its
+		// rotation already edits this page's 3rd slot below) - on the 8
+		// pages that map to a real ApplyPost() stage (see kPageToFxStage),
+		// pressing it toggles that whole stage's bypass for all 4 slots at
+		// once (see kFxBypassXxx's comment). Only when not already in
+		// quick-edit-depth mode, where the same press instead means "delete
+		// this slot's route" (below) on the 4 pages that support both.
+		int fxStage = kPageToFxStage[ pThis->currentPage ];
+		if ( fxStage != -1 && !editingDepth && ( data.controls & kNT_encoderButtonR ) && !( data.lastButtons & kNT_encoderButtonR ) )
+			pThis->fxBypassMask ^= kFxStageBypassBit[fxStage];
 
 		// Clicking the pot/encoder for a mapped slot while in quick-edit
 		// mode opens a delete-confirm dialog (see deleteConfirmOpen's
@@ -5655,12 +6791,26 @@ static void DrawBarPage( _drumMachineAlgorithm* pThis )
 	int concept = kPageConcept[page];
 	bool editingDepth = ( concept != -1 ) && ( pThis->barPageMode != kModSrcNone );
 
+	// BYPASSED tag - see kFxBypassXxx's comment. Only pages that actually
+	// map to an ApplyPost() stage can ever be bypassed (kPageToFxStage
+	// returns -1, and kFxStageBypassBit[-1]-shaped bugs are avoided, for
+	// everything else).
+	int fxStage = kPageToFxStage[page];
+	bool bypassed = ( fxStage != -1 ) && ( pThis->fxBypassMask & kFxStageBypassBit[fxStage] ) != 0;
+
 	if ( editingDepth )
 	{
 		char titleBuff[32];
 		strcpy( titleBuff, kPageNames[page] );
 		strcat( titleBuff, " - " );
 		strcat( titleBuff, kQuickModeNames[pThis->barPageMode] );
+		DrawHeader( pThis, titleBuff );
+	}
+	else if ( bypassed )
+	{
+		char titleBuff[40];
+		strcpy( titleBuff, kPageNames[page] );
+		strcat( titleBuff, " - BYPASSED" );
 		DrawHeader( pThis, titleBuff );
 	}
 	else
@@ -5814,7 +6964,17 @@ static void DrawBarPage( _drumMachineAlgorithm* pThis )
 		// bottom of the screen).
 		int labelX = bx1 + 2;
 		int labelY = y1;
-		NT_drawText( labelX, labelY, kSlotNames[slot], 15, kNT_textLeft, kNT_textTiny );
+		// FROZEN/ARMED tag - session-local (see _drumVoicePost::frozenBuf's
+		// comment), so it lives here rather than the preset browser's slot
+		// list, which has no persistent per-preset state to show for it.
+		{
+			_drumVoicePost& fv = VoiceForSlot( pThis, slot );
+			char slotLabel[8];
+			strcpy( slotLabel, kSlotNames[slot] );
+			if ( fv.freezeArmed ) strcat( slotLabel, "A" );
+			else if ( fv.frozen ) strcat( slotLabel, "F" );
+			NT_drawText( labelX, labelY, slotLabel, 15, kNT_textLeft, kNT_textTiny );
+		}
 
 		if ( !editingDepth && concept != -1 )
 		{
@@ -5836,9 +6996,10 @@ static void DrawPresetMenu( _drumMachineAlgorithm* pThis )
 		NT_drawText( 251, 7, "PRESS", 8, kNT_textRight, kNT_textTiny );
 	else
 	{
-		NT_drawText( 178, 7, "LOAD", pThis->presetMenuAction == 0 ? 15 : 5, kNT_textLeft, kNT_textTiny );
-		NT_drawText( 208, 7, "SAVE", pThis->presetMenuAction == 1 ? 15 : 5, kNT_textLeft, kNT_textTiny );
-		NT_drawText( 238, 7, "NEW", pThis->presetMenuAction == 2 ? 15 : 5, kNT_textLeft, kNT_textTiny );
+		NT_drawText( 166, 7, "LOAD", pThis->presetMenuAction == 0 ? 15 : 5, kNT_textLeft, kNT_textTiny );
+		NT_drawText( 192, 7, "SAVE", pThis->presetMenuAction == 1 ? 15 : 5, kNT_textLeft, kNT_textTiny );
+		NT_drawText( 218, 7, "NEW", pThis->presetMenuAction == 2 ? 15 : 5, kNT_textLeft, kNT_textTiny );
+		NT_drawText( 238, 7, "FREEZE", pThis->presetMenuAction == 3 ? 15 : 5, kNT_textLeft, kNT_textTiny );
 	}
 	NT_drawShapeI( kNT_line, 0, kHeaderDividerY, 255, kHeaderDividerY, 4 );
 
@@ -5919,7 +7080,7 @@ static void DrawEqDeleteConfirm( _drumMachineAlgorithm* pThis )
 // than a bare point ever could.
 static void DrawEqSculptPage( _drumMachineAlgorithm* pThis )
 {
-	DrawHeader( pThis, "EQ SCULPT" );
+	DrawHeader( pThis, ( pThis->fxBypassMask & kFxBypassEqSculpt ) ? "EQ SCULPT - BYPASSED" : "EQ SCULPT" );
 
 	static const int kEqFreq1Param[kNumSlots] = { kParamEqFreq1BD, kParamEqFreq1SD, kParamEqFreq1CH, kParamEqFreq1OH };
 	static const int kEqGain1Param[kNumSlots] = { kParamEqGain1BD, kParamEqGain1SD, kParamEqGain1CH, kParamEqGain1OH };
@@ -6046,6 +7207,62 @@ static void DrawEqSculptPage( _drumMachineAlgorithm* pThis )
 	NT_drawText( 252, 59, "POT L: DELETE PT", 6, kNT_textRight, kNT_textTiny );
 }
 
+// Signal Chain overview - the first custom-UI page (Encoder L cycles here
+// before Envelopes). One box per ApplyPost() stage in actual signal-chain
+// order (kFxStageXxx), no per-slot values at all (unlike every other custom
+// page) since bypass is a single all-slots flag, not a per-slot parameter -
+// see fxBypassMask's comment. Bypassed stages dim and get a strike-through;
+// pressing Encoder R toggles the CPU profiler (see fxProfiling's comment),
+// which replaces each box's static short name with its live % of the real-
+// time budget instead. kFxStageRender (leftmost - actually first in the
+// chain) has no bypass bit, so it never dims/strikes, only ever profiles.
+static void DrawChainOverviewPage( _drumMachineAlgorithm* pThis )
+{
+	DrawHeader( pThis, "SIGNAL CHAIN" );
+
+	constexpr int y0 = kHeaderDividerY + 6;
+	constexpr int y1 = 52;
+	constexpr int gap = 2;
+	constexpr int boxWidth = ( 256 - ( kNumFxStages + 1 ) * gap ) / kNumFxStages;
+
+	for ( int stage=0; stage<kNumFxStages; ++stage )
+	{
+		int bx0 = gap + stage * ( boxWidth + gap );
+		int bx1 = bx0 + boxWidth;
+
+		uint16_t bit = kFxStageBypassBit[stage];
+		bool bypassed = bit != 0 && ( pThis->fxBypassMask & bit ) != 0;
+		int outline = bypassed ? 4 : 12;
+
+		NT_drawShapeI( kNT_box, bx0, y0, bx1, y1, outline );
+
+		if ( pThis->fxProfiling )
+		{
+			char pctBuff[8];
+			NT_intToString( pctBuff, (int)( pThis->fxStagePercent[stage] + 0.5f ) );
+			char buff[12];
+			strcpy( buff, pctBuff );
+			strcat( buff, "%" );
+			NT_drawText( ( bx0 + bx1 ) / 2, ( y0 + y1 ) / 2 - 2, buff, bypassed ? 8 : 15, kNT_textCentre, kNT_textTiny );
+		}
+		else
+		{
+			NT_drawText( ( bx0 + bx1 ) / 2, ( y0 + y1 ) / 2 - 2, kFxStageShortName[stage], bypassed ? 5 : 15, kNT_textCentre, kNT_textTiny );
+		}
+
+		if ( bypassed )
+			NT_drawShapeI( kNT_line, bx0 + 2, ( y0 + y1 ) / 2 + 3, bx1 - 2, ( y0 + y1 ) / 2 + 3, 4 );
+
+		// Chain-order connector - a short tick between adjacent boxes, purely
+		// decorative (reinforces "this is a signal path", not just a grid).
+		if ( stage < kNumFxStages - 1 )
+			NT_drawShapeI( kNT_line, bx1, ( y0 + y1 ) / 2, bx1 + gap, ( y0 + y1 ) / 2, 4 );
+	}
+
+	NT_drawText( 4, 59, "BYPASS: EACH STAGE'S OWN PAGE, ENC R", 6, kNT_textLeft, kNT_textTiny );
+	NT_drawText( 252, 59, pThis->fxProfiling ? "PROFILING" : "ENC R: PROFILE", pThis->fxProfiling ? 15 : 6, kNT_textRight, kNT_textTiny );
+}
+
 bool	draw( _NT_algorithm* self )
 {
 	_drumMachineAlgorithm* pThis = (_drumMachineAlgorithm*)self;
@@ -6064,6 +7281,8 @@ bool	draw( _NT_algorithm* self )
 		DrawLfosPage( pThis );
 	else if ( pThis->currentPage == kPageEqSculpt )
 		DrawEqSculptPage( pThis );
+	else if ( pThis->currentPage == kPageChainOverview )
+		DrawChainOverviewPage( pThis );
 	else
 		DrawBarPage( pThis );
 
