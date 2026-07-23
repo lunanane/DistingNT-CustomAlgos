@@ -7289,6 +7289,15 @@ static void AdvanceFreezeSequence( _drumMachineAlgorithm* pThis )
 	if ( !VoiceForSlot( pThis, pThis->freezeSeqSlot ).frozen )
 		return;
 	int nextSlot = pThis->freezeSeqSlot + 1;
+	// Skip past any slot that's already validly frozen (e.g. Prerender
+	// already captured it as part of the same preset switch that started
+	// this sequence - see AdvanceAutoFreeze()'s comment) - only arm slots
+	// that actually still need a live capture, rather than unconditionally
+	// re-arming every slot in the scope regardless of whether it's already
+	// done, which would throw away a good Prerendered capture and force an
+	// avoidable live re-render (a real CPU spike right after a switch).
+	while ( nextSlot <= kSlotOH && VoiceForSlot( pThis, nextSlot ).frozen )
+		++nextSlot;
 	if ( nextSlot > kSlotOH )
 	{
 		pThis->freezeSeqSlot = -1;
@@ -7302,10 +7311,21 @@ static void AdvanceFreezeSequence( _drumMachineAlgorithm* pThis )
 // step(), right after AdvanceFreezeSequence(). Whenever no capture is
 // currently in progress (freezeSeqSlot == -1) and at least one in-scope
 // voice isn't already frozen or armed (e.g. because a parameter edit just
-// un-froze it - see each ProcessXxx()'s un-freeze check), (re)starts a fresh
-// ArmFreeze() sequence over exactly the selected scope - making Freeze
-// fully self-maintaining with no user action, on top of (not instead of)
-// the manual preset-menu action.
+// un-froze it - see each ProcessXxx()'s un-freeze check, or because a
+// Prerendered switch left one slot incomplete - see FinishCue()), arms
+// *only* the first such slot - deliberately not ArmFreeze() (which would
+// unconditionally reset every slot in scope back to un-frozen first) - so
+// a slot Prerender (or a previous pass of this same function) already
+// froze is left completely untouched. Without this distinction, a preset
+// switch that finished prerendering 3 of 4 slots would have this function
+// see "not everything is frozen" and discard all 3 good captures just to
+// re-arm the whole scope from scratch - exactly the live-rendering CPU
+// spike Prerender exists to avoid, right at the moment of a switch.
+// AdvanceFreezeSequence() (immediately above) mirrors this same
+// "skip anything already frozen" logic as the sequence continues slot to
+// slot. Self-maintaining with no user action, on top of (not instead of)
+// the manual preset-menu Freeze action (which still uses ArmFreeze() to
+// force a full fresh capture, unconditionally, by design).
 static void AdvanceAutoFreeze( _drumMachineAlgorithm* pThis )
 {
 	int mode = pThis->v[ kParamAutoFreezeMode ];
@@ -7315,18 +7335,21 @@ static void AdvanceAutoFreeze( _drumMachineAlgorithm* pThis )
 		return;
 
 	int startSlot = ( mode == kAutoFreezeAll ) ? kSlotBD : kSlotSD;
-	bool anyNeeds = false;
+	int firstNeeded = -1;
 	for ( int s=startSlot; s<=kSlotOH; ++s )
 	{
 		_drumVoicePost& v = VoiceForSlot( pThis, s );
 		if ( !v.frozen && !v.freezeArmed )
 		{
-			anyNeeds = true;
+			firstNeeded = s;
 			break;
 		}
 	}
-	if ( anyNeeds )
-		ArmFreeze( pThis, startSlot );
+	if ( firstNeeded < 0 )
+		return;
+
+	pThis->freezeSeqSlot = firstNeeded;
+	VoiceForSlot( pThis, firstNeeded ).freezeArmed = true;
 }
 
 // Resolves the route mapping `source` to (concept, slot) for quick-edit
