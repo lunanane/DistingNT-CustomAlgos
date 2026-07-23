@@ -399,6 +399,42 @@ enum
 	// presets).
 	kParamDriveTypeBD, kParamDriveTypeSD, kParamDriveTypeCH, kParamDriveTypeOH,
 
+	// AUTO FREEZE MODE - see kAutoFreezeXxx's comment and AdvanceAutoFreeze().
+	// Not modulatable, not per-slot (one global mode). Appended at the very
+	// end, like every other non-smoothed control - never inserted mid-range
+	// (see kParamFoldBD's comment for why that matters for saved presets).
+	kParamAutoFreezeMode,
+
+	// RUMBLE GENERATOR - see ProcessRumble()'s comment. A single mono/stereo
+	// sub-bass layer, not per-slot (no BD/SD/CH/OH dimension), reactive to
+	// the kick rather than driven by its own MIDI note. Not modulatable (no
+	// Mod Matrix entries) - appended at the very end like every other
+	// addition in this enum.
+	kParamRumbleType,
+	kParamRumbleEnvType,
+	kParamRumbleEnvTime,
+	kParamRumbleIntensity,
+	kParamRumblePitchType,
+	kParamRumblePitchValue,
+	// Routing - identical shape to BD/SD/CH/OH's own Out/Mode/Stereo (no Pan -
+	// deliberately dropped to stay at the confirmed-safe 213-parameter total
+	// rather than the confirmed-broken 214 when Prerender's own toggle below
+	// was added; sub-bass is conventionally mixed mono anyway, so Rumble
+	// always renders center-panned - see ProcessRumble()'s comment). Just
+	// appended here rather than up in the Routing block above (Page 0) to
+	// avoid shifting every later parameter's saved-preset position - see
+	// kParamFoldBD's comment for why that's a hard rule, not just tidiness.
+	// Still listed on the standard menu's "Routing" page (pageRouting[]
+	// appends these at its end) despite living here in the enum - the
+	// page's display order is independent of the enum's storage order.
+	kParamRumbleOut,
+	kParamRumbleOutMode,
+	kParamRumbleStereo,
+
+	// PRERENDER - see the Preset Prerender feature's comment (ProcessRenderVoice(),
+	// CuePreset()). Not modulatable, not per-slot. Appended at the very end.
+	kParamPrerenderEnabled,
+
 	kNumParams,
 };
 
@@ -488,6 +524,40 @@ enum { kWaveshaperTypeGentle, kWaveshaperTypeOverdrive, kWaveshaperTypeHardClip,
 static char const * const kEnumWaveshaperType[] = { "Gentle", "Overdrive", "HardClip" };
 static_assert( ARRAY_SIZE(kEnumWaveshaperType) == kNumWaveshaperTypes, "" );
 
+// Auto Freeze - see kParamAutoFreezeMode's comment and AdvanceAutoFreeze().
+// None leaves Freeze fully manual (the existing preset-menu action, untouched
+// either way). All continuously (re-)arms every voice the instant any of
+// them isn't already frozen/capturing; SD/CH/OH does the same but leaves BD
+// alone (always live) - for kits where BD's own per-hit variation is worth
+// keeping, per the user's own framing ("the dynamic real-voice bassdrum is
+// adding a lot of extra audio quality with its variations").
+enum { kAutoFreezeNone, kAutoFreezeAll, kAutoFreezeSdChOh, kNumAutoFreezeModes };
+static char const * const kEnumAutoFreezeMode[] = { "None", "All", "SD/CH/OH" };
+static_assert( ARRAY_SIZE(kEnumAutoFreezeMode) == kNumAutoFreezeModes, "" );
+
+// Rumble Generator - see ProcessRumble()'s comment. Type 0 is "None" (the
+// whole generator is skipped entirely, not just silenced - same "0 = off,
+// skip the work" convention as Sample/Noise elsewhere in this file).
+enum {
+	kRumbleNone,
+	kRumbleSubSine, kRumbleSineFoldGrit, kRumbleDetunedDualSine, kRumbleFilteredNoise,
+	kRumbleFmGrowl, kRumbleRingModMetallic, kRumbleResonantComb, kRumbleDistortedBoom,
+	kNumRumbleTypes,
+};
+static char const * const kEnumRumbleType[] = {
+	"None", "Sub Sine", "Sine Fold Grit", "Dual Sine", "Filtered Noise",
+	"FM Growl", "Ring Mod", "Resonant Comb", "Distorted Boom",
+};
+static_assert( ARRAY_SIZE(kEnumRumbleType) == kNumRumbleTypes, "" );
+
+enum { kRumbleEnvFixed, kRumbleEnvSidechain, kNumRumbleEnvTypes };
+static char const * const kEnumRumbleEnvType[] = { "Fixed", "Sidechain" };
+static_assert( ARRAY_SIZE(kEnumRumbleEnvType) == kNumRumbleEnvTypes, "" );
+
+enum { kRumblePitchTrackBD, kRumblePitchHarmonic, kRumblePitchFixed, kNumRumblePitchTypes };
+static char const * const kEnumRumblePitchType[] = { "Track BD", "Harmonic", "Fixed Note" };
+static_assert( ARRAY_SIZE(kEnumRumblePitchType) == kNumRumblePitchTypes, "" );
+
 // Transient shaper model - see kParamTransTypeBD's comment and
 // ApplyTransient(). Each is inspired by a different open-source transient
 // shaper (Classic: johannes-mueller/envolvigo; Snap: lowwavestudios/
@@ -549,6 +619,7 @@ static_assert( ARRAY_SIZE(kEnumSrCrushMode) == kNumSrCrushModes, "" );
 
 static char const * const kEnumMidiMode[] = { "Note per slot", "Channel per slot" };
 static char const * const kEnumStereo[] = { "Mono", "Stereo" };
+static char const * const kEnumOffOn[] = { "Off", "On" };
 
 // LFO rate: synced clock division, independently selectable per LFO (see
 // AdvanceLfos()). kLfoRateMultiplier is in units of quarter notes (a "1/1"
@@ -765,9 +836,22 @@ static _NT_parameter parameters[] = {
 	{ .name = "SD waveshaper type", .min = 0, .max = kNumWaveshaperTypes - 1, .def = 0, .unit = kNT_unitEnum, .scaling = 0, .enumStrings = kEnumWaveshaperType },
 	{ .name = "CH waveshaper type", .min = 0, .max = kNumWaveshaperTypes - 1, .def = 0, .unit = kNT_unitEnum, .scaling = 0, .enumStrings = kEnumWaveshaperType },
 	{ .name = "OH waveshaper type", .min = 0, .max = kNumWaveshaperTypes - 1, .def = 0, .unit = kNT_unitEnum, .scaling = 0, .enumStrings = kEnumWaveshaperType },
+
+	{ .name = "Auto Freeze", .min = 0, .max = kNumAutoFreezeModes - 1, .def = 0, .unit = kNT_unitEnum, .scaling = 0, .enumStrings = kEnumAutoFreezeMode },
+
+	{ .name = "Rumble type", .min = 0, .max = kNumRumbleTypes - 1, .def = 0, .unit = kNT_unitEnum, .scaling = 0, .enumStrings = kEnumRumbleType },
+	{ .name = "Rumble env type", .min = 0, .max = kNumRumbleEnvTypes - 1, .def = 0, .unit = kNT_unitEnum, .scaling = 0, .enumStrings = kEnumRumbleEnvType },
+	{ .name = "Rumble env time", .min = 0, .max = 100, .def = 50, .unit = kNT_unitPercent, .scaling = 0, .enumStrings = NULL },
+	{ .name = "Rumble intensity", .min = 0, .max = 100, .def = 50, .unit = kNT_unitPercent, .scaling = 0, .enumStrings = NULL },
+	{ .name = "Rumble pitch type", .min = 0, .max = kNumRumblePitchTypes - 1, .def = 0, .unit = kNT_unitEnum, .scaling = 0, .enumStrings = kEnumRumblePitchType },
+	{ .name = "Rumble pitch value", .min = 0, .max = 100, .def = 50, .unit = kNT_unitPercent, .scaling = 0, .enumStrings = NULL },
+	NT_PARAMETER_AUDIO_OUTPUT_WITH_MODE( "Rumble Out", 1, 18 )
+	{ .name = "Rumble stereo", .min = 0, .max = 1, .def = 0, .unit = kNT_unitEnum, .scaling = 0, .enumStrings = kEnumStereo },
+
+	{ .name = "Prerender", .min = 0, .max = 1, .def = 0, .unit = kNT_unitEnum, .scaling = 0, .enumStrings = kEnumOffOn },
 };
 
-static const uint8_t pageRouting[]   = { kParamOutBD, kParamOutBDMode, kParamStereoBD, kParamPanBD, kParamOutSD, kParamOutSDMode, kParamStereoSD, kParamPanSD, kParamOutCH, kParamOutCHMode, kParamStereoCH, kParamPanCH, kParamOutOH, kParamOutOHMode, kParamStereoOH, kParamPanOH };
+static const uint8_t pageRouting[]   = { kParamOutBD, kParamOutBDMode, kParamStereoBD, kParamPanBD, kParamOutSD, kParamOutSDMode, kParamStereoSD, kParamPanSD, kParamOutCH, kParamOutCHMode, kParamStereoCH, kParamPanCH, kParamOutOH, kParamOutOHMode, kParamStereoOH, kParamPanOH, kParamRumbleOut, kParamRumbleOutMode, kParamRumbleStereo };
 static const uint8_t pageMidi[]      = { kParamMidiMode, kParamMidiChannel, kParamMidiChBD, kParamMidiChSD, kParamMidiChCH, kParamMidiChOH, kParamMidiNoteBD, kParamMidiNoteSD, kParamMidiNoteCH, kParamMidiNoteOH };
 static const uint8_t pageEnvelopes[] = { kParamEnv1Morph, kParamEnv1Shape, kParamEnv2Morph, kParamEnv2Shape };
 static const uint8_t pageLfos[]      = { kParamLfo1Rate, kParamLfo1Shape, kParamLfo2Rate, kParamLfo2Shape };
@@ -829,40 +913,27 @@ static void BuildModMatrixPage()
 		pageModMatrix[i] = (uint8_t)( kFirstModRouteParam + i );
 }
 
+// Deliberately just these 3 - every other page here would be a pure
+// duplicate of a page already in the custom UI's own bar-page cycle (see
+// kFirstCustomPage's comment), and the standard menu's page-selector strip
+// divides its fixed screen width evenly across however many pages exist -
+// with all ~32 duplicates included, that left under 8px per tab, nowhere
+// near enough to render a page name legibly (confirmed on hardware: tab
+// labels were rendering as illegible garbled fragments). Routing/MIDI/Mod
+// Matrix are the only pages with no custom-UI equivalent at all (patching/
+// config, not sound-shaping - per the same kFirstCustomPage comment), so
+// they're the only ones that actually need standard-menu real estate.
+// Every parameter removed from this list is still fully editable via the
+// custom UI (and still a real, automatable _NT_parameter either way) -
+// nothing here deletes or hides a parameter, only its redundant standard-
+// menu page grouping.
+static const uint8_t pageAutoFreeze[] = { kParamAutoFreezeMode, kParamPrerenderEnabled };
+
 static const _NT_parameterPage pages[] = {
 	{ .name = "Routing", .numParams = ARRAY_SIZE(pageRouting), .params = pageRouting },
 	{ .name = "MIDI", .numParams = ARRAY_SIZE(pageMidi), .params = pageMidi },
 	{ .name = "Mod Matrix", .numParams = ARRAY_SIZE(pageModMatrix), .params = pageModMatrix },
-	{ .name = "Envelopes", .numParams = ARRAY_SIZE(pageEnvelopes), .params = pageEnvelopes },
-	{ .name = "LFOs", .numParams = ARRAY_SIZE(pageLfos), .params = pageLfos },
-	{ .name = "Model", .numParams = ARRAY_SIZE(pageModel), .params = pageModel },
-	{ .name = "Release", .numParams = ARRAY_SIZE(pageRelease), .params = pageRelease },
-	{ .name = "Compressor", .numParams = ARRAY_SIZE(pageComp), .params = pageComp },
-	{ .name = "Filter", .numParams = ARRAY_SIZE(pageFilter), .params = pageFilter },
-	{ .name = "Waveshaper", .numParams = ARRAY_SIZE(pageDrive), .params = pageDrive },
-	{ .name = "Waveshaper Type", .numParams = ARRAY_SIZE(pageDriveType), .params = pageDriveType },
-	{ .name = "Pitch", .numParams = ARRAY_SIZE(pagePitch), .params = pagePitch },
-	{ .name = "Volume", .numParams = ARRAY_SIZE(pageVolume), .params = pageVolume },
-	{ .name = "Tone", .numParams = ARRAY_SIZE(pageTone), .params = pageTone },
-	{ .name = "Character", .numParams = ARRAY_SIZE(pageChar), .params = pageChar },
-	{ .name = "FM", .numParams = ARRAY_SIZE(pageFm), .params = pageFm },
-	{ .name = "FM Mode", .numParams = ARRAY_SIZE(pageFmMode), .params = pageFmMode },
-	{ .name = "Sample", .numParams = ARRAY_SIZE(pageSample), .params = pageSample },
-	{ .name = "Sample Mix", .numParams = ARRAY_SIZE(pageSampleMix), .params = pageSampleMix },
-	{ .name = "Knock/Tail", .numParams = ARRAY_SIZE(pageKnockTail), .params = pageKnockTail },
-	{ .name = "Mix Type", .numParams = ARRAY_SIZE(pageMixType), .params = pageMixType },
-	{ .name = "Wavefolder", .numParams = ARRAY_SIZE(pageFold), .params = pageFold },
-	{ .name = "Wavefolder Type", .numParams = ARRAY_SIZE(pageFoldType), .params = pageFoldType },
-	{ .name = "Pan", .numParams = ARRAY_SIZE(pagePan), .params = pagePan },
-	{ .name = "EQ Sculpt", .numParams = ARRAY_SIZE(pageEqSculptList), .params = pageEqSculptList },
-	{ .name = "Transient", .numParams = ARRAY_SIZE(pageTrans), .params = pageTrans },
-	{ .name = "Transient Type", .numParams = ARRAY_SIZE(pageTransType), .params = pageTransType },
-	{ .name = "Noise", .numParams = ARRAY_SIZE(pageNoise), .params = pageNoise },
-	{ .name = "Noise Type", .numParams = ARRAY_SIZE(pageNoiseType), .params = pageNoiseType },
-	{ .name = "Bit Crush", .numParams = ARRAY_SIZE(pageBitCrush), .params = pageBitCrush },
-	{ .name = "Sample Crush", .numParams = ARRAY_SIZE(pageSrCrush), .params = pageSrCrush },
-	{ .name = "Attack Mode", .numParams = ARRAY_SIZE(pageAttackMode), .params = pageAttackMode },
-	{ .name = "Sample Crush Mode", .numParams = ARRAY_SIZE(pageSrCrushMode), .params = pageSrCrushMode },
+	{ .name = "Auto Freeze", .numParams = ARRAY_SIZE(pageAutoFreeze), .params = pageAutoFreeze },
 };
 
 static const _NT_parameterPages parameterPages = {
@@ -883,6 +954,7 @@ enum {
 	kPageRouting, kPageMidi,
 	kPageChainOverview,
 	kPageEnvelopes, kPageLfos, kPageModMatrix,
+	kPageRumble, kPageRumbleEnv,
 	kPageModel, kPageRelease, kPageCompressor, kPageFilter,
 	kPageWaveshaper, kPageWaveshaperType,
 	kPagePitch, kPageVolume, kPageTone, kPageCharacter, kPageFm, kPageFmMode,
@@ -905,11 +977,17 @@ enum { kFirstCustomPage = kPageChainOverview };
 // page's "4 controls, one per slot" layout. kPageTypeChainOverview is
 // likewise bespoke (see DrawChainOverviewPage()) - it has no per-slot
 // values at all, just a static row of FX-block boxes plus the profiler.
-enum { kPageTypeList, kPageTypeGraph, kPageTypeBar, kPageTypeEqSculpt, kPageTypeChainOverview };
+// kPageTypeRumble/kPageTypeRumbleEnv are bespoke for the same reason as
+// EQ Sculpt/Chain Overview - Rumble has no BD/SD/CH/OH slot dimension at
+// all, so the generic "4 controls, one per slot" bar-page layout doesn't
+// apply; each maps its 4 controls to different *parameters* instead (see
+// DrawRumblePage()/DrawRumbleEnvPage()).
+enum { kPageTypeList, kPageTypeGraph, kPageTypeBar, kPageTypeEqSculpt, kPageTypeChainOverview, kPageTypeRumble, kPageTypeRumbleEnv };
 static const int kPageType[kNumPages] = {
 	kPageTypeList, kPageTypeList,
 	kPageTypeChainOverview,
 	kPageTypeGraph, kPageTypeGraph, kPageTypeList,
+	kPageTypeRumble, kPageTypeRumbleEnv,
 	kPageTypeBar, kPageTypeBar, kPageTypeBar, kPageTypeBar,
 	kPageTypeBar, kPageTypeBar,
 	kPageTypeBar, kPageTypeBar, kPageTypeBar, kPageTypeBar, kPageTypeBar, kPageTypeBar,
@@ -933,6 +1011,7 @@ static const uint8_t* const kPageParams[kNumPages] = {
 	pageRouting, pageMidi,
 	pageEqSculptList,
 	pageEnvelopes, pageLfos, pageModMatrix,
+	pageEqSculptList, pageEqSculptList,
 	pageModel, pageRelease, pageComp, pageFilter,
 	pageDrive, pageDriveType,
 	pagePitch, pageVolume, pageTone, pageChar, pageFm, pageFmMode,
@@ -949,6 +1028,7 @@ static const int kPageItemCount[kNumPages] = {
 	(int)ARRAY_SIZE(pageRouting), (int)ARRAY_SIZE(pageMidi),
 	0,
 	0, 0, (int)ARRAY_SIZE(pageModMatrix),
+	0, 0,
 	0, 0, 0, 0,
 	0, 0,
 	0, 0, 0, 0, 0, 0,
@@ -965,6 +1045,7 @@ static const char* const kPageNames[kNumPages] = {
 	"ROUTING", "MIDI",
 	"SIGNAL CHAIN",
 	"ENVELOPES", "LFOS", "MOD MATRIX",
+	"RUMBLE", "RUMBLE ENV",
 	"MODEL", "RELEASE", "COMPRESSOR", "FILTER",
 	"WAVESHAPE", "WAVESHAPE TYPE",
 	"PITCH", "VOLUME", "TONE", "CHARACTER", "FM", "FM MODE",
@@ -981,6 +1062,7 @@ static const bool kPageBipolar[kNumPages] = {
 	false, false,
 	false,
 	false, false, false,
+	false, false,
 	false, false, false, true,
 	false, false,
 	false, false, false, false, false, false,
@@ -1004,6 +1086,7 @@ static const int kPageConcept[kNumPages] = {
 	-1, -1,
 	-1,
 	-1, -1, -1,
+	-1, -1,
 	-1, kConceptRelease, kConceptCompressor, kConceptFilter,
 	kConceptDrive, -1,
 	kConceptPitch, kConceptVolume, kConceptTone, kConceptCharacter, kConceptFm, -1,
@@ -1023,6 +1106,7 @@ static const int kPageToFxStage[kNumPages] = {
 	-1, -1,
 	-1,
 	-1, -1, -1,
+	-1, -1,
 	-1, -1, kFxStageCompressor, kFxStageFilter,
 	kFxStageWaveshaper, -1,
 	-1, -1, -1, -1, -1, -1,
@@ -1120,6 +1204,19 @@ static int ModParamAt( int i )
 	if ( i < (int)ARRAY_SIZE(kModParams) )
 		return kModParams[i];
 	return kFirstModRouteParam + ( i - (int)ARRAY_SIZE(kModParams) );
+}
+
+// Reverse of ModParamAt() - finds `paramIndex`'s position within
+// kModParams[], or -1 if it's not a modBank param at all (e.g. Model/Pitch/
+// Release/etc - those live in presetBank instead, see CuedParam()). Linear
+// scan - kModParams is small (~80 entries) and this only ever runs when a
+// prerender capture starts for a new slot, never per-block.
+static int FindModParamSlot( int paramIndex )
+{
+	for ( int i=0; i<(int)ARRAY_SIZE(kModParams); ++i )
+		if ( kModParams[i] == paramIndex )
+			return i;
+	return -1;
 }
 
 // ---------------------------------------------------------------------
@@ -2272,13 +2369,112 @@ struct _hatVoice : _drumVoicePost
 	}
 };
 
+// Rumble Generator - see ProcessRumble()'s comment. A single mono instance
+// (not per-slot like the 4 real voices), reused across whichever of the 8
+// types is currently selected (only one is ever active at a time, so
+// sharing phase/filter state across types is safe). Deliberately reuses
+// only already-proven-cheap building blocks from elsewhere in this file
+// (plaits::Sine, stmlib::Svf, ApplyWavefolder, GentleClip/HardClip,
+// stmlib::Random) rather than introducing new DSP classes.
+struct _rumbleVoice
+{
+	// Oscillator phases - types that use one or two sine oscillators share
+	// these (only one type active at a time).
+	float phase1, phase2;
+
+	// Resonant lowpass, shared by every filtered type - genuinely resonant
+	// (real Q, single mode) here, unlike ApplyPost()'s bipolar "DJ" HP/LP
+	// crossfade use of the same stmlib::Svf class elsewhere in this file.
+	stmlib::Svf lp;
+
+	// Resonant Comb - a small dedicated feedback delay line (not
+	// CombBodyVoice's - that one only reaches ~47Hz, short of Rumble's 20Hz
+	// floor - see RumblePitchFrequency()'s comment) sized for a 20Hz floor
+	// at 48kHz.
+	static constexpr int kCombMaxDelaySamples = 2400;
+	float* combDelayLine;	// [kCombMaxDelaySamples], points into DRAM
+	int combWritePos;
+	float combDampState;
+	float combExciteEnv;
+
+	// Fixed-envelope mode reuses the exact same _envelopeState/LevelAD()
+	// machinery Env1/Env2 already use (see ProcessRumble()'s comment) - no
+	// new envelope DSP. Unused in Sidechain mode.
+	_envelopeState env;
+
+	void Init( float* combBuf )
+	{
+		phase1 = 0.0f;
+		phase2 = 0.0f;
+		lp.Init();
+		combDelayLine = combBuf;
+		for ( int i=0; i<kCombMaxDelaySamples; ++i ) combDelayLine[i] = 0.0f;
+		combWritePos = 0;
+		combDampState = 0.0f;
+		combExciteEnv = 0.0f;
+		env.Init();
+	}
+};
+constexpr int _rumbleVoice::kCombMaxDelaySamples;
+
+// DIAGNOSTIC HISTORY - a first version of this feature gave shadowKick/
+// shadowSnare/shadowHat 3 separate full-size instances (~3.2KB of DTC
+// growth). That alone made the whole module fail to restore an algorithm at
+// boot ("some algorithm in the preset was not restored") - confirmed by
+// process of elimination: the DRAM buffers below were independently ruled
+// out first (identical failure at PrerenderMaxFrames() = 1.0s/0.4s/0.1s/0),
+// then disabling just the 3 DTC instances (PRERENDER_SHADOW_ENABLED = 0)
+// fixed it. DTC turned out to have a much tighter ceiling than DRAM on this
+// hardware. The permanent fix, below, isn't disabling the feature - it's
+// giving shadow kick/snare/hat ONE shared piece of storage instead of 3,
+// since BD/SD/CH/OH are only ever captured one at a time anyway (see
+// ShadowKick()/ShadowSnare()/ShadowHat()).
+#define PRERENDER_SHADOW_ENABLED 1
+
+#if PRERENDER_SHADOW_ENABLED
+static const size_t kShadowVoiceStorageSizeAB = sizeof(_kickVoice) > sizeof(_snareVoice) ? sizeof(_kickVoice) : sizeof(_snareVoice);
+static const size_t kShadowVoiceStorageSize = kShadowVoiceStorageSizeAB > sizeof(_hatVoice) ? kShadowVoiceStorageSizeAB : sizeof(_hatVoice);
+#endif
+
 struct _drumMachineAlgorithm_DTC
 {
 	_kickVoice kick;
 	_snareVoice snare;
 	_hatVoice closedHat;
 	_hatVoice openHat;
+	_rumbleVoice rumble;
+
+#if PRERENDER_SHADOW_ENABLED
+	// Preset Prerender - see ProcessRenderVoice()'s comment. BD, SD, CH, and
+	// OH are always captured strictly one at a time (never concurrently),
+	// so all 3 voice archetypes share this one buffer - sized to the
+	// largest of the three (_snareVoice) - rather than 3 separate full-size
+	// instances, cutting the feature's DTC growth from ~3.2KB to ~1.1KB
+	// (see this section's diagnostic-history comment for why that
+	// difference matters on this hardware). Reinterpreted via
+	// ShadowKick()/ShadowSnare()/ShadowHat() below as whichever archetype
+	// the sequencer is currently capturing - raw storage + explicit Init(),
+	// same convention as every other DTC/DRAM buffer in this file, not a
+	// real C++ object with its own constructor. Because the memory is
+	// shared, each slot's capture result (frozenNumFrames/frozenParamHash)
+	// must be read out and stashed at the algorithm level (bdFrozen*/
+	// sdFrozen*/chFrozen* - see their comment) the instant that slot
+	// finishes, before the next slot's Init() overwrites this buffer.
+	alignas(8) uint8_t shadowVoiceStorage[ kShadowVoiceStorageSize ];
+#endif
 };
+
+#if PRERENDER_SHADOW_ENABLED
+// Reinterprets the shared shadow-voice buffer as whichever archetype is
+// currently capturing - see shadowVoiceStorage's comment. Never call more
+// than one of these "live" at a time without first stashing the previous
+// occupant's result (frozenNumFrames/frozenParamHash) elsewhere - the next
+// Init() call (in RenderShadowKick/Snare/Hat's selfTrig branch) overwrites
+// this buffer's entire contents.
+static inline _kickVoice& ShadowKick( _drumMachineAlgorithm_DTC* dtc ) { return *(_kickVoice*)dtc->shadowVoiceStorage; }
+static inline _snareVoice& ShadowSnare( _drumMachineAlgorithm_DTC* dtc ) { return *(_snareVoice*)dtc->shadowVoiceStorage; }
+static inline _hatVoice& ShadowHat( _drumMachineAlgorithm_DTC* dtc ) { return *(_hatVoice*)dtc->shadowVoiceStorage; }
+#endif
 
 // Per-slot SD-card sample state - lives in SRAM (alongside the algorithm
 // struct itself). Playback uses the disting NT streaming API
@@ -2482,6 +2678,53 @@ struct _drumMachineAlgorithm : public _NT_algorithm
 	// (kSlotBD..kSlotOH) currently armed/capturing.
 	int freezeSeqSlot;
 
+	// Preset Prerender - see ProcessRenderVoice()'s comment. The "next
+	// preset" frozen-buffer pointers (DRAM, set once in construct() - see
+	// its matching comment) - kept here, not just as construct()-local
+	// variables, so ProcessRenderVoice() can reassign shadowHat's inherited
+	// frozenBuf between nextClosedHatFreezeBuf/nextOpenHatFreezeBuf as it
+	// moves from capturing CH to capturing OH.
+	float* nextKickFreezeBuf;
+	float* nextSnareFreezeBuf;
+	float* nextClosedHatFreezeBuf;
+	float* nextOpenHatFreezeBuf;
+	// Single shared CombBody delay line for whichever of shadow kick/snare
+	// is currently capturing (see ShadowKick()/ShadowSnare()'s comment -
+	// BD and SD are never captured concurrently, so one buffer covers both,
+	// re-zeroed by Init() every time the sequencer switches between them).
+	float* shadowCombBodyDelay;
+	// -1 = no cue in progress; otherwise the preset slot currently being
+	// silently prerendered in the background (see CuePreset()).
+	int cuedPresetSlot;
+	// Which real slot (kSlotBD..kSlotOH) the render-voice is currently
+	// capturing for cuedPresetSlot, or -1 between cues/when Prerender is
+	// off. Mirrors freezeSeqSlot's role but for the shadow voices.
+	int renderVoiceSlot;
+	// BD/SD/CH's capture results, stashed here the instant the sequencer
+	// moves past that slot - all 3 shadow voice archetypes share one piece
+	// of DTC storage (see ShadowKick()/ShadowSnare()/ShadowHat()'s comment,
+	// a deliberate size cut after the original 3-separate-instance design
+	// turned out to grow DTC just enough to make the whole module fail to
+	// restore an algorithm at boot - DTC has a much tighter ceiling than
+	// DRAM on this hardware), so the very next slot's Init() call
+	// overwrites whatever the previous slot left behind. The audio itself
+	// never needs stashing (already safely sitting in its own dedicated
+	// next*FreezeBuf, untouched by any other slot's capture) - just this
+	// metadata. OH needs no stash field: it's always the last slot
+	// rendered, so FinishCue() can read it directly out of shared storage
+	// before anything else reuses it - ohSkipped instead records whether
+	// OH's capture ran at all (skipped for a sample layer - see
+	// ProcessRenderVoice()), since shared storage can't distinguish
+	// "OH captured nothing" from "OH never ran, this is stale leftover
+	// state from whichever slot ran before it".
+	int bdFrozenNumFrames;
+	int bdFrozenParamHash;
+	int sdFrozenNumFrames;
+	int sdFrozenParamHash;
+	int chFrozenNumFrames;
+	int chFrozenParamHash;
+	bool ohSkipped;
+
 	// Delete-modifier confirm dialog - opened by clicking the pot/encoder
 	// for a given slot while in quick-edit depth mode on a bar page (see
 	// customUi()), same "defaults to the safe choice" pattern as the preset
@@ -2518,6 +2761,12 @@ struct _drumMachineAlgorithm : public _NT_algorithm
 	// DrawBarPage()) without reaching into DTC.
 	float currentEnv1Level[kNumSlots];
 	float currentEnv2Level[kNumSlots];
+
+	// Rumble's own envelope level (0..1), updated once per block from
+	// ProcessRumble() - lets DrawRumbleEnvPage() show a live graph without
+	// reaching into DTC, same convention as currentEnv1Level/currentEnv2Level
+	// above.
+	float rumbleEnvLevel;
 
 	// MIDI clock (24 PPQN) tracking, driving the synced LFOs - see
 	// midiRealtime()/AdvanceLfos(). sampleCounter is a free-running count
@@ -2582,6 +2831,29 @@ struct _drumMachineAlgorithm : public _NT_algorithm
 	// touching the sample-streaming API at all until things have settled.
 	int sampleSystemGraceSamples;
 
+	// True only while LoadPreset() is running with fromAudioContext=true
+	// (FinishCue()'s call, from inside step()'s call graph - see Preset
+	// Prerender's comment) - StartSampleLoad() calls NT_getSampleFileInfo(),
+	// a synchronous SD-card read with no documented real-time-safety
+	// guarantee (unlike NT_setParameterFromAudio's explicit "may be called
+	// from step()"), and this project has already hit a real freeze once
+	// from SD-card activity colliding with active playback (see
+	// sampleSystemGraceSamples's comment) - so any sample-selection change
+	// a Prerendered switch would otherwise trigger is deferred instead of
+	// risking that same collision from a new call site. Checked by
+	// parameterChanged()'s kParamSampleXX handlers and LoadPreset()'s own
+	// explicit StartSampleLoad() calls alike, since kParamSampleXX is a
+	// kModParams entry (see kModParams[]) and so gets set - and would
+	// otherwise trigger parameterChanged() - during every LoadPreset() call,
+	// not just via its own explicit calls. A slot whose sample selection
+	// actually changes as part of a Prerendered switch simply keeps
+	// whatever was previously loaded until the user next touches that
+	// slot's Sample parameter directly (a UI-context edit, always safe) -
+	// an accepted limitation, consistent with Prerender already not fully
+	// supporting the sample layer (see kSampleMixParamForSlot's use in
+	// ProcessRenderVoice()).
+	bool deferSampleLoad;
+
 	// This algorithm instance's own CPU cost, as a smoothed percentage of
 	// its real-time budget - see MeasureCpuPercent()'s comment for how it's
 	// derived and its caveats. Purely a self-diagnostic display value (see
@@ -2642,6 +2914,30 @@ static int AnalysisMaxFrames()
 static int FreezeMaxFrames()
 {
 	return (int)( 1.0f * NT_globals.sampleRate );
+}
+
+// Preset Prerender's "next preset" shadow buffers (see ProcessRenderVoice()'s
+// comment) are a second, parallel set of capture buffers alongside the live
+// Freeze buffers. DRAM headroom for these was thoroughly stress-tested
+// earlier in this feature's development (0-byte, 0.1s, 0.4s, and full
+// FreezeMaxFrames()-parity were all tried while chasing a since-resolved,
+// unrelated DTC sizing bug - see _drumMachineAlgorithm_DTC/
+// shadowVoiceStorage's comment) and DRAM was never the actual constraint at
+// any of those sizes. 0.4s covers the attack/onset that drives the CPU
+// spike this feature exists to avoid, at well under half of FreezeMaxFrames()'s
+// DRAM cost. This must stay > 0 - RenderShadowKick/Snare/Hat's accumulation
+// logic (spaceLeft = PrerenderMaxFrames() - frozenNumFrames) can only ever
+// mark a capture "done" once it has actually copied *something*, so a value
+// of 0 leaves a cued capture running its full DSP model every block
+// forever, never completing (a real, previously-hit bug - see git history/
+// session notes). Only affects the *prerendered* one-shot capture right at
+// the switch-over moment - Auto Freeze re-captures each voice again at the
+// full 1.0s cap immediately afterward via the existing, unchanged live
+// Freeze mechanism, so this is a one-time trade-off (a shorter prerendered
+// snippet before the tail silences early), not a lasting quality loss.
+static int PrerenderMaxFrames()
+{
+	return (int)( 0.4f * NT_globals.sampleRate );
 }
 
 // (Re)starts the sample-system "settle" window - see
@@ -2875,7 +3171,19 @@ void	calculateRequirements( _NT_algorithmRequirements& req, const int32_t* speci
 		+ AnalysisMaxFrames() * sizeof(float)
 		+ kNumSlots * NT_globals.streamBufferSizeBytes
 		+ 2 * CombBodyVoice::kMaxDelaySamples * sizeof(float)
-		+ kNumSlots * FreezeMaxFrames() * sizeof(float);
+		+ kNumSlots * FreezeMaxFrames() * sizeof(float)
+		+ _rumbleVoice::kCombMaxDelaySamples * sizeof(float)
+		// Preset Prerender - see ProcessRenderVoice()'s comment. A second,
+		// parallel set of buffers (one per slot, capped at
+		// PrerenderMaxFrames() - see its comment for why this is much
+		// shorter than FreezeMaxFrames(), confirmed necessary on hardware)
+		// for whichever preset is being silently prerendered next, plus one
+		// shared CombBody delay line for the shadow kick/snare (only one,
+		// not two - see ShadowKick()/ShadowSnare()'s comment: BD and SD are
+		// never captured concurrently, so they share it, same as the 3
+		// shadow voice archetypes themselves sharing shadowVoiceStorage).
+		+ kNumSlots * PrerenderMaxFrames() * sizeof(float)
+		+ CombBodyVoice::kMaxDelaySamples * sizeof(float);
 	req.itc = 0;
 }
 
@@ -2921,6 +3229,20 @@ _NT_algorithm*	construct( const _NT_algorithmMemoryPtrs& ptrs, const _NT_algorit
 	float* closedHatFreezeBuf = dram; dram += freezeMaxFrames;
 	float* openHatFreezeBuf = dram; dram += freezeMaxFrames;
 
+	float* rumbleCombDelay = dram; dram += _rumbleVoice::kCombMaxDelaySamples;
+
+	// Preset Prerender - see ProcessRenderVoice()'s comment. Second, parallel
+	// set of buffers (the "next preset" being silently prerendered), capped
+	// at PrerenderMaxFrames() rather than freezeMaxFrames - see its comment
+	// for why, plus one shared CombBody delay line for the shadow kick/snare
+	// (see ShadowKick()/ShadowSnare()'s comment for why only one is needed).
+	int prerenderMaxFrames = PrerenderMaxFrames();
+	float* nextKickFreezeBuf = dram; dram += prerenderMaxFrames;
+	float* nextSnareFreezeBuf = dram; dram += prerenderMaxFrames;
+	float* nextClosedHatFreezeBuf = dram; dram += prerenderMaxFrames;
+	float* nextOpenHatFreezeBuf = dram; dram += prerenderMaxFrames;
+	float* shadowCombBodyDelay = dram; dram += CombBodyVoice::kMaxDelaySamples;
+
 	alg->analysisMaxFrames = AnalysisMaxFrames();
 	alg->analysisBuffer = dram; dram += alg->analysisMaxFrames;
 
@@ -2952,11 +3274,41 @@ _NT_algorithm*	construct( const _NT_algorithmMemoryPtrs& ptrs, const _NT_algorit
 		alg->analysisPending[i] = false;
 	alg->sdCardWasMounted = false;
 	alg->sampleSystemGraceSamples = 0;
+	alg->deferSampleLoad = false;
 
 	alg->dtc->kick.Init( kickCombBodyDelay, kickFreezeBuf );
 	alg->dtc->snare.Init( snareCombBodyDelay, snareFreezeBuf );
 	alg->dtc->closedHat.Init( closedHatFreezeBuf );
 	alg->dtc->openHat.Init( openHatFreezeBuf );
+	alg->dtc->rumble.Init( rumbleCombDelay );
+
+	// Preset Prerender shadow voices - see ProcessRenderVoice()'s comment.
+	// No Init() call here for the shadow voices themselves (unlike the real
+	// voices above) - shadowVoiceStorage is shared across all 3 archetypes,
+	// so each one gets Init()'d fresh at the moment its own capture starts
+	// (RenderShadowKick/Snare/Hat's selfTrig branch) rather than once here.
+	alg->nextKickFreezeBuf = nextKickFreezeBuf;
+	alg->nextSnareFreezeBuf = nextSnareFreezeBuf;
+	alg->nextClosedHatFreezeBuf = nextClosedHatFreezeBuf;
+	alg->nextOpenHatFreezeBuf = nextOpenHatFreezeBuf;
+#if PRERENDER_SHADOW_ENABLED
+	alg->shadowCombBodyDelay = shadowCombBodyDelay;
+	// One-time zero rather than a typed Init() (which type would even be
+	// "right" for shared, not-yet-claimed storage?) - only really needs
+	// freezeCapturing/frozenNumFrames at false/0 so the very first-ever
+	// capture (before any real Init() call - see RenderShadowKick/Snare/
+	// Hat's selfTrig branch) reads a known state instead of raw DTC memory.
+	memset( alg->dtc->shadowVoiceStorage, 0, sizeof(alg->dtc->shadowVoiceStorage) );
+#endif
+	alg->cuedPresetSlot = -1;
+	alg->renderVoiceSlot = -1;
+	alg->bdFrozenNumFrames = 0;
+	alg->bdFrozenParamHash = 0;
+	alg->sdFrozenNumFrames = 0;
+	alg->sdFrozenParamHash = 0;
+	alg->chFrozenNumFrames = 0;
+	alg->chFrozenParamHash = 0;
+	alg->ohSkipped = false;
 
 	alg->currentPage = kFirstCustomPage;
 	alg->setupSelectedItem = 0;
@@ -3701,10 +4053,52 @@ int	parameterString( _NT_algorithm* self, int p, int v, char* buff )
 void	parameterChanged( _NT_algorithm* self, int p )
 {
 	_drumMachineAlgorithm* pThis = (_drumMachineAlgorithm*)self;
-	if ( p == kParamSampleBD ) StartSampleLoad( pThis, kSlotBD );
-	else if ( p == kParamSampleSD ) StartSampleLoad( pThis, kSlotSD );
-	else if ( p == kParamSampleCH ) StartSampleLoad( pThis, kSlotCH );
-	else if ( p == kParamSampleOH ) StartSampleLoad( pThis, kSlotOH );
+	// !deferSampleLoad - see its own comment: skip the SD-card metadata read
+	// while LoadPreset() is running from inside step()'s call graph
+	// (FinishCue()'s audio-context call) - kParamSampleXX is a kModParams
+	// entry, so LoadPreset() setting it for every slot would otherwise
+	// trigger this same read regardless of what LoadPreset() itself does.
+	if ( !pThis->deferSampleLoad && p == kParamSampleBD ) StartSampleLoad( pThis, kSlotBD );
+	else if ( !pThis->deferSampleLoad && p == kParamSampleSD ) StartSampleLoad( pThis, kSlotSD );
+	else if ( !pThis->deferSampleLoad && p == kParamSampleCH ) StartSampleLoad( pThis, kSlotCH );
+	else if ( !pThis->deferSampleLoad && p == kParamSampleOH ) StartSampleLoad( pThis, kSlotOH );
+	else if ( p == kParamAutoFreezeMode )
+	{
+		// Whatever was in-flight belonged to the *previous* mode's scope -
+		// without this, switching modes mid-sequence leaves stale state
+		// stuck forever (e.g. arm under "All", switch to "SD/CH/OH" before
+		// BD's capture finishes: BD sits at freezeArmed=true indefinitely,
+		// and since AdvanceAutoFreeze() only proceeds when
+		// freezeSeqSlot==-1, that one stuck slot blocks the whole freeze
+		// system from progressing under the new mode at all).
+		pThis->freezeSeqSlot = -1;
+		int mode = pThis->v[ kParamAutoFreezeMode ];
+		if ( mode != kAutoFreezeNone )
+		{
+			int startSlot = ( mode == kAutoFreezeAll ) ? kSlotBD : kSlotSD;
+			_drumVoicePost* voices[kNumSlots] = { &pThis->dtc->kick, &pThis->dtc->snare, &pThis->dtc->closedHat, &pThis->dtc->openHat };
+			for ( int s=kSlotBD; s<startSlot; ++s )
+			{
+				// Outside the new mode's scope (BD, when switching to
+				// SD/CH/OH) - must return to live *immediately*, not just
+				// stop being newly frozen going forward.
+				_drumVoicePost& v = *voices[s];
+				v.freezeArmed = false;
+				v.freezeCapturing = false;
+				v.frozen = false;
+			}
+			for ( int s=startSlot; s<=kSlotOH; ++s )
+			{
+				// In scope - clear any stale in-progress marker so a clean,
+				// correctly-scoped sequence can start next block. Leave
+				// `frozen` alone - already-valid captured audio doesn't
+				// need to be discarded just because the mode changed.
+				_drumVoicePost& v = *voices[s];
+				v.freezeArmed = false;
+				v.freezeCapturing = false;
+			}
+		}
+	}
 	else if ( p == kParamMidiMode )
 	{
 		bool notePerSlot = ( pThis->v[kParamMidiMode] == 0 );
@@ -4693,6 +5087,287 @@ static void WriteVoiceOutput( float* busFrames, int numFrames, const float* scra
 }
 
 // ---------------------------------------------------------------------
+// Rumble Generator - a single mono/stereo sub-bass "techno rumble" layer,
+// reactive to BD rather than driven by its own MIDI note (see
+// kParamRumbleType's comment) - see ProcessRumble() below.
+// ---------------------------------------------------------------------
+
+// Harmonic mode's curated ratio table (sub down to /4, up to the 3rd
+// harmonic) - PitchValue (0-100) selects an index into this rather than a
+// continuous ratio, since a rumble is a texture, not a lead line; a small
+// curated set is both cheaper to select (no interpolation) and more
+// reliably "musical" against BD than an arbitrary continuous ratio.
+static const float kRumbleHarmonicRatio[] = { 0.25f, 0.3333f, 0.5f, 1.0f, 2.0f, 3.0f };
+constexpr int kNumRumbleHarmonics = (int)ARRAY_SIZE(kRumbleHarmonicRatio);
+
+// Every Pitch Type mode funnels through this one shared clamp at the end,
+// so no combination of BD pitch + offset/ratio/note can ever push Rumble
+// out of sub-bass "rumble territory", regardless of what the mode or the
+// live BD pitch happens to be.
+constexpr float kRumbleMinHz = 20.0f;
+constexpr float kRumbleMaxHz = 100.0f;
+
+static float RumblePitchFrequency( _drumMachineAlgorithm* pThis, int pitchType, int pitchValue )
+{
+	int bdNote = pThis->v[ kParamPitchBD ];
+	CONSTRAIN( bdNote, 0, 127 );
+	float freq;
+
+	if ( pitchType == kRumblePitchFixed )
+	{
+		// The knob's own mapping range *is* the rumble territory here - no
+		// BD dependency at all (though the shared clamp below still applies
+		// as a final safety net regardless).
+		int note = 20 + ( pitchValue * 25 ) / 100;	// 0-100 -> MIDI ~20-45
+		CONSTRAIN( note, 0, 127 );
+		freq = kMidiNoteFreq[note];
+	}
+	else if ( pitchType == kRumblePitchHarmonic )
+	{
+		int idx = ( pitchValue * kNumRumbleHarmonics ) / 101;	// 0-100 -> 0..N-1
+		CONSTRAIN( idx, 0, kNumRumbleHarmonics - 1 );
+		freq = kMidiNoteFreq[bdNote] * kRumbleHarmonicRatio[idx];
+	}
+	else	// kRumblePitchTrackBD
+	{
+		int semitoneOffset = ( pitchValue - 50 ) * 24 / 100;	// 0-100 -> -12..+12
+		int note = bdNote + semitoneOffset;
+		CONSTRAIN( note, 0, 127 );
+		freq = kMidiNoteFreq[note];
+	}
+
+	CONSTRAIN( freq, kRumbleMinHz, kRumbleMaxHz );
+	return freq;
+}
+
+// Renders the Rumble layer for this block and writes it straight to its own
+// output bus - called once per block from step() (not per-slot; Rumble has
+// no BD/SD/CH/OH dimension), right after ProcessKick() so BD's fresh
+// per-block envelope level is available for Sidechain mode. `bdTrig` is
+// captured by step() *before* calling ProcessKick() (which consumes/clears
+// the real flag) - Rumble has no MIDI note of its own, it only ever reacts
+// to BD's own trigger. Skips all work entirely (not just silence) when Type
+// is None, same "0 = off" convention as Sample/Noise elsewhere in this file.
+static void ProcessRumble( _drumMachineAlgorithm* pThis, float* busFrames, int numFrames, bool bdTrig )
+{
+	int type = pThis->v[ kParamRumbleType ];
+	int outBus = pThis->v[ kParamRumbleOut ];
+	bool replace = pThis->v[ kParamRumbleOutMode ];
+	bool stereo = pThis->v[ kParamRumbleStereo ] != 0;
+	int panParam = 0;	// no Rumble Pan param - see its comment; sub-bass is kept center/mono
+
+	if ( type == kRumbleNone )
+	{
+		WriteVoiceOutput( busFrames, numFrames, NULL, outBus, replace, stereo, panParam );
+		return;
+	}
+
+	_rumbleVoice& v = pThis->dtc->rumble;
+	float blockSeconds = numFrames / plaits::kSampleRate;
+
+	// --- envelope / level ---
+	int envType = pThis->v[ kParamRumbleEnvType ];
+	int envTimeParam = pThis->v[ kParamRumbleEnvTime ];
+	float envLevel;
+	if ( envType == kRumbleEnvSidechain )
+	{
+		// Classic ducking sidechain - reuses BD's own already-computed
+		// per-block envelope level directly (no separate follower state at
+		// all). envTimeParam here is duck *depth* (0 = no duck, 100 = fully
+		// silent right on the kick) rather than a time, since a live
+		// envelope-follower has no fixed attack/decay of its own to shape.
+		float duckAmount = envTimeParam * 0.01f;
+		envLevel = 1.0f - pThis->currentEnv1Level[kSlotBD] * duckAmount;
+		CONSTRAIN( envLevel, 0.0f, 1.0f );
+	}
+	else
+	{
+		if ( bdTrig )
+		{
+			v.env.active = true;
+			v.env.elapsed = 0.0f;
+		}
+		if ( v.env.active )
+		{
+			v.env.elapsed += blockSeconds;
+			bool finished;
+			envLevel = LevelAD( v.env.elapsed, envTimeParam, &finished );
+			if ( finished )
+				v.env.active = false;
+		}
+		else
+		{
+			envLevel = 0.0f;
+		}
+
+		if ( envLevel <= 0.0f )
+		{
+			pThis->rumbleEnvLevel = 0.0f;
+			// Fixed mode, fully released - nothing to render, same idle-skip
+			// convention used everywhere else in this file rather than
+			// running the oscillator/filter for a silent result.
+			WriteVoiceOutput( busFrames, numFrames, NULL, outBus, replace, stereo, panParam );
+			return;
+		}
+	}
+	pThis->rumbleEnvLevel = envLevel;
+
+	int pitchType = pThis->v[ kParamRumblePitchType ];
+	int pitchValue = pThis->v[ kParamRumblePitchValue ];
+	float freqHz = RumblePitchFrequency( pThis, pitchType, pitchValue );
+	float f0 = freqHz / plaits::kSampleRate;
+	float intensity = pThis->v[ kParamRumbleIntensity ] * 0.01f;
+
+	float* scratch = pThis->renderScratch;	// free again by this point - see ProcessKick()'s own use of it
+
+	if ( type == kRumbleSubSine )
+	{
+		for ( int i=0; i<numFrames; ++i )
+		{
+			v.phase1 += f0;
+			if ( v.phase1 >= 1.0f ) v.phase1 -= 1.0f;
+			scratch[i] = plaits::Sine( v.phase1 );
+		}
+		float cutoffNorm = f0 * 2.0f;
+		CONSTRAIN( cutoffNorm, 0.001f, 0.49f );
+		v.lp.set_f_q<stmlib::FREQUENCY_FAST>( cutoffNorm, 1.0f + intensity * 2.0f );
+		v.lp.Process<stmlib::FILTER_MODE_LOW_PASS>( scratch, scratch, numFrames );
+		for ( int i=0; i<numFrames; ++i )
+		{
+			float wet = GentleClip( scratch[i] * 1.5f );
+			scratch[i] += intensity * ( wet - scratch[i] );
+		}
+	}
+	else if ( type == kRumbleSineFoldGrit )
+	{
+		for ( int i=0; i<numFrames; ++i )
+		{
+			v.phase1 += f0;
+			if ( v.phase1 >= 1.0f ) v.phase1 -= 1.0f;
+			scratch[i] = plaits::Sine( v.phase1 );
+		}
+		ApplyWavefolder( scratch, numFrames, intensity, kWavefolderTypeSine );
+		float cutoffNorm = f0 * 3.0f;
+		CONSTRAIN( cutoffNorm, 0.001f, 0.49f );
+		v.lp.set_f_q<stmlib::FREQUENCY_FAST>( cutoffNorm, 0.8f );
+		v.lp.Process<stmlib::FILTER_MODE_LOW_PASS>( scratch, scratch, numFrames );
+	}
+	else if ( type == kRumbleDetunedDualSine )
+	{
+		float detune = 0.002f + intensity * 0.02f;
+		for ( int i=0; i<numFrames; ++i )
+		{
+			v.phase1 += f0;
+			if ( v.phase1 >= 1.0f ) v.phase1 -= 1.0f;
+			v.phase2 += f0 * ( 1.0f + detune );
+			if ( v.phase2 >= 1.0f ) v.phase2 -= 1.0f;
+			scratch[i] = 0.5f * ( plaits::Sine( v.phase1 ) + plaits::Sine( v.phase2 ) );
+		}
+		float cutoffNorm = f0 * 2.0f;
+		CONSTRAIN( cutoffNorm, 0.001f, 0.49f );
+		v.lp.set_f_q<stmlib::FREQUENCY_FAST>( cutoffNorm, 1.2f );
+		v.lp.Process<stmlib::FILTER_MODE_LOW_PASS>( scratch, scratch, numFrames );
+	}
+	else if ( type == kRumbleFilteredNoise )
+	{
+		for ( int i=0; i<numFrames; ++i )
+			scratch[i] = stmlib::Random::GetFloat() * 2.0f - 1.0f;
+		float cutoffNorm = f0 * 1.5f;
+		CONSTRAIN( cutoffNorm, 0.001f, 0.49f );
+		float q = 0.6f + intensity * 3.0f;
+		v.lp.set_f_q<stmlib::FREQUENCY_FAST>( cutoffNorm, q );
+		v.lp.Process<stmlib::FILTER_MODE_LOW_PASS>( scratch, scratch, numFrames );
+	}
+	else if ( type == kRumbleFmGrowl )
+	{
+		constexpr float kModRatio = 0.5f;
+		float fmIndex = intensity * 3.0f;
+		for ( int i=0; i<numFrames; ++i )
+		{
+			v.phase2 += f0 * kModRatio;
+			if ( v.phase2 >= 1.0f ) v.phase2 -= 1.0f;
+			float mod = plaits::Sine( v.phase2 ) * fmIndex;
+			v.phase1 += f0 * ( 1.0f + mod * 0.1f );
+			while ( v.phase1 >= 1.0f ) v.phase1 -= 1.0f;
+			while ( v.phase1 < 0.0f ) v.phase1 += 1.0f;
+			scratch[i] = plaits::Sine( v.phase1 );
+		}
+		float cutoffNorm = f0 * 4.0f;
+		CONSTRAIN( cutoffNorm, 0.001f, 0.49f );
+		v.lp.set_f_q<stmlib::FREQUENCY_FAST>( cutoffNorm, 0.7f );
+		v.lp.Process<stmlib::FILTER_MODE_LOW_PASS>( scratch, scratch, numFrames );
+	}
+	else if ( type == kRumbleRingModMetallic )
+	{
+		constexpr float kRatio = 1.41f;
+		float depth = intensity;
+		for ( int i=0; i<numFrames; ++i )
+		{
+			v.phase1 += f0;
+			if ( v.phase1 >= 1.0f ) v.phase1 -= 1.0f;
+			v.phase2 += f0 * kRatio;
+			if ( v.phase2 >= 1.0f ) v.phase2 -= 1.0f;
+			float dry = plaits::Sine( v.phase1 );
+			float ring = dry * plaits::Sine( v.phase2 );
+			scratch[i] = dry + depth * ( ring - dry );
+		}
+		float cutoffNorm = f0 * 3.0f;
+		CONSTRAIN( cutoffNorm, 0.001f, 0.49f );
+		v.lp.set_f_q<stmlib::FREQUENCY_FAST>( cutoffNorm, 0.8f );
+		v.lp.Process<stmlib::FILTER_MODE_LOW_PASS>( scratch, scratch, numFrames );
+	}
+	else if ( type == kRumbleResonantComb )
+	{
+		if ( bdTrig )
+			v.combExciteEnv = 1.0f;
+		int delaySamples = (int)( 1.0f / f0 );
+		CONSTRAIN( delaySamples, 4, _rumbleVoice::kCombMaxDelaySamples - 1 );
+		float feedback = 0.9f + intensity * 0.095f;	// stays safely below 1.0 - decays, never runs away
+		float exciteDecayCoeff = 1.0f - 1.0f / ( 0.01f * plaits::kSampleRate );
+		for ( int i=0; i<numFrames; ++i )
+		{
+			float excite = ( stmlib::Random::GetFloat() * 2.0f - 1.0f ) * v.combExciteEnv;
+			v.combExciteEnv *= exciteDecayCoeff;
+
+			int readPos = v.combWritePos - delaySamples;
+			if ( readPos < 0 ) readPos += _rumbleVoice::kCombMaxDelaySamples;
+			float delayed = v.combDelayLine[readPos];
+
+			v.combDampState += ( delayed - v.combDampState ) * 0.3f;
+			float newSample = excite + v.combDampState * feedback;
+			CONSTRAIN( newSample, -4.0f, 4.0f );
+
+			v.combDelayLine[v.combWritePos] = newSample;
+			v.combWritePos = v.combWritePos + 1;
+			if ( v.combWritePos >= _rumbleVoice::kCombMaxDelaySamples ) v.combWritePos = 0;
+
+			scratch[i] = newSample;
+		}
+	}
+	else	// kRumbleDistortedBoom
+	{
+		for ( int i=0; i<numFrames; ++i )
+		{
+			v.phase1 += f0;
+			if ( v.phase1 >= 1.0f ) v.phase1 -= 1.0f;
+			scratch[i] = plaits::Sine( v.phase1 );
+		}
+		float cutoffNorm = f0 * 2.5f;
+		CONSTRAIN( cutoffNorm, 0.001f, 0.49f );
+		v.lp.set_f_q<stmlib::FREQUENCY_FAST>( cutoffNorm, 2.0f + intensity * 3.0f );
+		v.lp.Process<stmlib::FILTER_MODE_LOW_PASS>( scratch, scratch, numFrames );
+		float preGain = 1.0f + intensity * 6.0f;
+		for ( int i=0; i<numFrames; ++i )
+			scratch[i] = HardClip( scratch[i] * preGain );
+	}
+
+	for ( int i=0; i<numFrames; ++i )
+		scratch[i] *= envLevel * intensity;
+
+	WriteVoiceOutput( busFrames, numFrames, scratch, outBus, replace, stereo, panParam );
+}
+
+// ---------------------------------------------------------------------
 // Sample layer - mixes a loaded WAV into a voice's rendered signal, before
 // ApplyPost() (per the explicit "mix should happen early on... so that the
 // postfx still applies to the mix as well" spec). See kParamSampleBD,
@@ -4968,6 +5643,80 @@ static void MixNoiseLayer( _drumVoicePost& v, int mixAmount, int type, float dec
 	v.noiseEnvElapsed += blockSeconds;
 }
 
+// Model dispatch shared by ProcessKick() (live) and RenderShadowKick() (the
+// silent Preset Prerender capture voice - see its comment) - given already-
+// resolved scalar parameters (live: resolved via ModulatedViaMatrix()/
+// Smoothed(); shadow: raw un-modulated base values straight from
+// presetBank/modBank, since prerendering deliberately doesn't replicate live
+// Mod Matrix modulation - see RenderShadowKick()'s comment), dispatches to
+// the selected model and writes into `scratch`. Never reads pThis->v[] or
+// any other live state directly, so this one code path is exactly correct
+// for both callers - a mechanical, behavior-preserving extraction of what
+// was previously inlined directly in ProcessKick().
+static void RenderKickModel( _kickVoice& v, int model, bool trig, float accent, float f0, int pitchIdx, float decay, float tone, float character, float fm, float fmKnock, int fmMode, float bdDecayCap, float blockSeconds, float* elementsExciteScratch, float* scratch, int numFrames )
+{
+	if ( model == 0 )
+	{
+		v.analog.Render( trig, accent, f0, tone, decay, fmKnock, character, fmMode, scratch, numFrames );
+	}
+	else if ( model == 1 )
+	{
+		v.synthetic.Render( false, trig, accent, f0, tone, decay, character, fmKnock, 0.5f, fmMode, scratch, numFrames );
+	}
+	else if ( model == 2 )
+	{
+		float fmPush = ComputeExternalFmPush( v, trig, accent, fmMode, blockSeconds );
+		float modulatedF0 = f0 * ( 1.0f + fmPush * fm * 1.5f );
+		CONSTRAIN( modulatedF0, 0.001f, 0.49f );
+		RenderElements( v.elementsExciter, v.elementsResonator, elementsExciteScratch, trig, accent, modulatedF0, tone, decay * bdDecayCap, character, scratch, numFrames );
+		UpdateFmFeedback( v, scratch, numFrames );
+	}
+	else if ( model == 3 )
+	{
+		v.peaksBass.set_frequency( pitchIdx << 7 );
+		v.peaksBass.set_decay( (uint16_t)( decay * 65535.0f ) );
+		v.peaksBass.set_tone( (uint16_t)( tone * 65535.0f ) );
+		v.peaksBass.set_punch( (uint16_t)( character * 65535.0f ) );
+		v.peaksBass.set_attack_fm_amount( (uint16_t)( fmKnock * 65535.0f ) );
+		v.peaksBass.set_fm_mode( fmMode );
+		v.peaksBass.Process( trig, accent, scratch, numFrames );
+		for ( int i=0; i<numFrames; ++i ) scratch[i] *= accent;
+	}
+	else if ( model == 4 )
+	{
+		v.peaksFm.set_frequency( pitchIdx << 7 );
+		v.peaksFm.set_decay( (uint16_t)( decay * 65535.0f ) );
+		v.peaksFm.set_fm_amount( (uint16_t)( fm * 65535.0f ) );
+		v.peaksFm.set_noise( (uint16_t)( character * 65535.0f ) );
+		v.peaksFm.Process( trig, kMidiNoteFreq, plaits::kSampleRate, scratch, numFrames );
+		for ( int i=0; i<numFrames; ++i ) scratch[i] *= accent;
+	}
+	else if ( model == 5 )
+	{
+		v.chowKick.Render( trig, f0, decay, character, tone, scratch, numFrames );
+		for ( int i=0; i<numFrames; ++i ) scratch[i] *= accent;
+	}
+	else if ( model == 6 )
+	{
+		v.decel808.Render( trig, f0, decay, character, tone, fmKnock, scratch, numFrames );
+		for ( int i=0; i<numFrames; ++i ) scratch[i] *= accent;
+	}
+	else if ( model == 7 )
+	{
+		float fmPush = ComputeExternalFmPush( v, trig, accent, fmMode, blockSeconds );
+		float modulatedF0 = f0 * ( 1.0f + fmPush * fm * 1.5f );
+		CONSTRAIN( modulatedF0, 0.001f, 0.49f );
+		v.combBody.Render( trig, modulatedF0, decay * bdDecayCap, character, tone, scratch, numFrames );
+		for ( int i=0; i<numFrames; ++i ) scratch[i] *= accent;
+		UpdateFmFeedback( v, scratch, numFrames );
+	}
+	else
+	{
+		v.chaosFm.Render( trig, f0, decay, character, tone, fmKnock, scratch, numFrames );
+		for ( int i=0; i<numFrames; ++i ) scratch[i] *= accent;
+	}
+}
+
 static void ProcessKick( _drumMachineAlgorithm* pThis, float* busFrames, int numFrames )
 {
 	_kickVoice& v = pThis->dtc->kick;
@@ -5080,113 +5829,7 @@ static void ProcessKick( _drumMachineAlgorithm* pThis, float* busFrames, int num
 	// comment for why arming doesn't render synchronously itself.
 	if ( !v.frozen || v.freezeArmed )
 	{
-	if ( pThis->v[kParamModelBD] == 0 )
-	{
-		// attack_fm_amount is Plaits' own name for exactly the "knock" the
-		// user wants FM to control (a brief pitch-up burst right at the
-		// attack, the classic 808/909 kick trick) - now driven by FM
-		// directly instead of splitting Character's range across it and
-		// self_fm_amount (a separate, ongoing self-FM "growl" during the
-		// body, which Character now controls over its full range instead).
-		v.analog.Render( trig, accent, f0, tone, decay, fmKnock, character, fmMode, scratch, numFrames );
-	}
-	else if ( pThis->v[kParamModelBD] == 1 )
-	{
-		// fm_envelope_amount here is the same attack-knock idea (fm_ starts
-		// at 1.0 on trigger and decays, modulating pitch) - already wired to
-		// FM directly, so Synthetic gets the same knock with no change.
-		v.synthetic.Render( false, trig, accent, f0, tone, decay, character, fmKnock, 0.5f, fmMode, scratch, numFrames );
-	}
-	else if ( pThis->v[kParamModelBD] == 2 )
-	{
-		// See ComputeExternalFmPush()'s comment - Elements has no internal
-		// per-sample FM hook, so FM pushes its resonator frequency externally,
-		// once per block, instead.
-		float fmPush = ComputeExternalFmPush( v, trig, accent, fmMode, blockSeconds );
-		float modulatedF0 = f0 * ( 1.0f + fmPush * fm * 1.5f );
-		CONSTRAIN( modulatedF0, 0.001f, 0.49f );
-		// bdDecayCap - see BdSdModelDecayCap()'s comment: Elements runs a
-		// whole resonator bank every sample, so its own decay (not the
-		// shared `decay` used by the sample/noise layers below) is capped
-		// to bound how long that bank stays active.
-		RenderElements( v.elementsExciter, v.elementsResonator, pThis->elementsExciteScratch, trig, accent, modulatedF0, tone, decay * bdDecayCap, character, scratch, numFrames );
-		UpdateFmFeedback( v, scratch, numFrames );
-	}
-	else if ( pThis->v[kParamModelBD] == 3 )
-	{
-		// 808-style bass drum (Peaks BassDrum / Braids Kick - the same
-		// algorithm, see third_party/mi_peaks/ATTRIBUTION.md) - Character
-		// drives punch (dynamic Q push on the resonant body); FM drives the
-		// attack pitch-knock (originally a fixed, un-knobbed 17-semitone
-		// push - see bass_drum.h), same knock the Analog/Synthetic models'
-		// own FM input already gives.
-		v.peaksBass.set_frequency( pitchIdx << 7 );
-		v.peaksBass.set_decay( (uint16_t)( decay * 65535.0f ) );
-		v.peaksBass.set_tone( (uint16_t)( tone * 65535.0f ) );
-		v.peaksBass.set_punch( (uint16_t)( character * 65535.0f ) );
-		v.peaksBass.set_attack_fm_amount( (uint16_t)( fmKnock * 65535.0f ) );
-		v.peaksBass.set_fm_mode( fmMode );
-		v.peaksBass.Process( trig, accent, scratch, numFrames );
-		for ( int i=0; i<numFrames; ++i ) scratch[i] *= accent;
-	}
-	else if ( pThis->v[kParamModelBD] == 4 )
-	{
-		// Sine-FM drum (Peaks FmDrum, "similar to the BD/SD in Anushri") -
-		// FM knob finally drives a literal FM-amount parameter; Character
-		// drives the noise/overdrive blend; Tone is a no-op here (this model
-		// has no separate tone control of its own).
-		v.peaksFm.set_frequency( pitchIdx << 7 );
-		v.peaksFm.set_decay( (uint16_t)( decay * 65535.0f ) );
-		v.peaksFm.set_fm_amount( (uint16_t)( fm * 65535.0f ) );
-		v.peaksFm.set_noise( (uint16_t)( character * 65535.0f ) );
-		v.peaksFm.Process( trig, kMidiNoteFreq, plaits::kSampleRate, scratch, numFrames );
-		for ( int i=0; i<numFrames; ++i ) scratch[i] *= accent;
-	}
-	else if ( pThis->v[kParamModelBD] == 5 )
-	{
-		// ChowKick-style saturating resonant kick (see ChowKickVoice) -
-		// Character drives the resonant filter's saturation drive (0 =
-		// clean, higher = grittier); Tone drives the output lowpass; FM is
-		// a no-op here (this model's character comes from the resonant
-		// filter's own saturation, not a pitch-knock).
-		v.chowKick.Render( trig, f0, decay, character, tone, scratch, numFrames );
-		for ( int i=0; i<numFrames; ++i ) scratch[i] *= accent;
-	}
-	else if ( pThis->v[kParamModelBD] == 6 )
-	{
-		// 808 Decel Kick (see Decel808Voice) - Character drives click/drive
-		// saturation amount; Tone drives output brightness; FM makes the
-		// deceleration's starting pitch (the knock) bigger.
-		v.decel808.Render( trig, f0, decay, character, tone, fmKnock, scratch, numFrames );
-		for ( int i=0; i<numFrames; ++i ) scratch[i] *= accent;
-	}
-	else if ( pThis->v[kParamModelBD] == 7 )
-	{
-		// Comb Body (see CombBodyVoice) - a delay-line/Karplus-Strong-adjacent
-		// pluck rather than a filter-resonator model. Character drives the
-		// in-loop damping brightness; Tone drives excitation brightness; FM
-		// briefly shortens the delay (a pitch-bend-down knock, same external-
-		// push convention as Elements/Modal).
-		float fmPush = ComputeExternalFmPush( v, trig, accent, fmMode, blockSeconds );
-		float modulatedF0 = f0 * ( 1.0f + fmPush * fm * 1.5f );
-		CONSTRAIN( modulatedF0, 0.001f, 0.49f );
-		// bdDecayCap - see BdSdModelDecayCap()'s comment: CombBody reads/
-		// writes its own delay line every sample, so its own decay is
-		// capped the same way as Elements above.
-		v.combBody.Render( trig, modulatedF0, decay * bdDecayCap, character, tone, scratch, numFrames );
-		for ( int i=0; i<numFrames; ++i ) scratch[i] *= accent;
-		UpdateFmFeedback( v, scratch, numFrames );
-	}
-	else
-	{
-		// Chaos FM (see ChaosFmVoice) - Character drives the self-referential
-		// feedback amount (0 = stable 2:1 FM pair, higher = increasingly
-		// evolving/unpredictable); Tone drives the base carrier:modulator
-		// ratio; FM adds a dedicated attack knock (previously this model had
-		// no distinct attack transient at all).
-		v.chaosFm.Render( trig, f0, decay, character, tone, fmKnock, scratch, numFrames );
-		for ( int i=0; i<numFrames; ++i ) scratch[i] *= accent;
-	}
+	RenderKickModel( v, pThis->v[kParamModelBD], trig, accent, f0, pitchIdx, decay, tone, character, fm, fmKnock, fmMode, bdDecayCap, blockSeconds, pThis->elementsExciteScratch, scratch, numFrames );
 
 	MixSampleLayer( pThis, v, kSlotBD, trig, accent, decay, blockSeconds, scratch, numFrames );
 	MixNoiseLayer( v, pThis->v[kParamNoiseBD], pThis->v[kParamNoiseTypeBD], decay, trig, blockSeconds, scratch, numFrames );
@@ -5242,6 +5885,71 @@ static void ProcessKick( _drumMachineAlgorithm* pThis, float* busFrames, int num
 	if ( v.samplesUntilIdle < 0 ) v.samplesUntilIdle = 0;
 
 	WriteVoiceOutput( busFrames, numFrames, scratch, pThis->v[kParamOutBD], replace, stereo, pThis->v[kParamPanBD] );
+}
+
+// See RenderKickModel()'s comment - the same shared-dispatch pattern, for
+// SD's model repertoire.
+static void RenderSnareModel( _snareVoice& v, int model, bool trig, float accent, float f0, int pitchIdx, float decay, float tone, float character, float fm, float fmKnock, int fmMode, float sdDecayCap, float blockSeconds, float* elementsExciteScratch, float* scratch, int numFrames )
+{
+	if ( model == 0 )
+	{
+		v.analog.Render( trig, accent, f0, tone, decay, character, scratch, numFrames );
+	}
+	else if ( model == 1 )
+	{
+		v.synthetic.Render( false, trig, accent, f0, fmKnock, decay, character, fmMode, scratch, numFrames );
+	}
+	else if ( model == 2 )
+	{
+		float fmPush = ComputeExternalFmPush( v, trig, accent, fmMode, blockSeconds );
+		float modulatedF0 = f0 * ( 1.0f + fmPush * fm * 1.5f );
+		CONSTRAIN( modulatedF0, 0.001f, 0.49f );
+		RenderElements( v.elementsExciter, v.elementsResonator, elementsExciteScratch, trig, accent, modulatedF0, tone, decay * sdDecayCap, character, scratch, numFrames );
+		UpdateFmFeedback( v, scratch, numFrames );
+	}
+	else if ( model == 3 )
+	{
+		v.peaksSnare.set_frequency( pitchIdx << 7 );
+		v.peaksSnare.set_decay( (uint16_t)( decay * 65535.0f ) );
+		v.peaksSnare.set_tone( (uint16_t)( tone * 65535.0f ) );
+		v.peaksSnare.set_snappy( (uint16_t)( character * 65535.0f ) );
+		v.peaksSnare.Process( trig, scratch, numFrames );
+		for ( int i=0; i<numFrames; ++i ) scratch[i] *= accent;
+	}
+	else if ( model == 4 )
+	{
+		v.peaksFm.set_frequency( pitchIdx << 7 );
+		v.peaksFm.set_decay( (uint16_t)( decay * 65535.0f ) );
+		v.peaksFm.set_fm_amount( (uint16_t)( fm * 65535.0f ) );
+		v.peaksFm.set_noise( (uint16_t)( character * 65535.0f ) );
+		v.peaksFm.Process( trig, kMidiNoteFreq, plaits::kSampleRate, scratch, numFrames );
+		for ( int i=0; i<numFrames; ++i ) scratch[i] *= accent;
+	}
+	else if ( model == 5 )
+	{
+		v.chowKick.Render( trig, f0, decay, character, tone, scratch, numFrames );
+		for ( int i=0; i<numFrames; ++i ) scratch[i] *= accent;
+	}
+	else if ( model == 6 )
+	{
+		float fmPush = ComputeExternalFmPush( v, trig, accent, fmMode, blockSeconds );
+		v.clap.Render( trig, accent, decay, character, tone, fmPush * fm, scratch, numFrames );
+		UpdateFmFeedback( v, scratch, numFrames );
+	}
+	else if ( model == 7 )
+	{
+		float fmPush = ComputeExternalFmPush( v, trig, accent, fmMode, blockSeconds );
+		float modulatedF0 = f0 * ( 1.0f + fmPush * fm * 1.5f );
+		CONSTRAIN( modulatedF0, 0.001f, 0.49f );
+		v.combBody.Render( trig, modulatedF0, decay * sdDecayCap, character, tone, scratch, numFrames );
+		for ( int i=0; i<numFrames; ++i ) scratch[i] *= accent;
+		UpdateFmFeedback( v, scratch, numFrames );
+	}
+	else
+	{
+		v.chaosFm.Render( trig, f0, decay, character, tone, fmKnock, scratch, numFrames );
+		for ( int i=0; i<numFrames; ++i ) scratch[i] *= accent;
+	}
 }
 
 static void ProcessSnare( _drumMachineAlgorithm* pThis, float* busFrames, int numFrames )
@@ -5334,82 +6042,7 @@ static void ProcessSnare( _drumMachineAlgorithm* pThis, float* busFrames, int nu
 
 	if ( !v.frozen || v.freezeArmed )
 	{
-	if ( pThis->v[kParamModelSD] == 0 )
-		v.analog.Render( trig, accent, f0, tone, decay, character, scratch, numFrames );
-	else if ( pThis->v[kParamModelSD] == 1 )
-		v.synthetic.Render( false, trig, accent, f0, fmKnock, decay, character, fmMode, scratch, numFrames );
-	else if ( pThis->v[kParamModelSD] == 2 )
-	{
-		float fmPush = ComputeExternalFmPush( v, trig, accent, fmMode, blockSeconds );
-		float modulatedF0 = f0 * ( 1.0f + fmPush * fm * 1.5f );
-		CONSTRAIN( modulatedF0, 0.001f, 0.49f );
-		// sdDecayCap - see BdSdModelDecayCap()'s comment.
-		RenderElements( v.elementsExciter, v.elementsResonator, pThis->elementsExciteScratch, trig, accent, modulatedF0, tone, decay * sdDecayCap, character, scratch, numFrames );
-		UpdateFmFeedback( v, scratch, numFrames );
-	}
-	else if ( pThis->v[kParamModelSD] == 3 )
-	{
-		// 808-style snare (Peaks SnareDrum / Braids Snare - same algorithm,
-		// see third_party/mi_peaks/ATTRIBUTION.md) - Character drives snappy
-		// (noise-band amount).
-		v.peaksSnare.set_frequency( pitchIdx << 7 );
-		v.peaksSnare.set_decay( (uint16_t)( decay * 65535.0f ) );
-		v.peaksSnare.set_tone( (uint16_t)( tone * 65535.0f ) );
-		v.peaksSnare.set_snappy( (uint16_t)( character * 65535.0f ) );
-		v.peaksSnare.Process( trig, scratch, numFrames );
-		for ( int i=0; i<numFrames; ++i ) scratch[i] *= accent;
-	}
-	else if ( pThis->v[kParamModelSD] == 4 )
-	{
-		// Sine-FM drum (Peaks FmDrum) - same as the BD FM model, its own
-		// per-voice instance so BD/SD's self-FM sweeps never interact.
-		v.peaksFm.set_frequency( pitchIdx << 7 );
-		v.peaksFm.set_decay( (uint16_t)( decay * 65535.0f ) );
-		v.peaksFm.set_fm_amount( (uint16_t)( fm * 65535.0f ) );
-		v.peaksFm.set_noise( (uint16_t)( character * 65535.0f ) );
-		v.peaksFm.Process( trig, kMidiNoteFreq, plaits::kSampleRate, scratch, numFrames );
-		for ( int i=0; i<numFrames; ++i ) scratch[i] *= accent;
-	}
-	else if ( pThis->v[kParamModelSD] == 5 )
-	{
-		// ChowKick-style saturating resonant snare (see ChowKickVoice,
-		// shared with BD) - same mapping as the BD version: Character
-		// drives saturation drive, Tone drives output brightness.
-		v.chowKick.Render( trig, f0, decay, character, tone, scratch, numFrames );
-		for ( int i=0; i<numFrames; ++i ) scratch[i] *= accent;
-	}
-	else if ( pThis->v[kParamModelSD] == 6 )
-	{
-		// Clap (see ClapVoice) - Character drives the bandpass centre
-		// frequency (the classic ~0.9-2.1kHz clap sweet spot); Tone drives
-		// the bandpass Q; FM briefly pushes the centre frequency up for a
-		// sharper attack chirp; Pitch is a no-op (a clap has no meaningful
-		// fundamental pitch).
-		float fmPush = ComputeExternalFmPush( v, trig, accent, fmMode, blockSeconds );
-		v.clap.Render( trig, accent, decay, character, tone, fmPush * fm, scratch, numFrames );
-		UpdateFmFeedback( v, scratch, numFrames );
-	}
-	else if ( pThis->v[kParamModelSD] == 7 )
-	{
-		// Comb Body (see CombBodyVoice, shared design with BD) - Character
-		// drives in-loop damping brightness; Tone drives excitation
-		// brightness; FM briefly shortens the delay (pitch-bend knock).
-		float fmPush = ComputeExternalFmPush( v, trig, accent, fmMode, blockSeconds );
-		float modulatedF0 = f0 * ( 1.0f + fmPush * fm * 1.5f );
-		CONSTRAIN( modulatedF0, 0.001f, 0.49f );
-		// sdDecayCap - see BdSdModelDecayCap()'s comment.
-		v.combBody.Render( trig, modulatedF0, decay * sdDecayCap, character, tone, scratch, numFrames );
-		for ( int i=0; i<numFrames; ++i ) scratch[i] *= accent;
-		UpdateFmFeedback( v, scratch, numFrames );
-	}
-	else
-	{
-		// Chaos FM (see ChaosFmVoice, shared design with BD) - Character
-		// drives the self-referential feedback amount; Tone drives the base
-		// carrier:modulator ratio; FM adds a dedicated attack knock.
-		v.chaosFm.Render( trig, f0, decay, character, tone, fmKnock, scratch, numFrames );
-		for ( int i=0; i<numFrames; ++i ) scratch[i] *= accent;
-	}
+	RenderSnareModel( v, pThis->v[kParamModelSD], trig, accent, f0, pitchIdx, decay, tone, character, fm, fmKnock, fmMode, sdDecayCap, blockSeconds, pThis->elementsExciteScratch, scratch, numFrames );
 
 	MixSampleLayer( pThis, v, kSlotSD, trig, accent, decay, blockSeconds, scratch, numFrames );
 	MixNoiseLayer( v, pThis->v[kParamNoiseSD], pThis->v[kParamNoiseTypeSD], decay, trig, blockSeconds, scratch, numFrames );
@@ -5453,6 +6086,86 @@ static void ProcessSnare( _drumMachineAlgorithm* pThis, float* busFrames, int nu
 	if ( v.samplesUntilIdle < 0 ) v.samplesUntilIdle = 0;
 
 	WriteVoiceOutput( busFrames, numFrames, scratch, pThis->v[kParamOutSD], replace, stereo, pThis->v[kParamPanSD] );
+}
+
+// See RenderKickModel()'s comment - the same shared-dispatch pattern, for
+// the Hat's model repertoire (used for both CH and OH, and by
+// RenderShadowHat() - see its comment).
+static void RenderHatModel( _hatVoice& v, int model, bool trig, float accent, float f0, int pitchIdx, float decay, float tone, float noisiness, float fm, int fmMode, float hatDecayCap, float blockSeconds, float* elementsExciteScratch, float* scratch, int numFrames )
+{
+	if ( model == 0 )
+	{
+		float fmPush = ComputeExternalFmPush( v, trig, accent, fmMode, blockSeconds );
+		float modulatedF0 = f0 * ( 1.0f + fmPush * fm * 1.5f );
+		CONSTRAIN( modulatedF0, 0.001f, 0.49f );
+		v.hihat.Render( trig, accent, modulatedF0, tone, decay, noisiness, v.scratch1, v.scratch2, scratch, numFrames );
+		UpdateFmFeedback( v, scratch, numFrames );
+	}
+	else if ( model == 1 )
+	{
+		float fmPush = ComputeExternalFmPush( v, trig, accent, fmMode, blockSeconds );
+		float modulatedF0 = f0 * ( 1.0f + fmPush * fm * 1.5f );
+		CONSTRAIN( modulatedF0, 0.001f, 0.49f );
+		RenderElements( v.elementsExciter, v.elementsResonator, elementsExciteScratch, trig, accent, modulatedF0, tone, decay * hatDecayCap, noisiness, scratch, numFrames );
+		UpdateFmFeedback( v, scratch, numFrames );
+	}
+	else if ( model == 2 )
+	{
+		if ( trig )
+		{
+			v.cymbalElapsed = 0.0f;
+			v.cymbalTotalS = NormToSeconds( decay * decay, 0.05f, 2.0f );
+			v.cymbalActive = true;
+		}
+		float cymbalAmp = 0.0f;
+		if ( v.cymbalActive )
+		{
+			v.cymbalElapsed += blockSeconds;
+			if ( v.cymbalElapsed >= v.cymbalTotalS )
+				v.cymbalActive = false;
+			else
+				cymbalAmp = 1.0f - v.cymbalElapsed / v.cymbalTotalS;
+		}
+		float fmPush = ComputeExternalFmPush( v, trig, accent, fmMode, blockSeconds );
+		int32_t pitchPush = (int32_t)( fmPush * fm * 18.0f * 128.0f );
+		v.braidsCymbal.set_pitch( ( pitchIdx << 7 ) + pitchPush );
+		v.braidsCymbal.set_tone( (uint16_t)( tone * 65535.0f ) );
+		v.braidsCymbal.set_xfade( (uint16_t)( noisiness * 65535.0f ) );
+		v.braidsCymbal.Process( kMidiNoteFreq, plaits::kSampleRate, scratch, numFrames );
+		float amp = cymbalAmp * accent;
+		for ( int i=0; i<numFrames; ++i ) scratch[i] *= amp;
+		UpdateFmFeedback( v, scratch, numFrames );
+	}
+	else if ( model == 3 )
+	{
+		float fmPush = ComputeExternalFmPush( v, trig, accent, fmMode, blockSeconds );
+		float modulatedF0 = f0 * ( 1.0f + fmPush * fm * 1.5f );
+		CONSTRAIN( modulatedF0, 0.001f, 0.49f );
+		v.modal.Render( trig, accent, modulatedF0, decay * hatDecayCap, tone, noisiness, scratch, numFrames );
+		UpdateFmFeedback( v, scratch, numFrames );
+	}
+	else if ( model == 4 )
+	{
+		float fmPush = ComputeExternalFmPush( v, trig, accent, fmMode, blockSeconds );
+		float modulatedF0 = f0 * ( 1.0f + fmPush * fm * 1.5f );
+		CONSTRAIN( modulatedF0, 0.001f, 0.49f );
+		v.shaker.Render( trig, accent, modulatedF0, decay, tone, noisiness, scratch, numFrames );
+		UpdateFmFeedback( v, scratch, numFrames );
+	}
+	else if ( model == 5 )
+	{
+		float fmPush = ComputeExternalFmPush( v, trig, accent, fmMode, blockSeconds );
+		v.sweepHat.Render( trig, accent, f0, decay * hatDecayCap, tone, noisiness, fmPush * fm, scratch, numFrames, blockSeconds );
+		UpdateFmFeedback( v, scratch, numFrames );
+	}
+	else
+	{
+		float fmPush = ComputeExternalFmPush( v, trig, accent, fmMode, blockSeconds );
+		float modulatedF0 = f0 * ( 1.0f + fmPush * fm * 1.5f );
+		CONSTRAIN( modulatedF0, 0.001f, 0.49f );
+		v.ringModMetal.Render( trig, accent, modulatedF0, decay, noisiness, tone, scratch, numFrames );
+		UpdateFmFeedback( v, scratch, numFrames );
+	}
 }
 
 static void ProcessHat( _drumMachineAlgorithm* pThis, float* busFrames, int numFrames, bool isOpen )
@@ -5569,104 +6282,7 @@ static void ProcessHat( _drumMachineAlgorithm* pThis, float* busFrames, int numF
 
 	if ( !v.frozen || v.freezeArmed )
 	{
-	if ( pThis->v[modelParamIdx] == 0 )
-	{
-		float fmPush = ComputeExternalFmPush( v, trig, accent, fmMode, blockSeconds );
-		float modulatedF0 = f0 * ( 1.0f + fmPush * fm * 1.5f );
-		CONSTRAIN( modulatedF0, 0.001f, 0.49f );
-		v.hihat.Render( trig, accent, modulatedF0, tone, decay, noisiness, v.scratch1, v.scratch2, scratch, numFrames );
-		UpdateFmFeedback( v, scratch, numFrames );
-	}
-	else if ( pThis->v[modelParamIdx] == 1 )
-	{
-		float fmPush = ComputeExternalFmPush( v, trig, accent, fmMode, blockSeconds );
-		float modulatedF0 = f0 * ( 1.0f + fmPush * fm * 1.5f );
-		CONSTRAIN( modulatedF0, 0.001f, 0.49f );
-		// hatDecayCap - see HatModelDecayCap()'s comment.
-		RenderElements( v.elementsExciter, v.elementsResonator, pThis->elementsExciteScratch, trig, accent, modulatedF0, tone, decay * hatDecayCap, noisiness, scratch, numFrames );
-		UpdateFmFeedback( v, scratch, numFrames );
-	}
-	else if ( pThis->v[modelParamIdx] == 2 )
-	{
-		// Braids' cymbal/hi-hat model has no envelope of its own (a
-		// continuously-running metallic/noise texture - see
-		// third_party/mi_braids/braids/cymbal.h) - this voice supplies a
-		// simple linear decay envelope itself, timed off the same Release
-		// knob as every other model, and applies it as a post-multiply.
-		if ( trig )
-		{
-			v.cymbalElapsed = 0.0f;
-			v.cymbalTotalS = NormToSeconds( decay * decay, 0.05f, 2.0f );
-			v.cymbalActive = true;
-		}
-		float cymbalAmp = 0.0f;
-		if ( v.cymbalActive )
-		{
-			v.cymbalElapsed += blockSeconds;
-			if ( v.cymbalElapsed >= v.cymbalTotalS )
-				v.cymbalActive = false;
-			else
-				cymbalAmp = 1.0f - v.cymbalElapsed / v.cymbalTotalS;
-		}
-		// FM pushes pitch here too (Q7 units, ~1 semitone per unit of
-		// fmPush*fm*18 below) - see ComputeExternalFmPush()'s comment.
-		float fmPush = ComputeExternalFmPush( v, trig, accent, fmMode, blockSeconds );
-		int32_t pitchPush = (int32_t)( fmPush * fm * 18.0f * 128.0f );
-		v.braidsCymbal.set_pitch( ( pitchIdx << 7 ) + pitchPush );
-		v.braidsCymbal.set_tone( (uint16_t)( tone * 65535.0f ) );
-		v.braidsCymbal.set_xfade( (uint16_t)( noisiness * 65535.0f ) );
-		v.braidsCymbal.Process( kMidiNoteFreq, plaits::kSampleRate, scratch, numFrames );
-		float amp = cymbalAmp * accent;
-		for ( int i=0; i<numFrames; ++i ) scratch[i] *= amp;
-		UpdateFmFeedback( v, scratch, numFrames );
-	}
-	else if ( pThis->v[modelParamIdx] == 3 )
-	{
-		// Modal synthesis (see ModalHatVoice) - Tone controls how many of
-		// the higher inharmonic modes are engaged (brightness); Character
-		// controls each mode's Q/resonance sharpness (ringy vs damped).
-		float fmPush = ComputeExternalFmPush( v, trig, accent, fmMode, blockSeconds );
-		float modulatedF0 = f0 * ( 1.0f + fmPush * fm * 1.5f );
-		CONSTRAIN( modulatedF0, 0.001f, 0.49f );
-		// hatDecayCap - see HatModelDecayCap()'s comment.
-		v.modal.Render( trig, accent, modulatedF0, decay * hatDecayCap, tone, noisiness, scratch, numFrames );
-		UpdateFmFeedback( v, scratch, numFrames );
-	}
-	else if ( pThis->v[modelParamIdx] == 4 )
-	{
-		// Shaker (see ShakerVoice, PhISEM-inspired) - Tone drives the
-		// resonant filter's Q (sharper = more "rattly" tonal centre);
-		// Character drives grain density (higher = faster, busier); FM
-		// briefly pushes the resonant filter's centre frequency up.
-		float fmPush = ComputeExternalFmPush( v, trig, accent, fmMode, blockSeconds );
-		float modulatedF0 = f0 * ( 1.0f + fmPush * fm * 1.5f );
-		CONSTRAIN( modulatedF0, 0.001f, 0.49f );
-		v.shaker.Render( trig, accent, modulatedF0, decay, tone, noisiness, scratch, numFrames );
-		UpdateFmFeedback( v, scratch, numFrames );
-	}
-	else if ( pThis->v[modelParamIdx] == 5 )
-	{
-		// Sweep Hat (see SweepHatVoice) - Tone sets the narrowed filter
-		// band's resting point once the HP/LP sweep closes in; Character
-		// drives HP/LP resonance (sharper/whistlier sweep); FM pushes the
-		// sweep's starting HP frequency higher for a sharper opening
-		// transient.
-		float fmPush = ComputeExternalFmPush( v, trig, accent, fmMode, blockSeconds );
-		// hatDecayCap - see HatModelDecayCap()'s comment.
-		v.sweepHat.Render( trig, accent, f0, decay * hatDecayCap, tone, noisiness, fmPush * fm, scratch, numFrames, blockSeconds );
-		UpdateFmFeedback( v, scratch, numFrames );
-	}
-	else
-	{
-		// Ring-Mod Metal (see RingModMetalVoice) - Character drives the
-		// ring-mod ratio (higher = more inharmonic/clangy); Tone drives the
-		// highpass cutoff; FM briefly pushes pitch up for extra clang.
-		float fmPush = ComputeExternalFmPush( v, trig, accent, fmMode, blockSeconds );
-		float modulatedF0 = f0 * ( 1.0f + fmPush * fm * 1.5f );
-		CONSTRAIN( modulatedF0, 0.001f, 0.49f );
-		v.ringModMetal.Render( trig, accent, modulatedF0, decay, noisiness, tone, scratch, numFrames );
-		UpdateFmFeedback( v, scratch, numFrames );
-	}
+	RenderHatModel( v, pThis->v[modelParamIdx], trig, accent, f0, pitchIdx, decay, tone, noisiness, fm, fmMode, hatDecayCap, blockSeconds, pThis->elementsExciteScratch, scratch, numFrames );
 
 	MixSampleLayer( pThis, v, slot, trig, accent, decay, blockSeconds, scratch, numFrames );
 	MixNoiseLayer( v, pThis->v[noiseParamIdx], pThis->v[noiseTypeParamIdx], decay, trig, blockSeconds, scratch, numFrames );
@@ -5712,6 +6328,476 @@ static void ProcessHat( _drumMachineAlgorithm* pThis, float* busFrames, int numF
 	WriteVoiceOutput( busFrames, numFrames, scratch, pThis->v[outParamIdx], replace, stereo, pThis->v[panParamIdx] );
 }
 
+// ---------------------------------------------------------------------
+// Preset Prerender - see kParamPrerenderEnabled's comment. When enabled,
+// selecting a preset from the preset menu doesn't switch to it immediately;
+// instead the shadow voices above (RenderKickModel()/RenderSnareModel()/
+// RenderHatModel() - the exact same model dispatch the live voices use,
+// just fed the *cued* preset's stored values via CuedParam() instead of
+// pThis->v[]) silently render each in-scope slot's hit, one at a time, self-
+// triggered rather than waiting for real MIDI/CV. Once every in-scope slot
+// has a captured buffer ready, FinishCue() hands those buffers to the real
+// voices (with a matching frozenParamHash already computed, so the per-
+// block un-freeze check never fires) and only then calls the real
+// LoadPreset() - so the switch itself is a silent buffer swap, never a live
+// render. Deliberately doesn't replicate live Mod Matrix modulation (raw
+// base values only) or the sample layer (a cued slot with Sample Mix > 0
+// just falls back to a normal live swap at that slot) - see the Preset
+// Prerender plan's own comment for why both are acceptable simplifications
+// for a background preview capture rather than a note-for-note reproduction.
+// ---------------------------------------------------------------------
+
+// Defined later (with SavePreset()) - forward-declared here so
+// FinishCue()/CuePreset() below can call it. `fromAudioContext` - see
+// LoadPreset()'s own comment: FinishCue() calls this from *inside* step()'s
+// call graph (a first for this function - every other caller is a direct
+// UI action from customUi()), which turned out to freeze the whole module
+// with an audible fault tone the first time it was tried on hardware -
+// NT_setParameterFromUi() ("safe to call from anywhere" per its doc
+// comment, but seemingly not meant for ~120 calls in a tight loop from the
+// audio callback) is what LoadPreset() normally uses; NT_setParameterFromAudio()
+// is the SDK's explicitly-documented real-time-safe alternative ("may be
+// called from step()..."), used instead whenever fromAudioContext is true.
+static void LoadPreset( _drumMachineAlgorithm* pThis, int slot, bool fromAudioContext = false );
+
+#if PRERENDER_SHADOW_ENABLED
+// DIAGNOSTIC (temporary) - keeps shadowVoiceStorage (1144 bytes DTC), the
+// new algorithm-level stash fields, and construct()'s memset exactly as
+// they are (all controlled by PRERENDER_SHADOW_ENABLED above). This second,
+// independent flag instead controls whether the capture logic below
+// (CuePreset()/ProcessRenderVoice(), and transitively RenderShadowKick/
+// Snare/Hat/FinishCue/AdvanceRenderVoiceSlot) is ever reachable at runtime -
+// set to 0 to isolate "is the ~1.1KB DTC growth alone enough to break boot,
+// with the actual rendering logic completely unreachable dead code" from
+// "is there a bug in that logic itself". Must be defined here, before
+// ProcessRenderVoice()'s own #if check below - defining it any later left
+// that particular #if silently evaluating an as-yet-undefined macro (= 0)
+// regardless of the value set here, a real bug in this diagnostic itself
+// caught by RenderShadowKick/Snare/Hat/AdvanceRenderVoiceSlot still showing
+// as "defined but not used" even with this set to 1.
+#define PRERENDER_LOGIC_ENABLED 1
+
+// Reads slot `cuedSlot`'s stored value for `paramIndex` from whichever of
+// presetBank/modBank actually holds it (falling back to the live pThis->v[]
+// for anything that isn't preset-specific, e.g. Routing/MIDI params) - the
+// cued-preset equivalent of pThis->v[paramIndex], used throughout
+// RenderShadowKick/Snare/Hat below so the shadow render always sees the
+// *cued* preset's values, never the live one.
+static int CuedParam( _drumMachineAlgorithm* pThis, int cuedSlot, int paramIndex )
+{
+	if ( paramIndex >= kFirstKitParam && paramIndex < kFirstKitParam + kNumKitParams )
+		return pThis->presetBank[cuedSlot][ paramIndex - kFirstKitParam ];
+	int modSlot = FindModParamSlot( paramIndex );
+	if ( modSlot >= 0 )
+		return pThis->modBank[cuedSlot][ modSlot ];
+	return pThis->v[ paramIndex ];
+}
+
+static const int kSampleMixParamForSlot[kNumSlots] = { kParamSampleMixBD, kParamSampleMixSD, kParamSampleMixCH, kParamSampleMixOH };
+
+// Renders one block of the shadow kick's capture for the cued preset -
+// see this section's comment. `selfTrig` fires exactly once per hit
+// (driven by ProcessRenderVoice(), not real MIDI), the same way a real
+// trigger starts the live voices' own capture. Returns true once this
+// hit's capture is complete (idle reached, something was actually
+// captured - same guard the live voices use, see ProcessKick()'s comment).
+static bool RenderShadowKick( _drumMachineAlgorithm* pThis, int cuedSlot, bool selfTrig, int numFrames )
+{
+	_kickVoice& v = ShadowKick( pThis->dtc );
+	int model = CuedParam( pThis, cuedSlot, kParamModelBD );
+	float bdDecayCap = BdSdModelDecayCap( model );
+	float baseDecay = CuedParam( pThis, cuedSlot, kParamRelBD ) * 0.01f * bdDecayCap;
+	float blockSeconds = numFrames / plaits::kSampleRate;
+
+	if ( selfTrig )
+	{
+		// Full Init(), not just a partial field reset - shadowVoiceStorage is
+		// shared with SD/CH/OH's own captures (see its comment), so whatever
+		// filter/envelope/drive state the previous slot's capture left
+		// behind must be wiped, not just the capture-tracking fields.
+		v.Init( pThis->shadowCombBodyDelay, pThis->nextKickFreezeBuf );
+		v.freezeCapturing = true;
+		v.samplesUntilIdle = IdleSamples( baseDecay );
+	}
+
+	if ( v.samplesUntilIdle <= 0 && !selfTrig )
+	{
+		bool done = v.frozenNumFrames > 0;
+		if ( done )
+		{
+			v.freezeCapturing = false;
+			v.frozenParamHash = ComputeFreezeHash( model, CuedParam( pThis, cuedSlot, kParamPitchBD ), CuedParam( pThis, cuedSlot, kParamRelBD ), CuedParam( pThis, cuedSlot, kParamToneBD ), CuedParam( pThis, cuedSlot, kParamCharBD ), CuedParam( pThis, cuedSlot, kParamFmBD ), CuedParam( pThis, cuedSlot, kParamSampleBD ), CuedParam( pThis, cuedSlot, kParamSampleMixBD ), CuedParam( pThis, cuedSlot, kParamNoiseBD ), CuedParam( pThis, cuedSlot, kParamNoiseTypeBD ) );
+		}
+		return done;
+	}
+
+	int pitchIdx = CuedParam( pThis, cuedSlot, kParamPitchBD );
+	CONSTRAIN( pitchIdx, 0, 127 );
+	float f0 = kMidiNoteFreq[pitchIdx] / plaits::kSampleRate;
+	float decay = CuedParam( pThis, cuedSlot, kParamRelBD ) * 0.01f;
+	float tone = CuedParam( pThis, cuedSlot, kParamToneBD ) * 0.01f;
+	float character = CuedParam( pThis, cuedSlot, kParamCharBD ) * 0.01f;
+	float fm = CuedParam( pThis, cuedSlot, kParamFmBD ) * 0.01f;
+	CONSTRAIN( decay, 0.0f, 1.0f );
+	CONSTRAIN( tone, 0.0f, 1.0f );
+	CONSTRAIN( character, 0.0f, 1.0f );
+	CONSTRAIN( fm, 0.0f, 1.0f );
+	float accent = 1.0f;	// no live velocity for a self-triggered preview capture
+	int fmMode = ResolveFmMode( CuedParam( pThis, cuedSlot, kParamFmModeBD ) );
+	float fmKnock = fm * 0.8f;
+
+	float* scratch = pThis->renderScratch;
+	RenderKickModel( v, model, selfTrig, accent, f0, pitchIdx, decay, tone, character, fm, fmKnock, fmMode, bdDecayCap, blockSeconds, pThis->elementsExciteScratch, scratch, numFrames );
+	MixNoiseLayer( v, CuedParam( pThis, cuedSlot, kParamNoiseBD ), CuedParam( pThis, cuedSlot, kParamNoiseTypeBD ), decay, selfTrig, blockSeconds, scratch, numFrames );
+
+	int spaceLeft = PrerenderMaxFrames() - v.frozenNumFrames;
+	int toCopy = numFrames < spaceLeft ? numFrames : spaceLeft;
+	if ( toCopy > 0 )
+	{
+		memcpy( v.frozenBuf + v.frozenNumFrames, scratch, toCopy * sizeof(float) );
+		v.frozenNumFrames += toCopy;
+	}
+
+	v.samplesUntilIdle -= numFrames;
+	if ( v.samplesUntilIdle < 0 ) v.samplesUntilIdle = 0;
+	return false;
+}
+
+// See RenderShadowKick()'s comment - same pattern, SD's model repertoire.
+static bool RenderShadowSnare( _drumMachineAlgorithm* pThis, int cuedSlot, bool selfTrig, int numFrames )
+{
+	_snareVoice& v = ShadowSnare( pThis->dtc );
+	int model = CuedParam( pThis, cuedSlot, kParamModelSD );
+	float sdDecayCap = BdSdModelDecayCap( model );
+	float baseDecay = CuedParam( pThis, cuedSlot, kParamRelSD ) * 0.01f * sdDecayCap;
+	float blockSeconds = numFrames / plaits::kSampleRate;
+
+	if ( selfTrig )
+	{
+		// See RenderShadowKick()'s comment - full Init(), not a partial reset.
+		v.Init( pThis->shadowCombBodyDelay, pThis->nextSnareFreezeBuf );
+		v.freezeCapturing = true;
+		v.samplesUntilIdle = IdleSamples( baseDecay );
+	}
+
+	if ( v.samplesUntilIdle <= 0 && !selfTrig )
+	{
+		bool done = v.frozenNumFrames > 0;
+		if ( done )
+		{
+			v.freezeCapturing = false;
+			v.frozenParamHash = ComputeFreezeHash( model, CuedParam( pThis, cuedSlot, kParamPitchSD ), CuedParam( pThis, cuedSlot, kParamRelSD ), CuedParam( pThis, cuedSlot, kParamToneSD ), CuedParam( pThis, cuedSlot, kParamCharSD ), CuedParam( pThis, cuedSlot, kParamFmSD ), CuedParam( pThis, cuedSlot, kParamSampleSD ), CuedParam( pThis, cuedSlot, kParamSampleMixSD ), CuedParam( pThis, cuedSlot, kParamNoiseSD ), CuedParam( pThis, cuedSlot, kParamNoiseTypeSD ) );
+		}
+		return done;
+	}
+
+	int pitchIdx = CuedParam( pThis, cuedSlot, kParamPitchSD );
+	CONSTRAIN( pitchIdx, 0, 127 );
+	float f0 = kMidiNoteFreq[pitchIdx] / plaits::kSampleRate;
+	float decay = CuedParam( pThis, cuedSlot, kParamRelSD ) * 0.01f;
+	float tone = CuedParam( pThis, cuedSlot, kParamToneSD ) * 0.01f;
+	float character = CuedParam( pThis, cuedSlot, kParamCharSD ) * 0.01f;
+	float fm = CuedParam( pThis, cuedSlot, kParamFmSD ) * 0.01f;
+	CONSTRAIN( decay, 0.0f, 1.0f );
+	CONSTRAIN( tone, 0.0f, 1.0f );
+	CONSTRAIN( character, 0.0f, 1.0f );
+	CONSTRAIN( fm, 0.0f, 1.0f );
+	float accent = 1.0f;
+	int fmMode = ResolveFmMode( CuedParam( pThis, cuedSlot, kParamFmModeSD ) );
+	float fmKnock = fm * 0.8f;
+
+	float* scratch = pThis->renderScratch;
+	RenderSnareModel( v, model, selfTrig, accent, f0, pitchIdx, decay, tone, character, fm, fmKnock, fmMode, sdDecayCap, blockSeconds, pThis->elementsExciteScratch, scratch, numFrames );
+	MixNoiseLayer( v, CuedParam( pThis, cuedSlot, kParamNoiseSD ), CuedParam( pThis, cuedSlot, kParamNoiseTypeSD ), decay, selfTrig, blockSeconds, scratch, numFrames );
+
+	int spaceLeft = PrerenderMaxFrames() - v.frozenNumFrames;
+	int toCopy = numFrames < spaceLeft ? numFrames : spaceLeft;
+	if ( toCopy > 0 )
+	{
+		memcpy( v.frozenBuf + v.frozenNumFrames, scratch, toCopy * sizeof(float) );
+		v.frozenNumFrames += toCopy;
+	}
+
+	v.samplesUntilIdle -= numFrames;
+	if ( v.samplesUntilIdle < 0 ) v.samplesUntilIdle = 0;
+	return false;
+}
+
+// See RenderShadowKick()'s comment - same pattern, Hat's model repertoire.
+// shadowHat is shared by CH and OH (see nextClosedHatFreezeBuf's comment) -
+// `isOpen` selects which slot's params/param names this call captures for.
+static bool RenderShadowHat( _drumMachineAlgorithm* pThis, int cuedSlot, bool selfTrig, int numFrames, bool isOpen )
+{
+	_hatVoice& v = ShadowHat( pThis->dtc );
+	int modelParamIdx = isOpen ? kParamModelOH : kParamModelCH;
+	int pitchParamIdx = isOpen ? kParamPitchOH : kParamPitchCH;
+	int relParamIdx = isOpen ? kParamRelOH : kParamRelCH;
+	int toneParamIdx = isOpen ? kParamToneOH : kParamToneCH;
+	int charParamIdx = isOpen ? kParamCharOH : kParamCharCH;
+	int fmParamIdx = isOpen ? kParamFmOH : kParamFmCH;
+	int fmModeParamIdx = isOpen ? kParamFmModeOH : kParamFmModeCH;
+	int noiseParamIdx = isOpen ? kParamNoiseOH : kParamNoiseCH;
+	int noiseTypeParamIdx = isOpen ? kParamNoiseTypeOH : kParamNoiseTypeCH;
+	int slot = isOpen ? kSlotOH : kSlotCH;
+
+	int model = CuedParam( pThis, cuedSlot, modelParamIdx );
+	float hatDecayCap = HatModelDecayCap( model );
+	float baseDecay = CuedParam( pThis, cuedSlot, relParamIdx ) * 0.01f * hatDecayCap;
+	float blockSeconds = numFrames / plaits::kSampleRate;
+
+	if ( selfTrig )
+	{
+		// See RenderShadowKick()'s comment - full Init(), not a partial
+		// reset. CH and OH share this same storage too (isOpen picks the
+		// right buffer), so this also replaces AdvanceRenderVoiceSlot()'s
+		// old manual frozenBuf-reassignment/partial-reset when moving from
+		// capturing CH to capturing OH - now just a normal fresh Init().
+		v.Init( isOpen ? pThis->nextOpenHatFreezeBuf : pThis->nextClosedHatFreezeBuf );
+		v.freezeCapturing = true;
+		v.samplesUntilIdle = IdleSamples( baseDecay );
+	}
+
+	if ( v.samplesUntilIdle <= 0 && !selfTrig )
+	{
+		bool done = v.frozenNumFrames > 0;
+		if ( done )
+		{
+			v.freezeCapturing = false;
+			v.frozenParamHash = ComputeFreezeHash( model, CuedParam( pThis, cuedSlot, pitchParamIdx ), CuedParam( pThis, cuedSlot, relParamIdx ), CuedParam( pThis, cuedSlot, toneParamIdx ), CuedParam( pThis, cuedSlot, charParamIdx ), CuedParam( pThis, cuedSlot, fmParamIdx ), CuedParam( pThis, cuedSlot, kSampleParam[slot] ), CuedParam( pThis, cuedSlot, kSampleMixParam[slot] ), CuedParam( pThis, cuedSlot, noiseParamIdx ), CuedParam( pThis, cuedSlot, noiseTypeParamIdx ) );
+		}
+		return done;
+	}
+
+	int pitchIdx = CuedParam( pThis, cuedSlot, pitchParamIdx );
+	CONSTRAIN( pitchIdx, 0, 127 );
+	float f0 = kMidiNoteFreq[pitchIdx] / plaits::kSampleRate;
+	float decay = CuedParam( pThis, cuedSlot, relParamIdx ) * 0.01f;
+	float tone = CuedParam( pThis, cuedSlot, toneParamIdx ) * 0.01f;
+	float noisiness = CuedParam( pThis, cuedSlot, charParamIdx ) * 0.01f;
+	float fm = CuedParam( pThis, cuedSlot, fmParamIdx ) * 0.01f;
+	CONSTRAIN( decay, 0.0f, 1.0f );
+	CONSTRAIN( tone, 0.0f, 1.0f );
+	CONSTRAIN( noisiness, 0.0f, 1.0f );
+	CONSTRAIN( fm, 0.0f, 1.0f );
+	int fmMode = ResolveFmMode( CuedParam( pThis, cuedSlot, fmModeParamIdx ) );
+	float accent = 1.0f;
+
+	float* scratch = pThis->renderScratch;
+	RenderHatModel( v, model, selfTrig, accent, f0, pitchIdx, decay, tone, noisiness, fm, fmMode, hatDecayCap, blockSeconds, pThis->elementsExciteScratch, scratch, numFrames );
+	MixNoiseLayer( v, CuedParam( pThis, cuedSlot, noiseParamIdx ), CuedParam( pThis, cuedSlot, noiseTypeParamIdx ), decay, selfTrig, blockSeconds, scratch, numFrames );
+
+	int spaceLeft = PrerenderMaxFrames() - v.frozenNumFrames;
+	int toCopy = numFrames < spaceLeft ? numFrames : spaceLeft;
+	if ( toCopy > 0 )
+	{
+		memcpy( v.frozenBuf + v.frozenNumFrames, scratch, toCopy * sizeof(float) );
+		v.frozenNumFrames += toCopy;
+	}
+
+	v.samplesUntilIdle -= numFrames;
+	if ( v.samplesUntilIdle < 0 ) v.samplesUntilIdle = 0;
+	return false;
+}
+
+// Hands the render-voice's captured buffers over to the real voices and
+// performs the actual preset switch - see this section's top comment for
+// the full sequencing. Any in-scope slot that never got a captured buffer
+// (skipped for having a sample layer - see kSampleMixParamForSlot's use in
+// ProcessRenderVoice()) is simply left alone here, so LoadPreset() below
+// gives it a normal live parameter swap instead.
+static void FinishCue( _drumMachineAlgorithm* pThis )
+{
+	int cuedSlot = pThis->cuedPresetSlot;
+
+	// BD/SD/CH's results were stashed (metadata only - each one's audio has
+	// sat untouched in its own dedicated next*FreezeBuf since its own
+	// capture finished) as the sequencer moved past each, since all 3
+	// voice archetypes share one piece of DTC storage - see
+	// shadowVoiceStorage's comment for why it can't be handed to the real
+	// voices any earlier than this atomic swap.
+	if ( pThis->bdFrozenNumFrames > 0 )
+	{
+		_kickVoice& real = pThis->dtc->kick;
+		real.frozenNumFrames = pThis->bdFrozenNumFrames;
+		real.frozenParamHash = pThis->bdFrozenParamHash;
+		real.frozenPlayPos = 0;
+		real.frozen = true;
+		real.freezeArmed = false;
+		real.freezeCapturing = false;
+		memcpy( real.frozenBuf, pThis->nextKickFreezeBuf, pThis->bdFrozenNumFrames * sizeof(float) );
+	}
+	if ( pThis->sdFrozenNumFrames > 0 )
+	{
+		_snareVoice& real = pThis->dtc->snare;
+		real.frozenNumFrames = pThis->sdFrozenNumFrames;
+		real.frozenParamHash = pThis->sdFrozenParamHash;
+		real.frozenPlayPos = 0;
+		real.frozen = true;
+		real.freezeArmed = false;
+		real.freezeCapturing = false;
+		memcpy( real.frozenBuf, pThis->nextSnareFreezeBuf, pThis->sdFrozenNumFrames * sizeof(float) );
+	}
+	if ( pThis->chFrozenNumFrames > 0 )
+	{
+		_hatVoice& real = pThis->dtc->closedHat;
+		real.frozenNumFrames = pThis->chFrozenNumFrames;
+		real.frozenParamHash = pThis->chFrozenParamHash;
+		real.frozenPlayPos = 0;
+		real.frozen = true;
+		real.freezeArmed = false;
+		real.freezeCapturing = false;
+		memcpy( real.frozenBuf, pThis->nextClosedHatFreezeBuf, pThis->chFrozenNumFrames * sizeof(float) );
+	}
+	// OH is always the last slot rendered, so nothing has reused
+	// shadowVoiceStorage yet - safe to read directly. ohSkipped (rather
+	// than just checking frozenNumFrames > 0) distinguishes "OH ran and
+	// captured nothing" from "OH never ran at all" (sample-layer skip -
+	// see ProcessRenderVoice()), since the shared storage can't otherwise
+	// tell those apart from stale leftover state.
+	if ( !pThis->ohSkipped )
+	{
+		_hatVoice& shadowHat = ShadowHat( pThis->dtc );
+		if ( shadowHat.frozenNumFrames > 0 )
+		{
+			_hatVoice& real = pThis->dtc->openHat;
+			real.frozenNumFrames = shadowHat.frozenNumFrames;
+			real.frozenParamHash = shadowHat.frozenParamHash;
+			real.frozenPlayPos = 0;
+			real.frozen = true;
+			real.freezeArmed = false;
+			real.freezeCapturing = false;
+			memcpy( real.frozenBuf, shadowHat.frozenBuf, shadowHat.frozenNumFrames * sizeof(float) );
+		}
+	}
+
+	pThis->cuedPresetSlot = -1;
+	pThis->renderVoiceSlot = -1;
+	LoadPreset( pThis, cuedSlot, true );	// true - called from step()'s call graph, see LoadPreset()'s comment
+}
+
+// Moves to the next in-scope slot after the current one's capture finishes
+// (or was skipped for having a sample layer) - kSlotBD -> kSlotSD ->
+// kSlotCH -> kSlotOH -> FinishCue(). `wasCaptured` distinguishes a real
+// completed capture from a sample-layer skip (see ProcessRenderVoice()) -
+// the outgoing slot's result must be stashed (BD/SD/CH) or flagged as
+// skipped (OH) either way, since shadowVoiceStorage is shared and the next
+// slot's Init() (or FinishCue(), for OH) is about to run/read it.
+static void AdvanceRenderVoiceSlot( _drumMachineAlgorithm* pThis, bool wasCaptured )
+{
+	_drumMachineAlgorithm_DTC* dtc = pThis->dtc;
+	if ( pThis->renderVoiceSlot == kSlotBD )
+	{
+		pThis->bdFrozenNumFrames = wasCaptured ? ShadowKick( dtc ).frozenNumFrames : 0;
+		pThis->bdFrozenParamHash = wasCaptured ? ShadowKick( dtc ).frozenParamHash : 0;
+	}
+	else if ( pThis->renderVoiceSlot == kSlotSD )
+	{
+		pThis->sdFrozenNumFrames = wasCaptured ? ShadowSnare( dtc ).frozenNumFrames : 0;
+		pThis->sdFrozenParamHash = wasCaptured ? ShadowSnare( dtc ).frozenParamHash : 0;
+	}
+	else if ( pThis->renderVoiceSlot == kSlotCH )
+	{
+		pThis->chFrozenNumFrames = wasCaptured ? ShadowHat( dtc ).frozenNumFrames : 0;
+		pThis->chFrozenParamHash = wasCaptured ? ShadowHat( dtc ).frozenParamHash : 0;
+	}
+	else	// kSlotOH
+	{
+		pThis->ohSkipped = !wasCaptured;
+	}
+
+	int next = pThis->renderVoiceSlot + 1;
+	if ( next > kSlotOH )
+		FinishCue( pThis );
+	else
+		pThis->renderVoiceSlot = next;
+}
+
+// Called once per block from step() - see this section's top comment.
+static void ProcessRenderVoice( _drumMachineAlgorithm* pThis, int numFrames )
+{
+#if PRERENDER_LOGIC_ENABLED
+	if ( pThis->cuedPresetSlot < 0 || pThis->renderVoiceSlot < 0 )
+		return;
+
+	int cuedSlot = pThis->cuedPresetSlot;
+	int slot = pThis->renderVoiceSlot;
+
+	if ( CuedParam( pThis, cuedSlot, kSampleMixParamForSlot[slot] ) > 0 )
+	{
+		// Sample-layered - not supported for prerendering (see this
+		// section's top comment) - skip straight to the next slot without
+		// ever capturing anything for this one.
+		AdvanceRenderVoiceSlot( pThis, false );
+		return;
+	}
+
+	bool done;
+	if ( slot == kSlotBD )
+		done = RenderShadowKick( pThis, cuedSlot, !ShadowKick( pThis->dtc ).freezeCapturing, numFrames );
+	else if ( slot == kSlotSD )
+		done = RenderShadowSnare( pThis, cuedSlot, !ShadowSnare( pThis->dtc ).freezeCapturing, numFrames );
+	else
+		done = RenderShadowHat( pThis, cuedSlot, !ShadowHat( pThis->dtc ).freezeCapturing, numFrames, slot == kSlotOH );
+
+	if ( done )
+		AdvanceRenderVoiceSlot( pThis, true );
+#else
+	(void)pThis; (void)numFrames;
+#endif
+}
+
+// Called from the preset menu's Load action (see customUi()) instead of
+// calling LoadPreset() directly whenever Prerender is enabled - kicks off
+// the background capture sequence above rather than switching immediately.
+// Prerender is its own standalone feature (a "silent preload on preset
+// switch," independent of whatever Auto Freeze is doing to the *currently
+// loaded* preset's voices) - it does NOT require Auto Freeze Mode to also
+// be non-None. Auto Freeze Mode is only reused here for its *scope*
+// (whether BD is included or preserved-live) when it's actually set to
+// something; if it's None, Prerender still runs, defaulting to "All" scope
+// (there's no other scope to fall back to, and no reason to disable
+// Prerender just because the separate Auto Freeze feature happens to be
+// off).
+static void CuePreset( _drumMachineAlgorithm* pThis, int slot )
+{
+#if PRERENDER_LOGIC_ENABLED
+	if ( !pThis->v[ kParamPrerenderEnabled ] )
+	{
+		LoadPreset( pThis, slot );
+		return;
+	}
+
+	int autoFreezeMode = pThis->v[ kParamAutoFreezeMode ];
+	pThis->cuedPresetSlot = slot;
+	int startSlot = ( autoFreezeMode == kAutoFreezeSdChOh ) ? kSlotSD : kSlotBD;
+	pThis->renderVoiceSlot = startSlot;
+	// Force selfTrig = true on the very next ProcessRenderVoice() call
+	// regardless of what an interrupted previous cue left behind (re-cueing
+	// before an in-flight cue finishes is allowed) - freezeCapturing sits at
+	// the same offset (inherited from _drumVoicePost) no matter which of the
+	// 3 shadow voice types last touched shadowVoiceStorage, so a single
+	// write here covers all of them - see shadowVoiceStorage's comment.
+	ShadowKick( pThis->dtc ).freezeCapturing = false;
+	pThis->bdFrozenNumFrames = 0;
+	pThis->sdFrozenNumFrames = 0;
+	pThis->chFrozenNumFrames = 0;
+	pThis->ohSkipped = false;
+#else
+	LoadPreset( pThis, slot );
+#endif
+}
+#else
+// DIAGNOSTIC (temporary) - see PRERENDER_SHADOW_ENABLED's comment. Stubs so
+// the two call sites outside this block (customUi()'s preset Load action,
+// step()'s per-block call) still compile - Prerender itself is inert while
+// this is 0; every preset load just falls back to a normal live LoadPreset().
+static void ProcessRenderVoice( _drumMachineAlgorithm* pThis, int numFrames ) { (void)pThis; (void)numFrames; }
+static void CuePreset( _drumMachineAlgorithm* pThis, int slot )
+{
+	LoadPreset( pThis, slot );
+}
+#endif
+
 // Rough estimate of this algorithm instance's own CPU cost, as a % of the
 // real-time audio budget for one step() block - purely a self-diagnostic
 // display value (see cpuPercent's own comment/DrawHeader()), never read by
@@ -5744,6 +6830,7 @@ static float MeasureCpuPercent( float previous, uint32_t cyclesStart, uint32_t c
 }
 
 static void AdvanceFreezeSequence( _drumMachineAlgorithm* pThis );
+static void AdvanceAutoFreeze( _drumMachineAlgorithm* pThis );
 
 void 	step( _NT_algorithm* self, float* busFrames, int numFramesBy4 )
 {
@@ -5820,9 +6907,18 @@ void 	step( _NT_algorithm* self, float* busFrames, int numFramesBy4 )
 	uint32_t voiceCyclesTotal = 0;
 	uint32_t vc0;
 
+	// Captured before ProcessKick() consumes/clears the real flag - Rumble
+	// has no MIDI note of its own, it only ever reacts to BD's own trigger
+	// (see ProcessRumble()'s comment).
+	bool bdTrig = pThis->dtc->kick.pendingTrigger;
+
 	vc0 = pThis->fxProfiling ? NT_getCpuCycleCount() : 0;
 	ProcessKick( pThis, busFrames, numFrames );
 	if ( pThis->fxProfiling ) voiceCyclesTotal += NT_getCpuCycleCount() - vc0;
+
+	// Runs right after ProcessKick() so BD's fresh per-block envelope level
+	// is available this same block for Sidechain mode.
+	ProcessRumble( pThis, busFrames, numFrames, bdTrig );
 
 	vc0 = pThis->fxProfiling ? NT_getCpuCycleCount() : 0;
 	ProcessSnare( pThis, busFrames, numFrames );
@@ -5837,6 +6933,8 @@ void 	step( _NT_algorithm* self, float* busFrames, int numFramesBy4 )
 	if ( pThis->fxProfiling ) voiceCyclesTotal += NT_getCpuCycleCount() - vc0;
 
 	AdvanceFreezeSequence( pThis );
+	AdvanceAutoFreeze( pThis );
+	ProcessRenderVoice( pThis, numFrames );
 
 	if ( pThis->fxProfiling )
 	{
@@ -5996,7 +7094,30 @@ static void SavePreset( _drumMachineAlgorithm* pThis, int slot )
 // other kit parameter is set instantly too (so the displayed value/bar
 // jumps immediately, same as any other edit) but ramps the actual
 // DSP-facing smoothed value over ~1.5s - see AdvanceSmoothers()/Smoothed().
-static void LoadPreset( _drumMachineAlgorithm* pThis, int slot )
+// `fromAudioContext` - see the forward declaration's comment: selects
+// NT_setParameterFromAudio() (real-time-safe, for FinishCue()'s call from
+// inside step()) instead of the usual NT_setParameterFromUi() (every other
+// caller - a direct customUi() action).
+// Calls NT_setParameterFromAudio()/NT_setParameterFromUi() directly (never
+// stored as a function pointer) - see LoadPreset()'s comment: this
+// platform's plugin loader patches direct-call relocations to resolve
+// NT_* symbols, but doesn't resolve one taken as a data value (a function
+// pointer assigned `NT_setParameterFromUi` rather than calling it), which
+// showed up on hardware as "unresolved symbol NT_setParameterFromUi" and
+// failed the *entire* plugin to load (matching this project's established
+// libm-symbol precedent: any single unresolved reference anywhere in the
+// file breaks loading altogether, not just the one call site) - this is
+// what broke even old, pre-Prerender saved presets that never touch this
+// feature at all.
+static inline void SetPresetParam( int algIdx, uint32_t p, int16_t value, bool fromAudioContext )
+{
+	if ( fromAudioContext )
+		NT_setParameterFromAudio( algIdx, p, value );
+	else
+		NT_setParameterFromUi( algIdx, p, value );
+}
+
+static void LoadPreset( _drumMachineAlgorithm* pThis, int slot, bool fromAudioContext )
 {
 	if ( !pThis->presetBankValid[slot] )
 		return;
@@ -6005,12 +7126,18 @@ static void LoadPreset( _drumMachineAlgorithm* pThis, int slot )
 
 	int algIdx = NT_algorithmIndex( pThis );
 	uint32_t off = NT_parameterOffset();
+	// deferSampleLoad - see its own comment: fromAudioContext means this call
+	// is FinishCue()'s, from inside step()'s call graph - StartSampleLoad()'s
+	// synchronous SD-card read has no documented real-time-safety guarantee,
+	// so it (and parameterChanged()'s own reaction to kParamSampleXX below)
+	// must not run in that case.
+	pThis->deferSampleLoad = fromAudioContext;
 
 	static const int kModelParams[kNumSlots] = { kParamModelBD, kParamModelSD, kParamModelCH, kParamModelOH };
 	for ( int i=0; i<kNumSlots; ++i )
 	{
 		int p = kModelParams[i];
-		NT_setParameterFromUi( algIdx, p + off, pThis->presetBank[slot][ p - kFirstKitParam ] );
+		SetPresetParam( algIdx, p + off, pThis->presetBank[slot][ p - kFirstKitParam ], fromAudioContext );
 	}
 
 	pThis->loadingPreset++;
@@ -6023,7 +7150,7 @@ static void LoadPreset( _drumMachineAlgorithm* pThis, int slot )
 		s.target = (float)newValue;
 		s.samplesRemaining = (int)rampSamples;
 		s.increment = ( s.target - s.current ) / rampSamples;
-		NT_setParameterFromUi( algIdx, p + off, newValue );
+		SetPresetParam( algIdx, p + off, newValue, fromAudioContext );
 	}
 	pThis->loadingPreset--;
 
@@ -6033,7 +7160,7 @@ static void LoadPreset( _drumMachineAlgorithm* pThis, int slot )
 	for ( int i=0; i<kNumModParams; ++i )
 	{
 		int p = ModParamAt(i);
-		NT_setParameterFromUi( algIdx, p + off, pThis->modBank[slot][i] );
+		SetPresetParam( algIdx, p + off, pThis->modBank[slot][i], fromAudioContext );
 	}
 
 	// parameterChanged()'s callback timing for changes originating from our
@@ -6041,11 +7168,16 @@ static void LoadPreset( _drumMachineAlgorithm* pThis, int slot )
 	// SetParam()'s matching comment) - Sample's side effect (kicking off the
 	// actual SD card read) can't be left to chance the way the other
 	// kModParams entries can (none of which have a load-time side effect),
-	// so explicitly (re)start each slot's load here regardless.
-	StartSampleLoad( pThis, kSlotBD );
-	StartSampleLoad( pThis, kSlotSD );
-	StartSampleLoad( pThis, kSlotCH );
-	StartSampleLoad( pThis, kSlotOH );
+	// so explicitly (re)start each slot's load here regardless - except when
+	// fromAudioContext, where it's deferred instead (see deferSampleLoad).
+	if ( !fromAudioContext )
+	{
+		StartSampleLoad( pThis, kSlotBD );
+		StartSampleLoad( pThis, kSlotSD );
+		StartSampleLoad( pThis, kSlotCH );
+		StartSampleLoad( pThis, kSlotOH );
+	}
+	pThis->deferSampleLoad = false;
 
 	pThis->potHasLastPos[0] = pThis->potHasLastPos[1] = pThis->potHasLastPos[2] = false;
 	pThis->potAccum[0] = pThis->potAccum[1] = pThis->potAccum[2] = 0.0f;
@@ -6117,43 +7249,39 @@ static _drumVoicePost& VoiceForSlot( _drumMachineAlgorithm* pThis, int slot )
 	return pThis->dtc->openHat;
 }
 
-// "Freeze" - the preset menu's 4th option, alongside Load/Save/New. Captures
-// one slot at a time (BD, then SD, then CH, then OH - see freezeSeqSlot's
-// comment) rather than arming all 4 simultaneously, so a fast pattern only
-// ever has one voice dropping hits (see TriggerSlot()'s comment) at once
-// instead of all 4 at the same time. Operates on whatever kit is *currently
-// loaded*, not an arbitrary bank slot, since frozen audio is session-local
-// and was never part of presetBank/modBank in the first place. Clears any
-// existing frozen/captured state on all 4 immediately so arming always
-// means "about to capture fresh live hits", never "still showing stale
-// frozen audio while waiting".
-static void ArmFreeze( _drumMachineAlgorithm* pThis )
+// "Freeze" - the preset menu's 4th option, alongside Load/Save/New (always
+// called with startSlot=kSlotBD from there - see customUi()). Also the
+// engine behind Auto Freeze (see AdvanceAutoFreeze(), which calls this with
+// startSlot=kSlotSD for the "SD/CH/OH" scope, leaving BD alone/always live).
+// Captures one slot at a time (see freezeSeqSlot's comment) rather than
+// arming all of them simultaneously, so a fast pattern only ever has one
+// voice dropping hits (see TriggerSlot()'s comment) at once. Operates on
+// whatever kit is *currently loaded*, not an arbitrary bank slot, since
+// frozen audio is session-local and was never part of presetBank/modBank in
+// the first place. Clears any existing frozen/captured state on every
+// slot >= startSlot immediately so arming always means "about to capture
+// fresh live hits", never "still showing stale frozen audio while waiting" -
+// slots *before* startSlot are left completely untouched.
+static void ArmFreeze( _drumMachineAlgorithm* pThis, int startSlot )
 {
-	pThis->dtc->kick.freezeArmed = false;
-	pThis->dtc->kick.freezeCapturing = false;
-	pThis->dtc->kick.frozen = false;
-	pThis->dtc->kick.frozenNumFrames = 0;
-	pThis->dtc->snare.freezeArmed = false;
-	pThis->dtc->snare.freezeCapturing = false;
-	pThis->dtc->snare.frozen = false;
-	pThis->dtc->snare.frozenNumFrames = 0;
-	pThis->dtc->closedHat.freezeArmed = false;
-	pThis->dtc->closedHat.freezeCapturing = false;
-	pThis->dtc->closedHat.frozen = false;
-	pThis->dtc->closedHat.frozenNumFrames = 0;
-	pThis->dtc->openHat.freezeArmed = false;
-	pThis->dtc->openHat.freezeCapturing = false;
-	pThis->dtc->openHat.frozen = false;
-	pThis->dtc->openHat.frozenNumFrames = 0;
+	for ( int s=startSlot; s<=kSlotOH; ++s )
+	{
+		_drumVoicePost& v = VoiceForSlot( pThis, s );
+		v.freezeArmed = false;
+		v.freezeCapturing = false;
+		v.frozen = false;
+		v.frozenNumFrames = 0;
+	}
 
-	pThis->freezeSeqSlot = kSlotBD;
-	VoiceForSlot( pThis, kSlotBD ).freezeArmed = true;
+	pThis->freezeSeqSlot = startSlot;
+	VoiceForSlot( pThis, startSlot ).freezeArmed = true;
 }
 
 // Called once per audio block (see step()'s tail) - watches the slot
 // currently capturing (freezeSeqSlot) and, the moment it finalizes
-// (frozen flips true), arms the next slot in BD->SD->CH->OH order. -1 means
-// no sequence is in progress (either never armed, or OH has finished).
+// (frozen flips true), arms the next slot up to kSlotOH. -1 means no
+// sequence is in progress (either never armed, or the last slot in this
+// sequence has finished).
 static void AdvanceFreezeSequence( _drumMachineAlgorithm* pThis )
 {
 	if ( pThis->freezeSeqSlot < 0 )
@@ -6168,6 +7296,37 @@ static void AdvanceFreezeSequence( _drumMachineAlgorithm* pThis )
 	}
 	pThis->freezeSeqSlot = nextSlot;
 	VoiceForSlot( pThis, nextSlot ).freezeArmed = true;
+}
+
+// Auto Freeze - see kAutoFreezeXxx's comment. Called once per block from
+// step(), right after AdvanceFreezeSequence(). Whenever no capture is
+// currently in progress (freezeSeqSlot == -1) and at least one in-scope
+// voice isn't already frozen or armed (e.g. because a parameter edit just
+// un-froze it - see each ProcessXxx()'s un-freeze check), (re)starts a fresh
+// ArmFreeze() sequence over exactly the selected scope - making Freeze
+// fully self-maintaining with no user action, on top of (not instead of)
+// the manual preset-menu action.
+static void AdvanceAutoFreeze( _drumMachineAlgorithm* pThis )
+{
+	int mode = pThis->v[ kParamAutoFreezeMode ];
+	if ( mode == kAutoFreezeNone )
+		return;
+	if ( pThis->freezeSeqSlot != -1 )
+		return;
+
+	int startSlot = ( mode == kAutoFreezeAll ) ? kSlotBD : kSlotSD;
+	bool anyNeeds = false;
+	for ( int s=startSlot; s<=kSlotOH; ++s )
+	{
+		_drumVoicePost& v = VoiceForSlot( pThis, s );
+		if ( !v.frozen && !v.freezeArmed )
+		{
+			anyNeeds = true;
+			break;
+		}
+	}
+	if ( anyNeeds )
+		ArmFreeze( pThis, startSlot );
 }
 
 // Resolves the route mapping `source` to (concept, slot) for quick-edit
@@ -6308,13 +7467,13 @@ void	customUi( _NT_algorithm* self, const _NT_uiData& data )
 		if ( ( data.controls & kNT_encoderButtonR ) && !( data.lastButtons & kNT_encoderButtonR ) )
 		{
 			if ( pThis->presetMenuAction == 0 )
-				LoadPreset( pThis, pThis->presetMenuIndex );
+				CuePreset( pThis, pThis->presetMenuIndex );
 			else if ( pThis->presetMenuAction == 1 )
 				SavePreset( pThis, pThis->presetMenuIndex );
 			else if ( pThis->presetMenuAction == 2 )
 				NewPreset( pThis );
 			else
-				ArmFreeze( pThis );	// operates on the currently-loaded kit, presetMenuIndex is irrelevant here
+				ArmFreeze( pThis, kSlotBD );	// operates on the currently-loaded kit, presetMenuIndex is irrelevant here
 			pThis->presetMenuOpen = false;
 		}
 		return;	// preset menu owns every claimed control while it's open
@@ -6459,6 +7618,59 @@ void	customUi( _NT_algorithm* self, const _NT_uiData& data )
 		// each stage's own bar page instead - see the bar-page branch below).
 		if ( ( data.controls & kNT_encoderButtonR ) && !( data.lastButtons & kNT_encoderButtonR ) )
 			pThis->fxProfiling = !pThis->fxProfiling;
+	}
+	else if ( kPageType[pThis->currentPage] == kPageTypeRumble )
+	{
+		// Rumble has no BD/SD/CH/OH slot dimension, so its 4 controls map to
+		// 4 different parameters instead of 4 slots of one concept - see
+		// kPageTypeRumble's comment. Pot L = Type, Pot C = Intensity,
+		// Encoder R = Pitch Type (cycled one step per turn, same idiom as
+		// the preset menu's Load/Save/New/Freeze choice), Pot R = Pitch
+		// Value (its meaning depends on Pitch Type - see
+		// RumblePitchFrequency()'s comment).
+		if ( data.controls & kNT_potL )
+		{
+			int newValue;
+			if ( PotRelativeUpdate( pThis, 0, data.pots[0], 0, kNumRumbleTypes - 1, pThis->v[kParamRumbleType], &newValue ) )
+				SetParam( pThis, kParamRumbleType, newValue );
+		}
+		if ( data.controls & kNT_potC )
+		{
+			int newValue;
+			if ( PotRelativeUpdate( pThis, 1, data.pots[1], 0, 100, pThis->v[kParamRumbleIntensity], &newValue ) )
+				SetParam( pThis, kParamRumbleIntensity, newValue );
+		}
+		if ( data.encoders[1] != 0 )
+		{
+			int dir = data.encoders[1] > 0 ? 1 : -1;
+			int newValue = ( pThis->v[kParamRumblePitchType] + dir + kNumRumblePitchTypes ) % kNumRumblePitchTypes;
+			SetParam( pThis, kParamRumblePitchType, newValue );
+		}
+		if ( data.controls & kNT_potR )
+		{
+			int newValue;
+			if ( PotRelativeUpdate( pThis, 2, data.pots[2], 0, 100, pThis->v[kParamRumblePitchValue], &newValue ) )
+				SetParam( pThis, kParamRumblePitchValue, newValue );
+		}
+	}
+	else if ( kPageType[pThis->currentPage] == kPageTypeRumbleEnv )
+	{
+		// Pot L = Env Type (Fixed/Sidechain), Pot C = Env Time (dual meaning
+		// per Env Type - see ProcessRumble()'s comment); Encoder R/Pot R are
+		// unused here - the remaining screen space is a live envelope-level
+		// graph instead (see DrawRumbleEnvPage()).
+		if ( data.controls & kNT_potL )
+		{
+			int newValue;
+			if ( PotRelativeUpdate( pThis, 0, data.pots[0], 0, kNumRumbleEnvTypes - 1, pThis->v[kParamRumbleEnvType], &newValue ) )
+				SetParam( pThis, kParamRumbleEnvType, newValue );
+		}
+		if ( data.controls & kNT_potC )
+		{
+			int newValue;
+			if ( PotRelativeUpdate( pThis, 1, data.pots[1], 0, 100, pThis->v[kParamRumbleEnvTime], &newValue ) )
+				SetParam( pThis, kParamRumbleEnvTime, newValue );
+		}
 	}
 	else if ( kPageType[pThis->currentPage] == kPageTypeList )
 	{
@@ -7003,6 +8215,24 @@ static void DrawPresetMenu( _drumMachineAlgorithm* pThis )
 	}
 	NT_drawShapeI( kNT_line, 0, kHeaderDividerY, 255, kHeaderDividerY, 4 );
 
+	// Preset Prerender progress - see CuePreset()'s comment. Shown whenever
+	// a cue is in flight, regardless of menu stage/selection, since the
+	// background capture keeps running even if the menu gets closed and
+	// reopened mid-cue.
+	if ( pThis->cuedPresetSlot >= 0 )
+	{
+		char buff[40];
+		strcpy( buff, "PRERENDERING " );
+		strcat( buff, pThis->presetName[ pThis->cuedPresetSlot ] );
+		if ( pThis->renderVoiceSlot >= 0 )
+		{
+			strcat( buff, " (" );
+			strcat( buff, kSlotNames[ pThis->renderVoiceSlot ] );
+			strcat( buff, ")" );
+		}
+		NT_drawText( 251, 7, buff, 15, kNT_textRight, kNT_textTiny );
+	}
+
 	// Scrolling window - kNumPresets (64) doesn't fit in the ~5 visible rows,
 	// so without this the selection could scroll right off screen with no
 	// indication (matches the same fix already applied to DrawSetupPage()).
@@ -7263,6 +8493,83 @@ static void DrawChainOverviewPage( _drumMachineAlgorithm* pThis )
 	NT_drawText( 252, 59, pThis->fxProfiling ? "PROFILING" : "ENC R: PROFILE", pThis->fxProfiling ? 15 : 6, kNT_textRight, kNT_textTiny );
 }
 
+// Rumble - see kPageTypeRumble's comment for why this isn't a plain bar
+// page (no BD/SD/CH/OH slot dimension). 4 boxes, one per control, same
+// visual language as DrawBarPage()'s per-slot boxes but each labelled with
+// its own parameter name instead of a slot name.
+static void DrawRumblePage( _drumMachineAlgorithm* pThis )
+{
+	DrawHeader( pThis, "RUMBLE" );
+
+	constexpr int y0 = kHeaderDividerY + 4;
+	constexpr int y1 = 52;
+	constexpr int barWidth = 56;
+	constexpr int gap = 8;
+	constexpr int x0 = ( 256 - 4 * barWidth - 3 * gap ) / 2;
+
+	int type = pThis->v[ kParamRumbleType ];
+	int intensity = pThis->v[ kParamRumbleIntensity ];
+	int pitchType = pThis->v[ kParamRumblePitchType ];
+	int pitchValue = pThis->v[ kParamRumblePitchValue ];
+
+	const char* labels[4] = { "TYPE", "INTENSITY", "PITCH TYPE", "PITCH" };
+	char valueBuff[4][16];
+	strcpy( valueBuff[0], kEnumRumbleType[type] );
+	NT_intToString( valueBuff[1], intensity );
+	strcpy( valueBuff[2], kEnumRumblePitchType[pitchType] );
+	NT_intToString( valueBuff[3], pitchValue );
+
+	for ( int i=0; i<4; ++i )
+	{
+		int bx0 = x0 + i * ( barWidth + gap );
+		int bx1 = bx0 + barWidth;
+		NT_drawShapeI( kNT_box, bx0, y0, bx1, y1, 12 );
+		NT_drawText( ( bx0 + bx1 ) / 2, ( y0 + y1 ) / 2 - 2, valueBuff[i], 15, kNT_textCentre, kNT_textTiny );
+		NT_drawText( ( bx0 + bx1 ) / 2, y1 + 8, labels[i], 8, kNT_textCentre, kNT_textTiny );
+	}
+}
+
+// Rumble Env - Env Type/Time on the left 2 boxes (same idiom as
+// DrawRumblePage()); the right half is a live envelope-level graph (same
+// drawing convention as DrawEnvelopesPage()) so Fixed mode's shape and
+// Sidechain mode's live duck/swell are both visible at a glance.
+static void DrawRumbleEnvPage( _drumMachineAlgorithm* pThis )
+{
+	DrawHeader( pThis, "RUMBLE ENV" );
+
+	constexpr int y0 = kHeaderDividerY + 4;
+	constexpr int y1 = 52;
+	constexpr int barWidth = 56;
+	constexpr int gap = 8;
+	constexpr int x0 = 12;
+
+	int envType = pThis->v[ kParamRumbleEnvType ];
+	int envTime = pThis->v[ kParamRumbleEnvTime ];
+
+	const char* labels[2] = { "ENV TYPE", envType == kRumbleEnvSidechain ? "DUCK DEPTH" : "ENV TIME" };
+	char valueBuff[2][16];
+	strcpy( valueBuff[0], kEnumRumbleEnvType[envType] );
+	NT_intToString( valueBuff[1], envTime );
+
+	for ( int i=0; i<2; ++i )
+	{
+		int bx0 = x0 + i * ( barWidth + gap );
+		int bx1 = bx0 + barWidth;
+		NT_drawShapeI( kNT_box, bx0, y0, bx1, y1, 12 );
+		NT_drawText( ( bx0 + bx1 ) / 2, ( y0 + y1 ) / 2 - 2, valueBuff[i], 15, kNT_textCentre, kNT_textTiny );
+		NT_drawText( ( bx0 + bx1 ) / 2, y1 + 8, labels[i], 8, kNT_textCentre, kNT_textTiny );
+	}
+
+	// Live level graph, right half of the screen.
+	constexpr int gx0 = 148;
+	constexpr int gx1 = 252;
+	NT_drawShapeI( kNT_box, gx0, y0, gx1, y1, 8 );
+	int fillTop = y1 - (int)( pThis->rumbleEnvLevel * ( y1 - y0 ) );
+	CONSTRAIN( fillTop, y0, y1 );
+	NT_drawShapeI( kNT_rectangle, gx0 + 1, fillTop, gx1 - 1, y1 - 1, 12 );
+	NT_drawText( ( gx0 + gx1 ) / 2, y1 + 8, "LEVEL", 8, kNT_textCentre, kNT_textTiny );
+}
+
 bool	draw( _NT_algorithm* self )
 {
 	_drumMachineAlgorithm* pThis = (_drumMachineAlgorithm*)self;
@@ -7283,6 +8590,10 @@ bool	draw( _NT_algorithm* self )
 		DrawEqSculptPage( pThis );
 	else if ( pThis->currentPage == kPageChainOverview )
 		DrawChainOverviewPage( pThis );
+	else if ( pThis->currentPage == kPageRumble )
+		DrawRumblePage( pThis );
+	else if ( pThis->currentPage == kPageRumbleEnv )
+		DrawRumbleEnvPage( pThis );
 	else
 		DrawBarPage( pThis );
 
