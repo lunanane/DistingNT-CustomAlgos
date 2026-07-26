@@ -435,6 +435,14 @@ enum
 	// CuePreset()). Not modulatable, not per-slot. Appended at the very end.
 	kParamPrerenderEnabled,
 
+	// Sync Bars - see kEnumSyncBars's comment (SyncLoopBars()) - how many
+	// bars Prerender's scheduling loop covers. Confirmed working at 214
+	// total parameters on hardware.
+	kParamSyncBars,
+
+	// Sync Mode - see kEnumSyncMode's comment (Wait/Strict).
+	kParamSyncMode,
+
 	kNumParams,
 };
 
@@ -534,6 +542,24 @@ static_assert( ARRAY_SIZE(kEnumWaveshaperType) == kNumWaveshaperTypes, "" );
 enum { kAutoFreezeNone, kAutoFreezeAll, kAutoFreezeSdChOh, kNumAutoFreezeModes };
 static char const * const kEnumAutoFreezeMode[] = { "None", "All", "SD/CH/OH" };
 static_assert( ARRAY_SIZE(kEnumAutoFreezeMode) == kNumAutoFreezeModes, "" );
+
+// Preset Prerender's sync loop length - see SyncLoopBars()/kParamSyncBars.
+// Confirmed working on hardware at 214 total parameters (see
+// kParamPrerenderEnabled's comment on the old 213/214 finding) - that old
+// limit evidently doesn't hold against the current DTC/DRAM layout, so
+// kParamSyncMode below is safe to add as its own 215th parameter too.
+enum { kSyncBars1, kSyncBars2, kSyncBars4, kNumSyncBarOptions };
+static char const * const kEnumSyncBars[] = { "1 Bar", "2 Bars", "4 Bars" };
+static_assert( ARRAY_SIZE(kEnumSyncBars) == kNumSyncBarOptions, "" );
+
+// Preset Prerender's switch-scheduling mode - see CheckCuedSwitch()'s Wait/
+// Strict branches. Wait (default) reproduces the original behavior exactly
+// (push the boundary out another loop if capture isn't done yet). Strict
+// always switches exactly on schedule, force-finishing any slot that isn't
+// ready (falls back to a normal live swap for that slot only).
+enum { kSyncModeWait, kSyncModeStrict, kNumSyncModes };
+static char const * const kEnumSyncMode[] = { "Wait", "Strict" };
+static_assert( ARRAY_SIZE(kEnumSyncMode) == kNumSyncModes, "" );
 
 // Rumble Generator - see ProcessRumble()'s comment. Type 0 is "None" (the
 // whole generator is skipped entirely, not just silenced - same "0 = off,
@@ -849,6 +875,8 @@ static _NT_parameter parameters[] = {
 	{ .name = "Rumble stereo", .min = 0, .max = 1, .def = 0, .unit = kNT_unitEnum, .scaling = 0, .enumStrings = kEnumStereo },
 
 	{ .name = "Prerender", .min = 0, .max = 1, .def = 0, .unit = kNT_unitEnum, .scaling = 0, .enumStrings = kEnumOffOn },
+	{ .name = "Sync bars", .min = 0, .max = kNumSyncBarOptions - 1, .def = kSyncBars4, .unit = kNT_unitEnum, .scaling = 0, .enumStrings = kEnumSyncBars },
+	{ .name = "Sync mode", .min = 0, .max = kNumSyncModes - 1, .def = kSyncModeWait, .unit = kNT_unitEnum, .scaling = 0, .enumStrings = kEnumSyncMode },
 };
 
 static const uint8_t pageRouting[]   = { kParamOutBD, kParamOutBDMode, kParamStereoBD, kParamPanBD, kParamOutSD, kParamOutSDMode, kParamStereoSD, kParamPanSD, kParamOutCH, kParamOutCHMode, kParamStereoCH, kParamPanCH, kParamOutOH, kParamOutOHMode, kParamStereoOH, kParamPanOH, kParamRumbleOut, kParamRumbleOutMode, kParamRumbleStereo };
@@ -927,7 +955,7 @@ static void BuildModMatrixPage()
 // custom UI (and still a real, automatable _NT_parameter either way) -
 // nothing here deletes or hides a parameter, only its redundant standard-
 // menu page grouping.
-static const uint8_t pageAutoFreeze[] = { kParamAutoFreezeMode, kParamPrerenderEnabled };
+static const uint8_t pageAutoFreeze[] = { kParamAutoFreezeMode, kParamPrerenderEnabled, kParamSyncBars, kParamSyncMode };
 
 static const _NT_parameterPage pages[] = {
 	{ .name = "Routing", .numParams = ARRAY_SIZE(pageRouting), .params = pageRouting },
@@ -1192,6 +1220,14 @@ static const uint8_t kModParams[] = {
 	kParamAttackModeBD, kParamAttackModeSD, kParamAttackModeCH, kParamAttackModeOH,
 	kParamSrCrushModeBD, kParamSrCrushModeSD, kParamSrCrushModeCH, kParamSrCrushModeOH,
 	kParamDriveTypeBD, kParamDriveTypeSD, kParamDriveTypeCH, kParamDriveTypeOH,
+	// Rumble - appended at the very end (never inserted mid-range - see
+	// kParamFoldBD's comment for why that's a hard rule for anything that
+	// lands in a saved preset's modBank slot). Previously not saved at all;
+	// Intensity gets its own dedicated smoother (see rumbleIntensitySmoother)
+	// since it isn't part of the kFirstSmoothedParam contiguous range - the
+	// rest snap instantly like every other kModParams entry.
+	kParamRumbleType, kParamRumbleEnvType, kParamRumbleEnvTime,
+	kParamRumblePitchType, kParamRumblePitchValue, kParamRumbleIntensity,
 };
 enum { kNumModRouteParamsTotal = kNumModRoutes * kNumModRouteParams };
 enum { kNumModParams = ARRAY_SIZE(kModParams) + kNumModRouteParamsTotal };
@@ -2615,6 +2651,18 @@ struct _drumMachineAlgorithm : public _NT_algorithm
 	_paramSmoother smoother[kNumSmoothedParams];
 	bool smoothersInitialized;
 
+	// Rumble Intensity's own smoother - not part of the contiguous
+	// kFirstSmoothedParam range (see kParamRumbleIntensity's kModParams
+	// comment) so it can't just join smoother[] above without violating
+	// the append-only/contiguous-range rule. Advanced identically to that
+	// array (see AdvanceSmoothers()); set up in LoadPreset() from
+	// modBank's saved value. The other 5 Rumble params snap instantly on
+	// load like every other kModParams entry - only Intensity needs a
+	// smoothed ramp, since it's the one most likely to be heard changing
+	// (a sudden jump in sub-bass level reads as a glitch; a fast ramp
+	// doesn't).
+	_paramSmoother rumbleIntensitySmoother;
+
 	// Recomputed fresh every block, before any voice processing (see
 	// step()) - true if at least one of the kNumModRoutes routes has a
 	// real Source (not None). Lets ModulatedViaMatrix() skip its own
@@ -2708,13 +2756,6 @@ struct _drumMachineAlgorithm : public _NT_algorithm
 	int presetMenuAction;	// 0 = Load, 1 = Save
 	int presetMenuIndex;	// which of kNumPresets slots is selected
 
-	// Freeze sequencing (see ArmFreeze()'s comment) - captures one slot at a
-	// time (BD, then SD, then CH, then OH) rather than all 4 at once, so a
-	// fast pattern only ever has to drop hits for one voice's capture window
-	// at a time. -1 = no freeze sequence in progress; otherwise the slot
-	// (kSlotBD..kSlotOH) currently armed/capturing.
-	int freezeSeqSlot;
-
 	// Preset Prerender - see ProcessRenderVoice()'s comment. The "next
 	// preset" frozen-buffer pointers (DRAM, set once in construct() - see
 	// its matching comment) - kept here, not just as construct()-local
@@ -2734,8 +2775,7 @@ struct _drumMachineAlgorithm : public _NT_algorithm
 	// silently prerendered in the background (see CuePreset()).
 	int cuedPresetSlot;
 	// Which real slot (kSlotBD..kSlotOH) the render-voice is currently
-	// capturing for cuedPresetSlot, or -1 between cues/when Prerender is
-	// off. Mirrors freezeSeqSlot's role but for the shadow voices.
+	// capturing for cuedPresetSlot, or -1 between cues/when Prerender is off.
 	int renderVoiceSlot;
 	// Throttle counter for ProcessRenderVoice() - see kRenderVoiceThrottle's
 	// comment. Counts blocks since the shadow voice last actually rendered;
@@ -2870,15 +2910,24 @@ struct _drumMachineAlgorithm : public _NT_algorithm
 	uint32_t lastClockPulseSample;
 	bool hasClockPulse;
 	float samplesPerQuarterNote;
-	// Bar/beat position within a 4-bar loop, for the header HUD (see
-	// BarPhase()) and Prerender's bar-locked switch scheduling (see
-	// SamplesUntilNextBarBoundary()). 0..383 = 24 ppqn x 4 beats/bar x 4
-	// bars, wrapping every 4-bar loop - a fixed 4/4 assumption, since MIDI
-	// clock itself carries no time signature. Incremented on every 0xF8 in
-	// midiRealtime(); reset to 0 by Start (0xFA) but not Continue (0xFB),
-	// matching real MIDI transport semantics (Continue resumes from wherever
-	// playback left off, Start restarts the loop from its top).
+	// Bar/beat position within the current sync loop - Prerender's own
+	// bar-locked switch scheduling (see SamplesUntilNextBarBoundary()).
+	// Ranges 0..SyncLoopPulses(pThis)-1 (24 ppqn x 4 beats/bar x
+	// kParamSyncBars' configured bar count - see SyncLoopPulses()), wrapping
+	// every loop - a fixed 4/4 assumption, since MIDI clock itself carries
+	// no time signature. Incremented on every 0xF8 in midiRealtime(); reset
+	// to 0 by Start (0xFA) but not Continue (0xFB), matching real MIDI
+	// transport semantics (Continue resumes from wherever playback left
+	// off, Start restarts the loop from its top).
 	int barPulseCounter;
+	// Same idea as barPulseCounter, but always wraps at a fixed 4 bars
+	// (384 pulses) regardless of kParamSyncBars - drives the header HUD's
+	// sweep (see BarPhase()) only. Kept deliberately separate: a 4-bar
+	// visual reference is the standard beat-counting convention in techno,
+	// so the display stays useful for manually timing changes by ear even
+	// when Prerender itself is scheduled on a shorter (1 or 2 bar) loop -
+	// see BarPhase()'s comment.
+	int visualBarPulseCounter;
 	// True from Start/Continue (0xFA/0xFB), false from Stop (0xFC) - Stop
 	// was never handled before this (midiRealtime() only reset the LFO
 	// phases on Start/Continue and silently ignored 0xFC entirely).
@@ -2968,9 +3017,9 @@ struct _drumMachineAlgorithm : public _NT_algorithm
 	// actually changes as part of a Prerendered switch simply keeps
 	// whatever was previously loaded until the user next touches that
 	// slot's Sample parameter directly (a UI-context edit, always safe) -
-	// an accepted limitation, consistent with Prerender already not fully
-	// supporting the sample layer (see kSampleMixParamForSlot's use in
-	// ProcessRenderVoice()).
+	// an accepted limitation, separate from (and narrower than) whether
+	// Prerender captures the sample layer at all, which it now does in
+	// full (see ProcessRenderVoice()'s own comment).
 	bool deferSampleLoad;
 
 	// This algorithm instance's own CPU cost, as a smoothed percentage of
@@ -3068,6 +3117,19 @@ static int PrerenderMaxFrames()
 static int CrossfadeSamples()
 {
 	return (int)( 0.03f * NT_globals.sampleRate );
+}
+
+// First sample of the crossfade window - see CheckCuedSwitch()'s comment:
+// the fade needs to *complete* exactly at cuedTargetBoundarySample (so the
+// new preset's full attack lands cleanly on the downbeat), so it must
+// start CrossfadeSamples() earlier rather than at the boundary itself.
+// Clamped to 0 to guard the (extreme, ~30ms-of-session-ever) edge case of
+// cueing before sampleCounter has advanced far enough for the subtraction
+// to stay positive.
+static uint32_t CrossfadeStartSample( _drumMachineAlgorithm* pThis )
+{
+	uint32_t fade = (uint32_t)CrossfadeSamples();
+	return ( pThis->cuedTargetBoundarySample > fade ) ? ( pThis->cuedTargetBoundarySample - fade ) : 0;
 }
 
 // How long a voice's live parameters must sit unchanged before the
@@ -3498,7 +3560,6 @@ _NT_algorithm*	construct( const _NT_algorithmMemoryPtrs& ptrs, const _NT_algorit
 	alg->presetMenuStage = 0;
 	alg->presetMenuAction = 0;
 	alg->presetMenuIndex = 0;
-	alg->freezeSeqSlot = -1;
 	alg->deleteConfirmOpen = false;
 	alg->deleteConfirmSlot = 0;
 	alg->deleteConfirmChoice = 0;
@@ -3517,6 +3578,7 @@ _NT_algorithm*	construct( const _NT_algorithmMemoryPtrs& ptrs, const _NT_algorit
 	alg->hasClockPulse = false;
 	alg->samplesPerQuarterNote = 0.5f * (float)NT_globals.sampleRate;	// 120bpm fallback until a real clock arrives
 	alg->barPulseCounter = 0;
+	alg->visualBarPulseCounter = 0;
 	alg->clockRunning = false;
 	alg->lfo1Phase = 0.0f;
 	alg->lfo2Phase = 0.0f;
@@ -3557,6 +3619,11 @@ static void AdvanceSmoothers( _drumMachineAlgorithm* pThis, int numFrames )
 			pThis->smoother[i].increment = 0.0f;
 			pThis->smoother[i].samplesRemaining = 0;
 		}
+		float rv = (float)pThis->v[ kParamRumbleIntensity ];
+		pThis->rumbleIntensitySmoother.current = rv;
+		pThis->rumbleIntensitySmoother.target = rv;
+		pThis->rumbleIntensitySmoother.increment = 0.0f;
+		pThis->rumbleIntensitySmoother.samplesRemaining = 0;
 		pThis->smoothersInitialized = true;
 	}
 
@@ -3570,6 +3637,21 @@ static void AdvanceSmoothers( _drumMachineAlgorithm* pThis, int numFrames )
 		s.samplesRemaining -= step;
 		if ( s.samplesRemaining <= 0 )
 			s.current = s.target;	// snap exactly at the end, avoid float drift
+	}
+
+	// Rumble Intensity - see its own comment on the algorithm struct for why
+	// this is a separate field rather than one more entry in smoother[]
+	// above; advanced identically either way.
+	{
+		_paramSmoother& s = pThis->rumbleIntensitySmoother;
+		if ( s.samplesRemaining > 0 )
+		{
+			int step = std::min( s.samplesRemaining, numFrames );
+			s.current += s.increment * step;
+			s.samplesRemaining -= step;
+			if ( s.samplesRemaining <= 0 )
+				s.current = s.target;
+		}
 	}
 }
 
@@ -4229,14 +4311,14 @@ void	parameterChanged( _NT_algorithm* self, int p )
 	else if ( !pThis->deferSampleLoad && p == kParamSampleOH ) StartSampleLoad( pThis, kSlotOH );
 	else if ( p == kParamAutoFreezeMode )
 	{
-		// Whatever was in-flight belonged to the *previous* mode's scope -
-		// without this, switching modes mid-sequence leaves stale state
-		// stuck forever (e.g. arm under "All", switch to "SD/CH/OH" before
-		// BD's capture finishes: BD sits at freezeArmed=true indefinitely,
-		// and since AdvanceAutoFreeze() only proceeds when
-		// freezeSeqSlot==-1, that one stuck slot blocks the whole freeze
-		// system from progressing under the new mode at all).
-		pThis->freezeSeqSlot = -1;
+		// Whatever's currently frozen might now be outside the new mode's
+		// scope (e.g. BD, frozen under "All", switching to "SD/CH/OH" - see
+		// kAutoFreezeSdChOh's comment: BD stays always-live in that scope) -
+		// return it to live immediately rather than leaving it frozen just
+		// because the mode changed after the fact. In-scope slots are left
+		// completely untouched either way - AdvanceRecapture()'s own scan
+		// (and its debounce) already handles picking up anything newly in
+		// scope, on its own schedule, with no help needed here.
 		int mode = pThis->v[ kParamAutoFreezeMode ];
 		if ( mode != kAutoFreezeNone )
 		{
@@ -4244,23 +4326,8 @@ void	parameterChanged( _NT_algorithm* self, int p )
 			_drumVoicePost* voices[kNumSlots] = { &pThis->dtc->kick, &pThis->dtc->snare, &pThis->dtc->closedHat, &pThis->dtc->openHat };
 			for ( int s=kSlotBD; s<startSlot; ++s )
 			{
-				// Outside the new mode's scope (BD, when switching to
-				// SD/CH/OH) - must return to live *immediately*, not just
-				// stop being newly frozen going forward.
 				_drumVoicePost& v = *voices[s];
-				v.freezeArmed = false;
-				v.freezeCapturing = false;
 				v.frozen = false;
-			}
-			for ( int s=startSlot; s<=kSlotOH; ++s )
-			{
-				// In scope - clear any stale in-progress marker so a clean,
-				// correctly-scoped sequence can start next block. Leave
-				// `frozen` alone - already-valid captured audio doesn't
-				// need to be discarded just because the mode changed.
-				_drumVoicePost& v = *voices[s];
-				v.freezeArmed = false;
-				v.freezeCapturing = false;
 			}
 		}
 	}
@@ -4286,6 +4353,19 @@ void	parameterChanged( _NT_algorithm* self, int p )
 		// Load (see LoadPreset()) sets up a real ramp, and it leaves this
 		// alone via the loadingPreset guard above.
 		_paramSmoother& s = pThis->smoother[ p - kFirstSmoothedParam ];
+		s.current = s.target = (float)pThis->v[p];
+		s.increment = 0.0f;
+		s.samplesRemaining = 0;
+	}
+	else if ( p == kParamRumbleIntensity && !pThis->loadingPreset )
+	{
+		// Rumble Intensity's own smoother - see its comment on the algorithm
+		// struct. Same live-edit-snaps-instantly rule as kFirstSmoothedParam
+		// above, just outside that contiguous range - without this, turning
+		// the Intensity knob had no audible effect at all (ProcessRumble()
+		// reads the smoother, not v[] directly, and only LoadPreset() was
+		// updating it).
+		_paramSmoother& s = pThis->rumbleIntensitySmoother;
 		s.current = s.target = (float)pThis->v[p];
 		s.increment = 0.0f;
 		s.samplesRemaining = 0;
@@ -4345,6 +4425,29 @@ void	midiMessage( _NT_algorithm* self, uint8_t byte0, uint8_t byte1, uint8_t byt
 	}
 }
 
+// Number of bars in Preset Prerender's configured sync loop (kParamSyncBars) -
+// replaces what used to be a fixed 4-bar assumption throughout barPulseCounter/
+// BarPhase()/SamplesUntilNextBarBoundary()/CheckCuedSwitch()/CuePreset().
+static int SyncLoopBars( _drumMachineAlgorithm* pThis )
+{
+	static const int kBars[kNumSyncBarOptions] = { 1, 2, 4 };
+	return kBars[ pThis->v[ kParamSyncBars ] ];
+}
+
+// Total 24ppqn MIDI clock pulses in one configured sync loop - what
+// barPulseCounter wraps at (see its own comment).
+static int SyncLoopPulses( _drumMachineAlgorithm* pThis )
+{
+	return SyncLoopBars( pThis ) * 4 * 24;
+}
+
+// Same loop length in quarter notes - used wherever the scheduler needs to
+// push its target out by one further loop (CheckCuedSwitch(), CuePreset()).
+static float SyncLoopQuarterNotes( _drumMachineAlgorithm* pThis )
+{
+	return (float)( SyncLoopBars( pThis ) * 4 );
+}
+
 // Realtime MIDI messages (clock/start/stop) - a separate callback from
 // midiMessage()'s note handling. Drives the synced LFOs (see AdvanceLfos()).
 void	midiRealtime( _NT_algorithm* self, uint8_t byte )
@@ -4363,15 +4466,22 @@ void	midiRealtime( _NT_algorithm* self, uint8_t byte )
 		}
 		pThis->lastClockPulseSample = pThis->sampleCounter;
 		pThis->hasClockPulse = true;
-		// barPulseCounter's comment: 384 = 24 ppqn x 4 beats/bar x 4 bars.
-		pThis->barPulseCounter = ( pThis->barPulseCounter + 1 ) % 384;
+		// barPulseCounter's comment - wraps at SyncLoopPulses(), the
+		// configured (1/2/4-bar) sync loop length, not a fixed 4 bars.
+		pThis->barPulseCounter = ( pThis->barPulseCounter + 1 ) % SyncLoopPulses( pThis );
+		// visualBarPulseCounter's comment - always a fixed 4 bars (384
+		// pulses), independent of the setting above.
+		pThis->visualBarPulseCounter = ( pThis->visualBarPulseCounter + 1 ) % 384;
 	}
 	else if ( byte == 0xFA || byte == 0xFB )	// start / continue
 	{
 		pThis->lfo1Phase = 0.0f;
 		pThis->lfo2Phase = 0.0f;
-		if ( byte == 0xFA )	// Start restarts the 4-bar loop from its top; Continue resumes where it left off
+		if ( byte == 0xFA )	// Start restarts the sync loop from its top; Continue resumes where it left off
+		{
 			pThis->barPulseCounter = 0;
+			pThis->visualBarPulseCounter = 0;
+		}
 		pThis->clockRunning = true;
 	}
 	else if ( byte == 0xFC )	// stop - previously not handled at all
@@ -4389,23 +4499,29 @@ static float Bpm( _drumMachineAlgorithm* pThis )
 	return 60.0f * NT_globals.sampleRate / pThis->samplesPerQuarterNote;
 }
 
-// Fraction (0..1) through the current 4-bar loop - see barPulseCounter's
-// comment. Used by the header HUD's sweep (DrawHeader()) and (once
-// blinking is wired up) the "ready, waiting for the boundary" indicator.
+// Fraction (0..1) through a fixed 4-bar reference loop - see
+// visualBarPulseCounter's comment. Deliberately NOT tied to the actual
+// Prerender sync-loop length (kParamSyncBars/SyncLoopPulses()) - a 4-bar
+// visual reference is the standard beat-counting convention in techno, so
+// the header HUD's sweep stays a stable, familiar reference for manually
+// timing changes by ear regardless of what Prerender itself is scheduled
+// against.
 static float BarPhase( _drumMachineAlgorithm* pThis )
 {
-	return pThis->barPulseCounter / 384.0f;
+	return pThis->visualBarPulseCounter / 384.0f;
 }
 
-// Samples remaining until the next 4-bar boundary - what Preset Prerender's
-// scheduler (see CuePreset()'s targeting logic) compares its estimated
-// capture time against to decide whether to target the next boundary or
-// the one after. Accounts for the fractional time already elapsed since
-// the last clock pulse, not just whole-pulse counting, so this stays
-// accurate between pulses rather than only updating once every 1/24 beat.
+// Samples remaining until the next sync-loop boundary - what Preset
+// Prerender's scheduler (see CuePreset()'s targeting logic) compares its
+// estimated capture time against to decide whether to target the next
+// boundary or the one after. Accounts for the fractional time already
+// elapsed since the last clock pulse, not just whole-pulse counting, so
+// this stays accurate between pulses rather than only updating once every
+// 1/24 beat.
 static int SamplesUntilNextBarBoundary( _drumMachineAlgorithm* pThis )
 {
-	int pulsesRemaining = ( 384 - pThis->barPulseCounter ) % 384;
+	int loopPulses = SyncLoopPulses( pThis );
+	int pulsesRemaining = ( loopPulses - pThis->barPulseCounter ) % loopPulses;
 	float samplesPerPulse = pThis->samplesPerQuarterNote / 24.0f;
 	float samplesSinceLastPulse = (float)( pThis->sampleCounter - pThis->lastClockPulseSample );
 	float result = pulsesRemaining * samplesPerPulse - samplesSinceLastPulse;
@@ -5423,7 +5539,10 @@ static void ProcessRumble( _drumMachineAlgorithm* pThis, float* busFrames, int n
 	int pitchValue = pThis->v[ kParamRumblePitchValue ];
 	float freqHz = RumblePitchFrequency( pThis, pitchType, pitchValue );
 	float f0 = freqHz / plaits::kSampleRate;
-	float intensity = pThis->v[ kParamRumbleIntensity ] * 0.01f;
+	// Smoothed (see rumbleIntensitySmoother's comment), not read directly
+	// from v[] like Rumble's other params - avoids an audible jump on
+	// preset change while those still snap instantly.
+	float intensity = pThis->rumbleIntensitySmoother.current * 0.01f;
 
 	float* scratch = pThis->renderScratch;	// free again by this point - see ProcessKick()'s own use of it
 
@@ -6036,6 +6155,18 @@ static void ProcessKick( _drumMachineAlgorithm* pThis, float* busFrames, int num
 			v.frozenPlayPos = 0;
 			v.frozenParamHash = ComputeFreezeHash( pThis->v[kParamModelBD], pThis->v[kParamPitchBD], pThis->v[kParamRelBD], pThis->v[kParamToneBD], pThis->v[kParamCharBD], pThis->v[kParamFmBD], pThis->v[kParamSampleBD], pThis->v[kParamSampleMixBD], pThis->v[kParamNoiseBD], pThis->v[kParamNoiseTypeBD] );
 		}
+		// This block is pure silence (WriteVoiceOutput below writes NULL) -
+		// if a crossfade was pending, finish it right here rather than
+		// leaving it for ApplyCrossfade() below, which this idle path never
+		// reaches. Nothing audible to blend either way, but a voice that
+		// isn't actively triggered/decaying during the crossfade window
+		// would otherwise never clear `crossfading` at all - stalling
+		// CheckCuedSwitch()'s "wait for every voice" loop forever (a rarely-
+		// hit voice like an open hi-hat in a typical pattern is the common
+		// case). The real frozenBuf swap still only happens in FinishCue(),
+		// so this voice simply keeps playing the outgoing preset's content
+		// if triggered again before that, same as before this fix existed.
+		v.crossfading = false;
 		WriteVoiceOutput( busFrames, numFrames, NULL, pThis->v[kParamOutBD], replace, stereo, pThis->v[kParamPanBD] );
 		return;
 	}
@@ -6273,6 +6404,10 @@ static void ProcessSnare( _drumMachineAlgorithm* pThis, float* busFrames, int nu
 			v.frozenPlayPos = 0;
 			v.frozenParamHash = ComputeFreezeHash( pThis->v[kParamModelSD], pThis->v[kParamPitchSD], pThis->v[kParamRelSD], pThis->v[kParamToneSD], pThis->v[kParamCharSD], pThis->v[kParamFmSD], pThis->v[kParamSampleSD], pThis->v[kParamSampleMixSD], pThis->v[kParamNoiseSD], pThis->v[kParamNoiseTypeSD] );
 		}
+		// See ProcessKick()'s matching comment - this idle path never
+		// reaches ApplyCrossfade() below, so finish a pending crossfade
+		// right here instead (silent block, nothing audible to blend).
+		v.crossfading = false;
 		WriteVoiceOutput( busFrames, numFrames, NULL, pThis->v[kParamOutSD], replace, stereo, pThis->v[kParamPanSD] );
 		return;
 	}
@@ -6532,6 +6667,10 @@ static void ProcessHat( _drumMachineAlgorithm* pThis, float* busFrames, int numF
 			v.frozenPlayPos = 0;
 			v.frozenParamHash = ComputeFreezeHash( pThis->v[modelParamIdx], pThis->v[pitchParamIdx], pThis->v[relParamIdx], pThis->v[toneParamIdx], pThis->v[charParamIdx], pThis->v[fmParamIdx], pThis->v[kSampleParam[slot]], pThis->v[kSampleMixParam[slot]], pThis->v[noiseParamIdx], pThis->v[noiseTypeParamIdx] );
 		}
+		// See ProcessKick()'s matching comment - this idle path never
+		// reaches ApplyCrossfade() below, so finish a pending crossfade
+		// right here instead (silent block, nothing audible to blend).
+		v.crossfading = false;
 		WriteVoiceOutput( busFrames, numFrames, NULL, pThis->v[outParamIdx], replace, stereo, pThis->v[panParamIdx] );
 		return;
 	}
@@ -6843,8 +6982,6 @@ static void MixShadowSampleLayer( _drumMachineAlgorithm* pThis, _drumVoicePost& 
 			scratch[i] = scratch[i] * synthGain + sampleBuf[i];
 	}
 }
-
-static const int kSampleMixParamForSlot[kNumSlots] = { kParamSampleMixBD, kParamSampleMixSD, kParamSampleMixCH, kParamSampleMixOH };
 
 // Renders one block of the shadow kick's capture for the cued preset (or,
 // with cuedSlot < 0, the currently live voice - see CuedParam()'s comment)
@@ -7183,12 +7320,32 @@ static void AdvanceRecapture( _drumMachineAlgorithm* pThis, int numFrames )
 	}
 }
 
+// Manual Freeze menu action - un-freezes all 4 real voices and marks them
+// recaptureForced so AdvanceRecapture()'s own scan (above) picks each one
+// up in turn on the next few idle blocks, bypassing both Auto Freeze's
+// scope check and its debounce wait - this is an explicit, deliberate
+// one-time request, so it works even with Auto Freeze Mode set to None.
+// Replaces the old direct real-voice ArmFreeze()/AdvanceFreezeSequence()
+// path (retired - see AdvanceRecapture()'s comment on why), unifying
+// manual Freeze onto the same shadow-recapture engine Auto Freeze and
+// Preset Prerender already use.
+static void ForceRecaptureAll( _drumMachineAlgorithm* pThis )
+{
+	for ( int s=kSlotBD; s<=kSlotOH; ++s )
+	{
+		_drumVoicePost& v = VoiceForSlot( pThis, s );
+		v.frozen = false;
+		v.freezeArmed = false;
+		v.recaptureForced = true;
+	}
+}
+
 // Hands the render-voice's captured buffers over to the real voices and
 // performs the actual preset switch - see this section's top comment for
 // the full sequencing. Any in-scope slot that never got a captured buffer
-// (skipped for having a sample layer - see kSampleMixParamForSlot's use in
-// ProcessRenderVoice()) is simply left alone here, so LoadPreset() below
-// gives it a normal live parameter swap instead.
+// (e.g. a Strict-mode force-finish that cut its capture short - see
+// CheckCuedSwitch()'s comment) is simply left alone here, so LoadPreset()
+// below gives it a normal live parameter swap instead.
 static void FinishCue( _drumMachineAlgorithm* pThis )
 {
 	int cuedSlot = pThis->cuedPresetSlot;
@@ -7340,14 +7497,10 @@ static void ProcessRenderVoice( _drumMachineAlgorithm* pThis, int numFrames )
 	int cuedSlot = pThis->cuedPresetSlot;
 	int slot = pThis->renderVoiceSlot;
 
-	if ( CuedParam( pThis, cuedSlot, kSampleMixParamForSlot[slot] ) > 0 )
-	{
-		// Sample-layered - not supported for prerendering (see this
-		// section's top comment) - skip straight to the next slot without
-		// ever capturing anything for this one.
-		AdvanceRenderVoiceSlot( pThis, false );
-		return;
-	}
+	// Sample-layered slots are no longer skipped - RenderShadowKick/Snare/
+	// Hat() already mix the sample layer in via MixShadowSampleLayer()
+	// (built for Auto Freeze's own shadow recapture, reused here), so
+	// Prerender captures these slots exactly like any other now.
 
 	// kRenderVoiceCpuThreshold/kRenderVoiceThrottle - see their own comment.
 	// Below the threshold, render every block (renderVoiceThrottleCounter
@@ -7385,18 +7538,16 @@ static void ProcessRenderVoice( _drumMachineAlgorithm* pThis, int numFrames )
 // rather than always assuming the worst case, which would make this
 // needlessly pessimistic; CheckCuedSwitch()'s own safety net already
 // covers the case where CPU does happen to be elevated and throttling
-// kicks in mid-capture, pushing the target out further if needed. A slot
-// skipped for having a sample layer (see kSampleMixParamForSlot's use in
-// ProcessRenderVoice()) costs nothing - it resolves in a single block, not
-// a full IdleSamples() wait.
+// kicks in mid-capture, pushing the target out further if needed.
+// Sample-layered slots are no longer free/skipped (see ProcessRenderVoice()'s
+// comment) - their estimate is still just the model's own decay time,
+// same as any other slot, since the sample layer renders alongside it
+// rather than adding its own separate wait.
 static int EstimateCaptureSamples( _drumMachineAlgorithm* pThis, int cuedSlot, int startSlot )
 {
 	int total = 0;
 	for ( int s=startSlot; s<=kSlotOH; ++s )
 	{
-		if ( CuedParam( pThis, cuedSlot, kSampleMixParamForSlot[s] ) > 0 )
-			continue;
-
 		int model;
 		int relParam;
 		bool isHat = ( s == kSlotCH || s == kSlotOH );
@@ -7486,20 +7637,53 @@ static void CheckCuedSwitch( _drumMachineAlgorithm* pThis )
 
 	if ( !pThis->cuedReadyToSwitch )
 	{
-		// Safety net: if the scheduled boundary arrives and capture still
-		// isn't done, push the target out by a further 4-bar loop rather
-		// than switching early (can't - not ready) or leaving the switch
-		// to land off-beat the instant it does finish.
-		if ( pThis->clockRunning && pThis->sampleCounter >= pThis->cuedTargetBoundarySample )
-			pThis->cuedTargetBoundarySample += (uint32_t)( 16.0f * pThis->samplesPerQuarterNote );
-		return;
+		bool pastBoundary = pThis->clockRunning && pThis->sampleCounter >= pThis->cuedTargetBoundarySample;
+		if ( !pastBoundary )
+			return;
+
+		if ( pThis->v[ kParamSyncMode ] == kSyncModeStrict )
+		{
+			// Strict: always switch exactly on schedule - force-finish
+			// whatever hasn't completed capturing yet rather than pushing
+			// the target out further (see kEnumSyncMode's comment).
+			// ohSkipped=true is required here, not just tidy, even though
+			// OH has no dedicated stash field of its own - see FinishCue()'s
+			// comment: it assumes OH's turn (when it runs) is always last,
+			// so it's safe to read shadowVoiceStorage directly for OH. This
+			// early abort is the one thing that can break that assumption
+			// (e.g. aborting mid-CH capture, which shares that same
+			// storage) - without this flag, FinishCue() could mistake CH's
+			// unfinished leftover data for a valid OH capture.
+			pThis->ohSkipped = true;
+			pThis->renderVoiceSlot = -1;
+			pThis->cuedReadyToSwitch = true;
+			// Falls through to the crossfade-start check below - the
+			// boundary was already confirmed reached above, so this same
+			// call starts the crossfade immediately rather than waiting
+			// for another CheckCuedSwitch() call to notice.
+		}
+		else
+		{
+			// Wait (default): push the target out by a further sync loop
+			// rather than switching early (can't - not ready) or leaving
+			// the switch to land off-beat the instant it does finish.
+			pThis->cuedTargetBoundarySample += (uint32_t)( SyncLoopQuarterNotes( pThis ) * pThis->samplesPerQuarterNote );
+			return;
+		}
 	}
 
 	// No MIDI clock running - nothing meaningful to sync to, so start the
 	// crossfade the moment capture finishes (the pre-bar-locking
 	// behaviour) rather than waiting on a boundary computed from a clock
-	// that isn't there.
-	if ( !pThis->clockRunning || pThis->sampleCounter >= pThis->cuedTargetBoundarySample )
+	// that isn't there. With a clock running, wait for CrossfadeStartSample()
+	// (CrossfadeSamples() before the true boundary) rather than the
+	// boundary itself, so the fade *completes* exactly on the beat instead
+	// of starting there - in the Strict force-finish case above, the
+	// boundary is already reached by the time this runs, so
+	// CrossfadeStartSample() is already in the past and the fade still
+	// starts immediately, same as before this phase (see kEnumSyncMode's
+	// comment - Strict already trades exactness for guaranteed timing).
+	if ( !pThis->clockRunning || pThis->sampleCounter >= CrossfadeStartSample( pThis ) )
 		StartCrossfade( pThis );
 }
 
@@ -7553,7 +7737,7 @@ static void CuePreset( _drumMachineAlgorithm* pThis, int slot )
 	pThis->cuedReadyToSwitch = false;
 
 	// Bar-locked switch scheduling - see CheckCuedSwitch()'s comment.
-	// Target the next 4-bar boundary if the estimated capture time
+	// Target the next sync-loop boundary if the estimated capture time
 	// comfortably fits before it; otherwise the one after, so a long
 	// Release setting doesn't risk switching mid-capture. CheckCuedSwitch()'s
 	// own safety net pushes this out further still if the estimate turns
@@ -7562,7 +7746,7 @@ static void CuePreset( _drumMachineAlgorithm* pThis, int slot )
 	int samplesToNext = SamplesUntilNextBarBoundary( pThis );
 	uint32_t target = pThis->sampleCounter + (uint32_t)samplesToNext;
 	if ( estimatedSamples > samplesToNext )
-		target += (uint32_t)( 16.0f * pThis->samplesPerQuarterNote );	// 4 bars * 4 beats
+		target += (uint32_t)( SyncLoopQuarterNotes( pThis ) * pThis->samplesPerQuarterNote );
 	pThis->cuedTargetBoundarySample = target;
 #else
 	LoadPreset( pThis, slot );
@@ -7612,9 +7796,6 @@ static float MeasureCpuPercent( float previous, uint32_t cyclesStart, uint32_t c
 	CONSTRAIN( smoothed, 0.0f, 999.0f );
 	return smoothed;
 }
-
-static void AdvanceFreezeSequence( _drumMachineAlgorithm* pThis );
-static void AdvanceAutoFreeze( _drumMachineAlgorithm* pThis );
 
 void 	step( _NT_algorithm* self, float* busFrames, int numFramesBy4 )
 {
@@ -7716,11 +7897,6 @@ void 	step( _NT_algorithm* self, float* busFrames, int numFramesBy4 )
 	ProcessHat( pThis, busFrames, numFrames, true );
 	if ( pThis->fxProfiling ) voiceCyclesTotal += NT_getCpuCycleCount() - vc0;
 
-	// AdvanceFreezeSequence()/ArmFreeze() still drive the manual Freeze
-	// menu action for now - Auto Freeze itself is fully replaced by
-	// AdvanceRecapture() (see its own comment for why). Manual Freeze gets
-	// unified onto the same shadow mechanism in a later phase.
-	AdvanceFreezeSequence( pThis );
 	AdvanceRecapture( pThis, numFrames );
 	ProcessRenderVoice( pThis, numFrames );
 	CheckCuedSwitch( pThis );
@@ -7768,6 +7944,17 @@ static void SetParam( _drumMachineAlgorithm* pThis, int paramIndex, int value )
 	if ( paramIndex >= kFirstSmoothedParam && paramIndex < kFirstSmoothedParam + kNumSmoothedParams && !pThis->loadingPreset )
 	{
 		_paramSmoother& s = pThis->smoother[ paramIndex - kFirstSmoothedParam ];
+		s.current = s.target = (float)value;
+		s.increment = 0.0f;
+		s.samplesRemaining = 0;
+	}
+	else if ( paramIndex == kParamRumbleIntensity && !pThis->loadingPreset )
+	{
+		// Rumble Intensity's own smoother - see its struct comment and this
+		// function's own comment above (the same "parameterChanged() timing
+		// isn't guaranteed for our own NT_setParameterFromUi() calls" reason
+		// applies here too, not just to the kFirstSmoothedParam range).
+		_paramSmoother& s = pThis->rumbleIntensitySmoother;
 		s.current = s.target = (float)value;
 		s.increment = 0.0f;
 		s.samplesRemaining = 0;
@@ -7952,6 +8139,21 @@ static void LoadPreset( _drumMachineAlgorithm* pThis, int slot, bool fromAudioCo
 		SetPresetParam( algIdx, p + off, pThis->modBank[slot][i], fromAudioContext );
 	}
 
+	// Rumble Intensity rides its own smoother (see rumbleIntensitySmoother's
+	// comment) rather than snapping instantly like the rest of kModParams
+	// just above - a sudden jump in sub-bass level reads as a glitch, and
+	// this preset-change ramp is exactly what the rest of the smoothed
+	// params already get, just outside their contiguous range. Uses the
+	// same rampSamples as those (~1.5s) for a consistent feel across every
+	// smoothed control on a preset switch.
+	{
+		int newValue = pThis->modBank[slot][ FindModParamSlot( kParamRumbleIntensity ) ];
+		_paramSmoother& s = pThis->rumbleIntensitySmoother;
+		s.target = (float)newValue;
+		s.samplesRemaining = (int)rampSamples;
+		s.increment = ( s.target - s.current ) / rampSamples;
+	}
+
 	// parameterChanged()'s callback timing for changes originating from our
 	// own NT_setParameterFromUi() calls above isn't guaranteed (see
 	// SetParam()'s matching comment) - Sample's side effect (kicking off the
@@ -8025,109 +8227,6 @@ static void NewPreset( _drumMachineAlgorithm* pThis )
 
 	pThis->potHasLastPos[0] = pThis->potHasLastPos[1] = pThis->potHasLastPos[2] = false;
 	pThis->potAccum[0] = pThis->potAccum[1] = pThis->potAccum[2] = 0.0f;
-}
-
-// "Freeze" - the preset menu's 4th option, alongside Load/Save/New (always
-// called with startSlot=kSlotBD from there - see customUi()). Also the
-// engine behind Auto Freeze (see AdvanceAutoFreeze(), which calls this with
-// startSlot=kSlotSD for the "SD/CH/OH" scope, leaving BD alone/always live).
-// Captures one slot at a time (see freezeSeqSlot's comment) rather than
-// arming all of them simultaneously, so a fast pattern only ever has one
-// voice dropping hits (see TriggerSlot()'s comment) at once. Operates on
-// whatever kit is *currently loaded*, not an arbitrary bank slot, since
-// frozen audio is session-local and was never part of presetBank/modBank in
-// the first place. Clears any existing frozen/captured state on every
-// slot >= startSlot immediately so arming always means "about to capture
-// fresh live hits", never "still showing stale frozen audio while waiting" -
-// slots *before* startSlot are left completely untouched.
-static void ArmFreeze( _drumMachineAlgorithm* pThis, int startSlot )
-{
-	for ( int s=startSlot; s<=kSlotOH; ++s )
-	{
-		_drumVoicePost& v = VoiceForSlot( pThis, s );
-		v.freezeArmed = false;
-		v.freezeCapturing = false;
-		v.frozen = false;
-		v.frozenNumFrames = 0;
-	}
-
-	pThis->freezeSeqSlot = startSlot;
-	VoiceForSlot( pThis, startSlot ).freezeArmed = true;
-}
-
-// Called once per audio block (see step()'s tail) - watches the slot
-// currently capturing (freezeSeqSlot) and, the moment it finalizes
-// (frozen flips true), arms the next slot up to kSlotOH. -1 means no
-// sequence is in progress (either never armed, or the last slot in this
-// sequence has finished).
-static void AdvanceFreezeSequence( _drumMachineAlgorithm* pThis )
-{
-	if ( pThis->freezeSeqSlot < 0 )
-		return;
-	if ( !VoiceForSlot( pThis, pThis->freezeSeqSlot ).frozen )
-		return;
-	int nextSlot = pThis->freezeSeqSlot + 1;
-	// Skip past any slot that's already validly frozen (e.g. Prerender
-	// already captured it as part of the same preset switch that started
-	// this sequence - see AdvanceAutoFreeze()'s comment) - only arm slots
-	// that actually still need a live capture, rather than unconditionally
-	// re-arming every slot in the scope regardless of whether it's already
-	// done, which would throw away a good Prerendered capture and force an
-	// avoidable live re-render (a real CPU spike right after a switch).
-	while ( nextSlot <= kSlotOH && VoiceForSlot( pThis, nextSlot ).frozen )
-		++nextSlot;
-	if ( nextSlot > kSlotOH )
-	{
-		pThis->freezeSeqSlot = -1;
-		return;
-	}
-	pThis->freezeSeqSlot = nextSlot;
-	VoiceForSlot( pThis, nextSlot ).freezeArmed = true;
-}
-
-// Auto Freeze - see kAutoFreezeXxx's comment. Called once per block from
-// step(), right after AdvanceFreezeSequence(). Whenever no capture is
-// currently in progress (freezeSeqSlot == -1) and at least one in-scope
-// voice isn't already frozen or armed (e.g. because a parameter edit just
-// un-froze it - see each ProcessXxx()'s un-freeze check, or because a
-// Prerendered switch left one slot incomplete - see FinishCue()), arms
-// *only* the first such slot - deliberately not ArmFreeze() (which would
-// unconditionally reset every slot in scope back to un-frozen first) - so
-// a slot Prerender (or a previous pass of this same function) already
-// froze is left completely untouched. Without this distinction, a preset
-// switch that finished prerendering 3 of 4 slots would have this function
-// see "not everything is frozen" and discard all 3 good captures just to
-// re-arm the whole scope from scratch - exactly the live-rendering CPU
-// spike Prerender exists to avoid, right at the moment of a switch.
-// AdvanceFreezeSequence() (immediately above) mirrors this same
-// "skip anything already frozen" logic as the sequence continues slot to
-// slot. Self-maintaining with no user action, on top of (not instead of)
-// the manual preset-menu Freeze action (which still uses ArmFreeze() to
-// force a full fresh capture, unconditionally, by design).
-static void AdvanceAutoFreeze( _drumMachineAlgorithm* pThis )
-{
-	int mode = pThis->v[ kParamAutoFreezeMode ];
-	if ( mode == kAutoFreezeNone )
-		return;
-	if ( pThis->freezeSeqSlot != -1 )
-		return;
-
-	int startSlot = ( mode == kAutoFreezeAll ) ? kSlotBD : kSlotSD;
-	int firstNeeded = -1;
-	for ( int s=startSlot; s<=kSlotOH; ++s )
-	{
-		_drumVoicePost& v = VoiceForSlot( pThis, s );
-		if ( !v.frozen && !v.freezeArmed )
-		{
-			firstNeeded = s;
-			break;
-		}
-	}
-	if ( firstNeeded < 0 )
-		return;
-
-	pThis->freezeSeqSlot = firstNeeded;
-	VoiceForSlot( pThis, firstNeeded ).freezeArmed = true;
 }
 
 // Resolves the route mapping `source` to (concept, slot) for quick-edit
@@ -8274,7 +8373,7 @@ void	customUi( _NT_algorithm* self, const _NT_uiData& data )
 			else if ( pThis->presetMenuAction == 2 )
 				NewPreset( pThis );
 			else
-				ArmFreeze( pThis, kSlotBD );	// operates on the currently-loaded kit, presetMenuIndex is irrelevant here
+				ForceRecaptureAll( pThis );	// operates on the currently-loaded kit, presetMenuIndex is irrelevant here
 			pThis->presetMenuOpen = false;
 		}
 		return;	// preset menu owns every claimed control while it's open
@@ -8658,6 +8757,66 @@ static void DrawBarPhaseDivider( _drumMachineAlgorithm* pThis )
 	NT_drawShapeI( kNT_line, sweepX, kHeaderDividerY - 2, sweepX, kHeaderDividerY + 2, 15 );
 }
 
+// Compact "which voice is currently (pre-)rendering" indicator - shown in
+// the header row (see DrawHeader()) so it's visible on every page, not
+// just DrawPresetMenu()'s own dedicated "PRERENDERING <preset> (SLOT)"
+// banner (which stays as-is - this is for the *other* pages, where a
+// Prerender cue or Auto Freeze recapture was previously invisible). Covers
+// whichever of the two is currently running (mutually exclusive by design
+// - see AdvanceRecapture()'s comment). Once every in-scope slot for a
+// pending cue has finished capturing, switches to a blinking "ARMED"
+// instead (see IsReadyAndWaiting()) - recapture has no equivalent "fully
+// armed" moment (a continuous one-slot-at-a-time background process, not
+// a scheduled all-at-once switch), so it just keeps showing whichever slot
+// it's currently re-capturing. Fixed position (right-aligned at x=191) so
+// switching between "nothing", a 2-letter slot name, and "ARMED" never
+// shifts anything else in the header - chosen with enough margin from the
+// BPM/CPU% text's own left edge (starts at x=204 even in the longest
+// realistic case, "255bpm  100%") and from any page title (all comfortably
+// under x=170) to never collide with either.
+static void DrawLoadingIndicator( _drumMachineAlgorithm* pThis )
+{
+	if ( IsReadyAndWaiting( pThis ) )
+	{
+		if ( BlinkOn( pThis ) )
+			NT_drawText( 191, 7, "ARMED", 12, kNT_textRight, kNT_textTiny );
+		return;
+	}
+
+	int slot = -1;
+	int maxFrames = 1;
+	if ( pThis->cuedPresetSlot >= 0 && pThis->renderVoiceSlot >= 0 )
+	{
+		slot = pThis->renderVoiceSlot;
+		maxFrames = PrerenderMaxFrames();
+	}
+	else if ( pThis->recaptureSlot >= 0 )
+	{
+		slot = pThis->recaptureSlot;
+		maxFrames = FreezeMaxFrames();
+	}
+	if ( slot < 0 )
+		return;
+
+	_drumMachineAlgorithm_DTC* dtc = pThis->dtc;
+	int frozenNumFrames = ( slot == kSlotBD ) ? ShadowKick( dtc ).frozenNumFrames
+		: ( slot == kSlotSD ) ? ShadowSnare( dtc ).frozenNumFrames
+		: ShadowHat( dtc ).frozenNumFrames;
+	float progress = frozenNumFrames / (float)maxFrames;
+	CONSTRAIN( progress, 0.0f, 1.0f );
+
+	NT_drawText( 191, 7, kSlotNames[slot], 12, kNT_textRight, kNT_textTiny );
+
+	int barX0 = 170;
+	int barX1 = 181;
+	int barY0 = 5;
+	int barY1 = 9;
+	NT_drawShapeI( kNT_box, barX0, barY0, barX1, barY1, 8 );
+	int fillX = barX0 + 1 + (int)( progress * ( barX1 - barX0 - 2 ) );
+	if ( fillX > barX0 + 1 )
+		NT_drawShapeI( kNT_rectangle, barX0 + 1, barY0 + 1, fillX, barY1 - 1, 12 );
+}
+
 // `pThis` is used both for the CPU% readout tacked onto rightTag below -
 // see MeasureCpuPercent()'s comment for how it's derived and its caveats -
 // and (when clockRunning) to opportunistically swap the version watermark
@@ -8696,6 +8855,7 @@ static void DrawHeader( _drumMachineAlgorithm* pThis, const char* title, const c
 		strcat( tagBuff, "%" );
 		NT_drawText( 252, 7, tagBuff, 5, kNT_textRight, kNT_textTiny );
 	}
+	DrawLoadingIndicator( pThis );
 	DrawBarPhaseDivider( pThis );
 }
 
@@ -8902,6 +9062,21 @@ static void DrawArmFrzIndicator( _drumMachineAlgorithm* pThis, int slot, int x, 
 	{
 		frozen = true;
 		blinking = true;
+	}
+	else if ( pThis->recaptureSlot == slot )
+	{
+		// Auto Freeze/manual Freeze's shadow recapture (see AdvanceRecapture())
+		// re-capturing this slot in the background - same ARM+progress
+		// convention as a Preset Prerender cue above, just reading
+		// FreezeMaxFrames() (recapture's full length) instead of
+		// PrerenderMaxFrames(). Nothing shown during the quiet debounce
+		// wait before this starts, same as before this branch existed.
+		armed = true;
+		_drumMachineAlgorithm_DTC* dtc = pThis->dtc;
+		int frozenNumFrames = ( slot == kSlotBD ) ? ShadowKick( dtc ).frozenNumFrames
+			: ( slot == kSlotSD ) ? ShadowSnare( dtc ).frozenNumFrames
+			: ShadowHat( dtc ).frozenNumFrames;
+		progress = frozenNumFrames / (float)FreezeMaxFrames();
 	}
 	else
 #endif
@@ -9385,8 +9560,10 @@ static void DrawEqSculptPage( _drumMachineAlgorithm* pThis )
 // page) since bypass is a single all-slots flag, not a per-slot parameter -
 // see fxBypassMask's comment. Bypassed stages dim and get a strike-through;
 // pressing Encoder R toggles the CPU profiler (see fxProfiling's comment),
-// which replaces each box's static short name with its live % of the real-
-// time budget instead. kFxStageRender (leftmost - actually first in the
+// which adds each box's live % of the real-time budget as a second line
+// underneath its static short name (name never moves/disappears - the %
+// used to replace it outright, which made it hard to tell stages apart
+// while profiling). kFxStageRender (leftmost - actually first in the
 // chain) has no bypass bit, so it never dims/strikes, only ever profiles.
 static void DrawChainOverviewPage( _drumMachineAlgorithm* pThis )
 {
@@ -9408,6 +9585,10 @@ static void DrawChainOverviewPage( _drumMachineAlgorithm* pThis )
 
 		NT_drawShapeI( kNT_box, bx0, y0, bx1, y1, outline );
 
+		// Name stays at the same y whether or not profiling is on, so
+		// toggling the profiler never moves it - the % (when profiling)
+		// is a second line underneath, not a replacement.
+		NT_drawText( ( bx0 + bx1 ) / 2, ( y0 + y1 ) / 2 - 2, kFxStageShortName[stage], bypassed ? 5 : 15, kNT_textCentre, kNT_textTiny );
 		if ( pThis->fxProfiling )
 		{
 			char pctBuff[8];
@@ -9415,11 +9596,7 @@ static void DrawChainOverviewPage( _drumMachineAlgorithm* pThis )
 			char buff[12];
 			strcpy( buff, pctBuff );
 			strcat( buff, "%" );
-			NT_drawText( ( bx0 + bx1 ) / 2, ( y0 + y1 ) / 2 - 2, buff, bypassed ? 8 : 15, kNT_textCentre, kNT_textTiny );
-		}
-		else
-		{
-			NT_drawText( ( bx0 + bx1 ) / 2, ( y0 + y1 ) / 2 - 2, kFxStageShortName[stage], bypassed ? 5 : 15, kNT_textCentre, kNT_textTiny );
+			NT_drawText( ( bx0 + bx1 ) / 2, ( y0 + y1 ) / 2 + 8, buff, bypassed ? 8 : 12, kNT_textCentre, kNT_textTiny );
 		}
 
 		if ( bypassed )
